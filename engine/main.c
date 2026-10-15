@@ -7,7 +7,7 @@
 typedef struct {
     const char *model, *draft, *prompt, *prompt_file, *system;
     int n_predict, threads, n_ctx, n_draft, lookup, chat, interactive, bench, kv_f16, raw, verbose;
-    int bench_prompt, bench_gen, ignore_eos;
+    int bench_prompt, bench_gen, ignore_eos, json;
     borg_sampling s;
 } options;
 
@@ -28,6 +28,7 @@ static void usage(void) {
             "  --n-draft K        tokens drafted per step (default 6)\n"
             "  --lookup N         prompt-lookup speculative decoding with N-gram matching\n"
             "  --kv-f16           store the KV cache in float16\n"
+            "  --json             constrain the output to valid JSON\n"
             "  --ignore-eos       keep generating past end-of-sequence tokens\n"
             "  --raw              do not parse special tokens in the prompt\n"
             "  --bench [P G]      benchmark prefill of P tokens and generation of G tokens\n"
@@ -64,6 +65,7 @@ static int parse_args(int argc, char **argv, options *o) {
         else if (!strcmp(a, "--lookup")) o->lookup = atoi(NEXT());
         else if (!strcmp(a, "--kv-f16")) o->kv_f16 = 1;
         else if (!strcmp(a, "--ignore-eos")) o->ignore_eos = 1;
+        else if (!strcmp(a, "--json")) o->json = 1;
         else if (!strcmp(a, "--raw")) o->raw = 1;
         else if (!strcmp(a, "-v")) o->verbose = 1;
         else if (!strcmp(a, "--bench")) {
@@ -255,6 +257,7 @@ int main(int argc, char **argv) {
     gp.n_draft = o.n_draft;
     gp.lookup_ngram = o.lookup;
     gp.ignore_eos = o.ignore_eos;
+    gp.json_mode = o.json;
     const int n_ctx = borg_ctx_n_ctx(c);
     int32_t *out = (int32_t *)malloc(sizeof(int32_t) * (size_t)n_ctx);
     const char *fmt = chat_format(m);
