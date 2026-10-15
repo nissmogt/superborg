@@ -6,3 +6,6 @@ __pycache__/
 *.part
 .pytest_cache/
 models/
+superborg/_lib/
+*.egg-info/
+dist/
