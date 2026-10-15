@@ -117,6 +117,7 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
     }
     int K = p.n_draft;
     if (!dc && p.lookup_ngram <= 0) K = 0;
+    if (p.json_mode) K = 0;
     if (K < 0) K = 0;
     if (K > 32) K = 32;
     const int greedy = p.sampling.temperature <= 0.0f;
@@ -140,8 +141,15 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
     float *dlog = dc ? (float *)malloc(sizeof(float) * (size_t)dc->model->cfg.vocab_size) : NULL;
     int32_t draft[33];
     borg_sampler *smp = borg_sampler_new(&p.sampling, Vs);
+    json_state js;
+    json_state_init(&js);
+    const int json_want = p.sampling.temperature <= 0.0f ? 1 : (p.sampling.top_k > 0 ? p.sampling.top_k : 64);
+    int32_t *jidx = p.json_mode ? (int32_t *)malloc(sizeof(int32_t) * (size_t)Vs) : NULL;
+    float *jval = p.json_mode ? (float *)malloc(sizeof(float) * (size_t)Vs) : NULL;
+    uint8_t *jkeep = p.json_mode ? (uint8_t *)malloc((size_t)Vs) : NULL;
     int rc = 0;
-    if (!g.seq || !g.piece || !logits || !L0 || (K && dc && !qd) || (dc && !dlog) || !smp) {
+    if (!g.seq || !g.piece || !logits || !L0 || (K && dc && !qd) || (dc && !dlog) || !smp ||
+        (p.json_mode && (!jidx || !jval || !jkeep))) {
         rc = -4;
         goto done;
     }
@@ -223,6 +231,7 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
         int32_t next = -1;
         for (int i = 0; i <= k; i++) {
             float *Li = (float *)Lrow[i];
+            if (p.json_mode) json_constrain(m, &js, Li, Vs, jidx, jval, jkeep, json_want);
             if (greedy) {
                 int32_t y = borg_sampler_sample(smp, Li, g.seq, g.len);
                 if (i < k && y == draft[i]) {
@@ -264,6 +273,7 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
         borg_ctx_truncate(c, cache_base + acc);
         pending = -1;
         if (g.stop < 0 && next >= 0) {
+            if (p.json_mode) json_state_feed_token(m, &js, next);
             if (!emit(&g, next)) pending = next;
         }
         if (g.stop < 0 && pending < 0) {
@@ -285,6 +295,9 @@ done:
     free(L0);
     free(qd);
     free(dlog);
+    free(jidx);
+    free(jval);
+    free(jkeep);
     return rc ? rc : g.n_gen;
 }
 
@@ -314,8 +327,14 @@ int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n
     int32_t *act_tok = (int32_t *)calloc((size_t)n_seq, sizeof(int32_t));
     int *act_idx = (int *)calloc((size_t)n_seq, sizeof(int));
     borg_sampler **smp = (borg_sampler **)calloc((size_t)n_seq, sizeof(borg_sampler *));
+    json_state *js = (json_state *)calloc((size_t)n_seq, sizeof(json_state));
+    const int json_want = p.sampling.temperature <= 0.0f ? 1 : (p.sampling.top_k > 0 ? p.sampling.top_k : 64);
+    int32_t *jidx = p.json_mode ? (int32_t *)malloc(sizeof(int32_t) * (size_t)Vs) : NULL;
+    float *jval = p.json_mode ? (float *)malloc(sizeof(float) * (size_t)Vs) : NULL;
+    uint8_t *jkeep = p.json_mode ? (uint8_t *)malloc((size_t)Vs) : NULL;
     char piece[4096];
-    if (!logits || !row || !hist || !len || !ngen || !reason || !active || !act_ctx || !act_tok || !act_idx || !smp) {
+    if (!logits || !row || !hist || !len || !ngen || !reason || !active || !act_ctx || !act_tok || !act_idx || !smp ||
+        !js || (p.json_mode && (!jidx || !jval || !jkeep))) {
         rc = -4;
         goto done;
     }
@@ -324,6 +343,7 @@ int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n
         sp.seed = p.sampling.seed + (uint64_t)i;
         smp[i] = borg_sampler_new(&sp, Vs);
         if (!smp[i]) { rc = -4; goto done; }
+        json_state_init(&js[i]);
     }
 
     double t0 = borg_time_ms();
@@ -349,7 +369,9 @@ int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n
         for (int i = 0; i < n_seq; i++) {
             if (!active[i]) continue;
             int32_t *h = hist + (size_t)i * hist_cap;
+            if (p.json_mode) json_constrain(m, &js[i], row[i], Vs, jidx, jval, jkeep, json_want);
             const int32_t tok = borg_sampler_sample(smp[i], row[i], h, len[i]);
+            if (p.json_mode) json_state_feed_token(m, &js[i], tok);
             int stop = !p.ignore_eos && borg_is_eog(m, tok);
             for (int k = 0; k < p.n_stop_tokens && !stop; k++) stop = p.stop_tokens[k] == tok;
             if (stop) { active[i] = 0; reason[i] = 1; continue; }
@@ -392,5 +414,9 @@ done:
     free(act_ctx);
     free(act_tok);
     free(act_idx);
+    free(js);
+    free(jidx);
+    free(jval);
+    free(jkeep);
     return rc ? rc : st.n_gen;
 }

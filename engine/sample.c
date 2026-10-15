@@ -88,7 +88,7 @@ static int argmax(const float *x, int n) {
 }
 
 /* Partially order val/idx[0..n) so that the k largest values come first (unordered). */
-static void select_top(float *val, int32_t *idx, int n, int k) {
+void sampler_select_top(float *val, int32_t *idx, int n, int k) {
     int lo = 0, hi = n - 1;
     while (lo < hi) {
         const float pivot = val[(lo + hi) / 2];
@@ -109,7 +109,7 @@ static void select_top(float *val, int32_t *idx, int n, int k) {
     }
 }
 
-static void sort_desc(float *val, int32_t *idx, int n) {
+void sampler_sort_desc(float *val, int32_t *idx, int n) {
     /* insertion sort for short arrays, otherwise heap sort (no recursion, no allocation) */
     if (n < 64) {
         for (int i = 1; i < n; i++) {
@@ -168,7 +168,7 @@ static int build_candidates(borg_sampler *s, const float *logits) {
         s->val[i] = logits[i] * inv_t;
     }
     if (s->p.top_k > 0 && s->p.top_k < n) {
-        select_top(s->val, s->idx, n, s->p.top_k);
+        sampler_select_top(s->val, s->idx, n, s->p.top_k);
         n = s->p.top_k;
     }
     /* softmax over the candidates */
@@ -196,7 +196,7 @@ static int build_candidates(borg_sampler *s, const float *logits) {
                     m++;
                 }
         }
-        sort_desc(s->val, s->idx, m);
+        sampler_sort_desc(s->val, s->idx, m);
         double cum = 0.0;
         int keep = m;
         for (int i = 0; i < m; i++) {
@@ -207,7 +207,7 @@ static int build_candidates(borg_sampler *s, const float *logits) {
             }
         }
         if (cum < s->p.top_p && m < n) {
-            sort_desc(s->val, s->idx, n);
+            sampler_sort_desc(s->val, s->idx, n);
             keep = n;
             cum = 0.0;
             for (int i = 0; i < n; i++) {

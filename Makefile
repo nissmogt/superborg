@@ -41,7 +41,7 @@ else
 endif
 
 LIB_SRC := engine/json.c engine/model.c engine/kernels.c engine/pool.c engine/tokenizer.c \
-           engine/forward.c engine/sample.c engine/generate.c
+           engine/forward.c engine/sample.c engine/generate.c engine/json_mode.c
 LIB_OBJ := $(patsubst engine/%.c,$(BUILD)/%.o,$(LIB_SRC))
 HDRS := $(wildcard engine/*.h)
 

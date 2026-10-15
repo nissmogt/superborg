@@ -50,7 +50,8 @@ class _Sampling(ctypes.Structure):
 class _GenParams(ctypes.Structure):
     _fields_ = [("max_tokens", ctypes.c_int), ("sampling", _Sampling), ("draft", ctypes.c_void_p),
                 ("n_draft", ctypes.c_int), ("lookup_ngram", ctypes.c_int), ("ignore_eos", ctypes.c_int),
-                ("stop_tokens", ctypes.POINTER(ctypes.c_int32)), ("n_stop_tokens", ctypes.c_int)]
+                ("stop_tokens", ctypes.POINTER(ctypes.c_int32)), ("n_stop_tokens", ctypes.c_int),
+                ("json_mode", ctypes.c_int)]
 
 
 class _GenStats(ctypes.Structure):
@@ -413,7 +414,7 @@ class Context:
     def generate(self, prompt: Sequence[int], max_tokens: int = 256, sampling: Sampling | None = None,
                  stop: Iterable[str] = (), stream: Callable[[str], None] | None = None,
                  draft: "Context | None" = None, n_draft: int = 6, lookup_ngram: int = 0,
-                 ignore_eos: bool = False, stop_tokens: Sequence[int] = ()) -> Generation:
+                 ignore_eos: bool = False, stop_tokens: Sequence[int] = (), json_mode: bool = False) -> Generation:
         """Generate a continuation of `prompt` (token ids).
 
         stop: strings that end generation (the stop string is not included in the text).
@@ -429,6 +430,7 @@ class Context:
         gp.n_draft = int(n_draft)
         gp.lookup_ngram = int(lookup_ngram)
         gp.ignore_eos = int(ignore_eos)
+        gp.json_mode = int(json_mode)
         stop_arr = None
         if stop_tokens:
             stop_arr = (ctypes.c_int32 * len(stop_tokens))(*stop_tokens)
@@ -526,7 +528,7 @@ class _StopTracker:
 def generate_multi(contexts: Sequence[Context], prompt: Sequence[int], max_tokens: int = 256,
                    sampling: Sampling | None = None, stop: Iterable[str] = (),
                    stream: Callable[[int, str], None] | None = None, ignore_eos: bool = False,
-                   stop_tokens: Sequence[int] = ()) -> list[Generation]:
+                   stop_tokens: Sequence[int] = (), json_mode: bool = False) -> list[Generation]:
     """Sample len(contexts) continuations of `prompt` in lockstep with batched decoding.
 
     Sequence i uses seed sampling.seed + i. The prompt is evaluated once (in contexts[0],
@@ -544,6 +546,7 @@ def generate_multi(contexts: Sequence[Context], prompt: Sequence[int], max_token
     gp.max_tokens = int(max_tokens)
     gp.sampling = sampling._c()
     gp.ignore_eos = int(ignore_eos)
+    gp.json_mode = int(json_mode)
     stop_arr = None
     if stop_tokens:
         stop_arr = (ctypes.c_int32 * len(stop_tokens))(*stop_tokens)

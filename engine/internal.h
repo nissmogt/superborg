@@ -197,6 +197,21 @@ void vec_axpy_f16(float *y, float a, const uint16_t *x, int n);
 /* ---- sampling helpers (sample.c) ----------------------------------------- */
 int32_t sampler_draw(borg_sampler *s, const float *probs, int n); /* draw from unnormalized probs */
 float sampler_uniform(borg_sampler *s);
+void sampler_select_top(float *val, int32_t *idx, int n, int k); /* k largest first (unordered) */
+void sampler_sort_desc(float *val, int32_t *idx, int n);
+
+/* ---- JSON-constrained decoding (json_mode.c) ------------------------------ */
+#define JSON_MAX_DEPTH 64
+typedef struct {
+    int mode, aux, depth, in_key, just_opened;
+    char stack[JSON_MAX_DEPTH];
+} json_state;
+void json_state_init(json_state *s);
+int json_state_feed(json_state *s, unsigned char c);
+void json_state_feed_token(const borg_model *m, json_state *s, int32_t tok);
+/* Set logits of tokens that would break the JSON text to -inf (scratch arrays: n_vocab each). */
+void json_constrain(const borg_model *m, const json_state *s, float *logits, int n_vocab, int32_t *idx, float *val,
+                    uint8_t *keep, int want);
 
 /* ---- utilities ------------------------------------------------------------ */
 double borg_time_ms(void);

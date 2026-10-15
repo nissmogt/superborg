@@ -153,6 +153,7 @@ typedef struct {
     int ignore_eos;
     const int32_t *stop_tokens; /* extra tokens that end generation */
     int n_stop_tokens;
+    int json_mode;    /* constrain the output to one valid JSON value (disables speculation) */
 } borg_gen_params;
 
 typedef struct {

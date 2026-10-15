@@ -277,8 +277,13 @@ borg_model *borg_model_load(const char *path, char *err, int errlen) {
         for (int d = 0; d < t->ndim; d++) t->shape[d] = (int64_t)shape->items[d].num;
         double off = json_num(json_get(tv, "offset"), -1);
         double nb = json_num(json_get(tv, "nbytes"), -1);
-        if (off < 0 || nb < 0 || data_start + (size_t)off + (size_t)nb > m->map_size) {
+        if (off < 0 || nb < 0 || off != (double)(size_t)off || nb != (double)(size_t)nb ||
+            (size_t)off > m->map_size || (size_t)nb > m->map_size ||
+            data_start + (size_t)off + (size_t)nb > m->map_size) {
             borg_set_err(err, errlen, "tensor %s lies outside the file", t->name); goto fail;
+        }
+        if ((size_t)off % 64) { /* the format guarantees it; kernels rely on aligned rows */
+            borg_set_err(err, errlen, "tensor %s is not 64-byte aligned", t->name); goto fail;
         }
         t->nbytes = (size_t)nb;
         if (tensor_expected_bytes(t) != t->nbytes) {
