@@ -97,7 +97,7 @@ static void unmap_file(borg_model *m) {
 
 /* ---- tensors -------------------------------------------------------------- */
 static borg_dtype parse_dtype(const char *s) {
-    static const char *names[DT_COUNT] = {"f32", "f16", "bf16", "q8_0", "q4_0", "u8", "u32", "i32"};
+    static const char *names[DT_COUNT] = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "u8", "u32", "i32"};
     for (int i = 0; i < DT_COUNT; i++)
         if (!strcmp(s, names[i])) return (borg_dtype)i;
     return DT_COUNT;
@@ -118,6 +118,7 @@ static size_t tensor_expected_bytes(const borg_tensor *t) {
     case DT_U8: return (size_t)n;
     case DT_Q8_0: return (size_t)(n / QK) * sizeof(block_q8_0);
     case DT_Q4_0: return (size_t)(n / QK) * sizeof(block_q4_0);
+    case DT_Q4_1: return (size_t)(n / QK) * sizeof(block_q4_1);
     default: return 0;
     }
 }
@@ -130,8 +131,8 @@ static int get_mat(borg_model *m, const char *name, int rows, int cols, borg_mat
                      (long long)t->shape[0], (long long)(t->ndim > 1 ? t->shape[1] : 0), rows, cols);
         return -1;
     }
-    if (t->dtype > DT_Q4_0) { borg_set_err(err, errlen, "tensor %s has a non-float dtype", name); return -1; }
-    if ((t->dtype == DT_Q8_0 || t->dtype == DT_Q4_0) && cols % QK) {
+    if (t->dtype > DT_Q4_1) { borg_set_err(err, errlen, "tensor %s has a non-float dtype", name); return -1; }
+    if ((t->dtype == DT_Q8_0 || t->dtype == DT_Q4_0 || t->dtype == DT_Q4_1) && cols % QK) {
         borg_set_err(err, errlen, "tensor %s: quantized rows must be a multiple of %d", name, QK);
         return -1;
     }

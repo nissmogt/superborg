@@ -86,9 +86,11 @@ form: dimension `i` pairs with `i + head_dim/2`.
 | `q8_0` | blocks of 32 values: `{f16 d; int8 q[32]}` (34 bytes); `x = d * q`                      |
 | `q4_0` | blocks of 32 values: `{f16 d; u8 qs[16]}` (18 bytes); element `j<16` is the low nibble  |
 |        | of `qs[j]`, element `j+16` the high nibble; `x = d * (nibble - 8)`                      |
+| `q4_1` | blocks of 32 values: `{f16 d; f16 m; u8 qs[16]}` (20 bytes); nibbles as in `q4_0`;     |
+|        | `x = d * nibble + m`                                                                   |
 | `u8`, `u32`, `i32` | plain integers (tokenizer tables)                                          |
 
-`q8_0` and `q4_0` match the ggml layouts of the same names. A quantized tensor's
+`q8_0`, `q4_0` and `q4_1` match the ggml layouts of the same names. A quantized tensor's
 last dimension must be a multiple of 32; the converter stores other tensors as
 f16/f32.
 

@@ -74,6 +74,7 @@ void borg_ctx_free(borg_ctx *c) {
     free(c->xq);
     free(c->att);
     free(c->embd);
+    free(c->stats);
     free(c);
 }
 
@@ -121,6 +122,47 @@ borg_ctx *borg_ctx_new(borg_model *m, borg_pool *pool, const borg_ctx_params *pa
     }
     compute_inv_freq(m, c->inv_freq);
     return c;
+}
+
+int borg_ctx_enable_stats(borg_ctx *c, int enable) {
+    if (!enable) {
+        free(c->stats);
+        c->stats = NULL;
+        c->stats_tokens = 0;
+        return 0;
+    }
+    if (c->stats) return 0;
+    c->stats = (double *)calloc((size_t)c->model->cfg.n_layers * SITE_COUNT * c->max_cols, sizeof(double));
+    c->stats_tokens = 0;
+    return c->stats ? 0 : -1;
+}
+
+static int site_cols(const borg_config *cfg, int site) {
+    switch (site) {
+    case SITE_ATTN_OUT: return cfg->n_heads * cfg->head_dim;
+    case SITE_FFN_MID: return cfg->hidden_dim;
+    default: return cfg->dim;
+    }
+}
+
+const double *borg_ctx_stats(const borg_ctx *c, int layer, int site, int *n_cols) {
+    const borg_config *cfg = &c->model->cfg;
+    if (!c->stats || layer < 0 || layer >= cfg->n_layers || site < 0 || site >= SITE_COUNT) return NULL;
+    if (n_cols) *n_cols = site_cols(cfg, site);
+    return c->stats + ((size_t)layer * SITE_COUNT + site) * c->max_cols;
+}
+
+int64_t borg_ctx_stats_tokens(const borg_ctx *c) { return c->stats_tokens; }
+
+static void record_stats(borg_ctx *c, int layer, int site, const float *x, int T, int ldx) {
+    if (!c->stats) return;
+    const int n = site_cols(&c->model->cfg, site);
+    double *s = c->stats + ((size_t)layer * SITE_COUNT + site) * c->max_cols;
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < n; i++) {
+            const double v = x[(size_t)t * ldx + i];
+            s[i] += v * v;
+        }
 }
 
 int borg_ctx_n_ctx(const borg_ctx *c) { return c->n_ctx; }
@@ -375,6 +417,7 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, int pos0, flo
         const borg_layer *L = &m->layers[l];
         /* attention */
         run_norm(c, c->xb, c->x, L->attn_norm, T, D);
+        record_stats(c, l, SITE_ATTN_IN, c->xb, T, D);
         {
             const borg_mat *ms[3] = {&L->wq, &L->wk, &L->wv};
             float *outs[3] = {c->q, c->k, c->v};
@@ -384,11 +427,13 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, int pos0, flo
         tok_task tt = {c, l, T, pos0};
         pool_for(c->pool, T, 1, qkv_post_range, &tt);
         pool_for(c->pool, T * cfg->n_heads, 1, attention_range, &tt);
+        record_stats(c, l, SITE_ATTN_OUT, c->xb, T, NQ);
         matmul1(c, &L->wo, c->xb2, D, T, c->xb, NQ);
         for (size_t i = 0; i < (size_t)T * D; i++) c->x[i] += c->xb2[i];
 
         /* feed-forward */
         run_norm(c, c->xb, c->x, L->ffn_norm, T, D);
+        record_stats(c, l, SITE_FFN_IN, c->xb, T, D);
         {
             const borg_mat *ms[2] = {&L->w_gate, &L->w_up};
             float *outs[2] = {c->hb, c->hb2};
@@ -401,6 +446,7 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, int pos0, flo
             if (chunk < 512) chunk = 512;
             pool_for(c->pool, T * F, chunk, act_range, c);
         }
+        record_stats(c, l, SITE_FFN_MID, c->hb, T, F);
         matmul1(c, &L->w_down, c->xb2, D, T, c->hb, F);
         for (size_t i = 0; i < (size_t)T * D; i++) c->x[i] += c->xb2[i];
     }
@@ -436,6 +482,7 @@ int borg_decode(borg_ctx *c, const int32_t *tokens, int n, float *logits, int lo
             out = logits;
         }
         forward_chunk(c, tokens + done, T, c->n_past, out, mode);
+        if (c->stats) c->stats_tokens += T;
         memcpy(c->tokens + c->n_past, tokens + done, (size_t)T * sizeof(int32_t));
         c->n_past += T;
         done += T;

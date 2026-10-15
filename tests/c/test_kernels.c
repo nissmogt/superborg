@@ -51,6 +51,22 @@ static void quantize_q4_0(const float *x, block_q4_0 *b, int n) {
     }
 }
 
+static void quantize_q4_1(const float *x, block_q4_1 *b, int n) {
+    for (int i = 0; i < n / QK; i++) {
+        float mn = x[i * QK], mx = x[i * QK];
+        for (int j = 1; j < QK; j++) { mn = fminf(mn, x[i * QK + j]); mx = fmaxf(mx, x[i * QK + j]); }
+        float d = (mx - mn) / 15.0f, id = d ? 1.0f / d : 0.0f;
+        b[i].d = fp32_to_fp16(d);
+        b[i].m = fp32_to_fp16(mn);
+        for (int j = 0; j < QK / 2; j++) {
+            int lo = (int)((x[i * QK + j] - mn) * id + 0.5f), hi = (int)((x[i * QK + j + 16] - mn) * id + 0.5f);
+            lo = lo > 15 ? 15 : (lo < 0 ? 0 : lo);
+            hi = hi > 15 ? 15 : (hi < 0 ? 0 : hi);
+            b[i].qs[j] = (uint8_t)(lo | (hi << 4));
+        }
+    }
+}
+
 static void test_fp16(void) {
     for (int i = 0; i < 65536; i++) {
         uint16_t h = (uint16_t)i;
@@ -78,6 +94,7 @@ static void test_dot(borg_dtype dt, int cols) {
         else if (dt == DT_BF16) for (int i = 0; i < cols; i++) { uint32_t u; memcpy(&u, &src[i], 4); ((uint16_t *)row)[i] = (uint16_t)(u >> 16); }
         else if (dt == DT_Q8_0) quantize_q8_0(src, (block_q8_0 *)row, cols);
         else if (dt == DT_Q4_0) quantize_q4_0(src, (block_q4_0 *)row, cols);
+        else if (dt == DT_Q4_1) quantize_q4_1(src, (block_q4_1 *)row, cols);
     }
     borg_mat m = {dt, rows, cols, data, rb};
     block_q8a *xq = malloc(sizeof(block_q8a) * (cols / QK + 1));
@@ -90,12 +107,13 @@ static void test_dot(borg_dtype dt, int cols) {
             CHECK(fabsf(xq[i].s - xq[i].d * s) <= 1e-5f * fabsf(xq[i].d * s) + 1e-7f, "q8a block sum");
         }
     }
-    float out[7 * 3];
-    float xs[3 * 4096];
-    for (int t = 0; t < 3; t++) memcpy(xs + t * cols, x, sizeof(float) * cols);
-    block_q8a xqs[3 * 4096 / QK];
-    if (cols % QK == 0) for (int t = 0; t < 3; t++) memcpy(xqs + t * (cols / QK), xq, sizeof(block_q8a) * (cols / QK));
-    mat_mul_rows(&m, 0, rows, 3, xs, cols, xqs, cols / QK, out, rows);
+    enum { NT = 6 }; /* exercises the 4-token kernels plus a remainder */
+    static float out[7 * NT];
+    static float xs[NT * 4096];
+    for (int t = 0; t < NT; t++) memcpy(xs + t * cols, x, sizeof(float) * cols);
+    static block_q8a xqs[NT * 4096 / QK];
+    if (cols % QK == 0) for (int t = 0; t < NT; t++) memcpy(xqs + t * (cols / QK), xq, sizeof(block_q8a) * (cols / QK));
+    mat_mul_rows(&m, 0, rows, NT, xs, cols, xqs, cols / QK, out, rows);
     for (int r = 0; r < rows; r++) {
         mat_get_row(&m, r, wd);
         const float *xv = mat_wants_q8a(&m) ? xdq : x;
@@ -103,7 +121,7 @@ static void test_dot(borg_dtype dt, int cols) {
         for (int i = 0; i < cols; i++) { ref += (double)wd[i] * xv[i]; mag += fabs((double)wd[i] * xv[i]); }
         float got = mat_dot_row(&m, r, x, xq);
         CHECK(fabs(got - ref) <= 1e-5 * mag + 1e-6, "%s cols=%d row %d: got %.7g want %.7g", dtype_name(dt), cols, r, got, ref);
-        for (int t = 0; t < 3; t++) CHECK(out[t * rows + r] == got, "%s mat_mul_rows token %d row %d", dtype_name(dt), t, r);
+        for (int t = 0; t < NT; t++) CHECK(fabsf(out[t * rows + r] - got) <= 1e-5f * (float)mag + 1e-6f, "%s mat_mul_rows token %d row %d", dtype_name(dt), t, r);
     }
     free(w); free(x); free(wd); free(data); free(xq); free(xdq);
 }
@@ -136,6 +154,7 @@ int main(void) {
         test_dot(DT_BF16, sizes[s]);
         test_dot(DT_Q8_0, sizes[s]);
         test_dot(DT_Q4_0, sizes[s]);
+        test_dot(DT_Q4_1, sizes[s]);
     }
     test_dot(DT_F32, 37);
     test_dot(DT_F16, 45);

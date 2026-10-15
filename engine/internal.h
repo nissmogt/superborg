@@ -11,7 +11,7 @@
 #define QK 32 /* quantization block size */
 
 /* ---- data types ----------------------------------------------------------- */
-typedef enum { DT_F32 = 0, DT_F16, DT_BF16, DT_Q8_0, DT_Q4_0, DT_U8, DT_U32, DT_I32, DT_COUNT } borg_dtype;
+typedef enum { DT_F32 = 0, DT_F16, DT_BF16, DT_Q8_0, DT_Q4_0, DT_Q4_1, DT_U8, DT_U32, DT_I32, DT_COUNT } borg_dtype;
 
 typedef struct {
     uint16_t d;
@@ -22,6 +22,12 @@ typedef struct {
     uint16_t d;
     uint8_t qs[QK / 2];
 } block_q4_0; /* 18 bytes */
+
+typedef struct {
+    uint16_t d;
+    uint16_t m;
+    uint8_t qs[QK / 2];
+} block_q4_1; /* 20 bytes: x = d * q + m, q in 0..15 */
 
 /* Activations quantized to 8 bits for integer dot products: scale as float plus the
  * block sum (d * sum(qs)) used by formats with an offset. */
@@ -127,6 +133,8 @@ struct borg_ctx {
     block_q8a *xq;       /* [B, max(dim, hidden_dim, n_heads*head_dim) / QK] */
     float *att;          /* [n_threads, n_ctx] attention scores */
     float *embd;         /* [dim] final hidden state of the last token */
+    double *stats;       /* optional [n_layers][SITE_COUNT][max_cols] sums of x^2 per input column */
+    int64_t stats_tokens;
     int max_cols;        /* columns of xq rows */
 };
 
@@ -164,6 +172,9 @@ float bf16_to_fp32(uint16_t h);
 
 size_t dtype_row_bytes(borg_dtype dt, int cols);
 const char *dtype_name(borg_dtype dt);
+
+/* Activation statistics for importance-weighted quantization (see borg_ctx_stats). */
+enum { SITE_ATTN_IN = 0, SITE_ATTN_OUT, SITE_FFN_IN, SITE_FFN_MID, SITE_COUNT };
 
 /* Quantize n floats (n % QK == 0) into n/QK activation blocks. */
 void quantize_row_q8a(const float *x, block_q8a *y, int n);

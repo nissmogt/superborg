@@ -94,6 +94,15 @@ BORG_API int borg_decode(borg_ctx *ctx, const int32_t *tokens, int n, float *log
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);
 
+/* Activation statistics for importance-weighted quantization. When enabled, every
+ * borg_decode adds x^2 of each matrix input column. Sites: 0 attention input (q/k/v),
+ * 1 attention output (o), 2 feed-forward input (gate/up), 3 feed-forward hidden (down).
+ * borg_ctx_stats returns the sums (n_cols values via *n_cols) or NULL; divide by
+ * borg_ctx_stats_tokens for the mean. */
+BORG_API int borg_ctx_enable_stats(borg_ctx *ctx, int enable);
+BORG_API const double *borg_ctx_stats(const borg_ctx *ctx, int layer, int site, int *n_cols);
+BORG_API int64_t borg_ctx_stats_tokens(const borg_ctx *ctx);
+
 /* ---- sampling ------------------------------------------------------------- */
 typedef struct {
     float temperature;    /* <= 0: greedy */

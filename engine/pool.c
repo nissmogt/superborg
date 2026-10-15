@@ -14,8 +14,8 @@
 
 #include <stdlib.h>
 
-#if defined(_WIN32) && !defined(BORG_NO_THREADS)
-#define BORG_NO_THREADS 1 /* TODO: native Win32 threads; single-threaded for now */
+#if defined(_MSC_VER) && !defined(BORG_NO_THREADS)
+#define BORG_NO_THREADS 1 /* MSVC has no pthreads: build with MinGW/clang for threads */
 #endif
 
 #if defined(BORG_NO_THREADS)
@@ -44,7 +44,11 @@ void pool_for(borg_pool *pool, int n_items, int chunk, borg_range_fn fn, void *c
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -139,7 +143,13 @@ static void *worker_main(void *arg) {
 }
 
 static int default_threads(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    long n = (long)si.dwNumberOfProcessors;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (n < 1) n = 1;
     if (n > 64) n = 64;
     return (int)n;

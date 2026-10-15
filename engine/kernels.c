@@ -42,6 +42,10 @@ static inline float u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 float fp16_to_fp32(uint16_t h) {
 #if defined(__F16C__)
     return _cvtsh_ss(h);
+#elif defined(__aarch64__)
+    __fp16 v;
+    memcpy(&v, &h, 2);
+    return (float)v;
 #else
     /* exact conversion including subnormals, inf and nan */
     const uint32_t w = (uint32_t)h << 16;
@@ -58,6 +62,11 @@ float fp16_to_fp32(uint16_t h) {
 uint16_t fp32_to_fp16(float f) {
 #if defined(__F16C__)
     return _cvtss_sh(f, 0);
+#elif defined(__aarch64__)
+    __fp16 v = (__fp16)f;
+    uint16_t h;
+    memcpy(&h, &v, 2);
+    return h;
 #else
     const float scale_to_inf = 0x1.0p+112f;
     const float scale_to_zero = 0x1.0p-110f;
@@ -84,12 +93,13 @@ size_t dtype_row_bytes(borg_dtype dt, int cols) {
     case DT_F16: case DT_BF16: return (size_t)cols * 2;
     case DT_Q8_0: return (size_t)(cols / QK) * sizeof(block_q8_0);
     case DT_Q4_0: return (size_t)(cols / QK) * sizeof(block_q4_0);
+    case DT_Q4_1: return (size_t)(cols / QK) * sizeof(block_q4_1);
     default: return 0;
     }
 }
 
 const char *dtype_name(borg_dtype dt) {
-    static const char *names[DT_COUNT] = {"f32", "f16", "bf16", "q8_0", "q4_0", "u8", "u32", "i32"};
+    static const char *names[DT_COUNT] = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "u8", "u32", "i32"};
     return dt < DT_COUNT ? names[dt] : "?";
 }
 
@@ -365,8 +375,58 @@ static float vec_dot_q4_0_q8a(const block_q4_0 *w, const block_q8a *x, int nb) {
     return sum;
 }
 
+static float vec_dot_q4_1_q8a(const block_q4_1 *w, const block_q8a *x, int nb) {
+    /* sum_j (d_w q_j + m_w) d_x x_j = d_w d_x sum_j q_j x_j + m_w s_x */
+    int i = 0;
+    float sum = 0.0f;
+#if defined(BORG_AVX2)
+    const __m256i lowmask = _mm256_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    float corr = 0.0f;
+    for (; i < nb; i++) {
+        __m128i raw = _mm_loadu_si128((const __m128i *)w[i].qs);
+        __m256i q = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw, 4), raw), lowmask);
+        __m256i qx = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(fp16_to_fp32(w[i].d) * x[i].d), _mm256_cvtepi32_ps(dot_u8_i8(q, qx)), acc);
+        corr += fp16_to_fp32(w[i].m) * x[i].s;
+    }
+    sum = hsum256(acc) + corr;
+#elif defined(BORG_NEON)
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    float32x4_t acc = vdupq_n_f32(0);
+    float corr = 0.0f;
+    for (; i < nb; i++) {
+        uint8x16_t raw = vld1q_u8(w[i].qs);
+        int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(raw, m4));
+        int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(raw, 4));
+        int8x16_t x0 = vld1q_s8(x[i].qs), x1 = vld1q_s8(x[i].qs + 16);
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t p = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x0), hi, x1);
+#else
+        int16x8_t a0 = vmull_s8(vget_low_s8(lo), vget_low_s8(x0));
+        int16x8_t a1 = vmull_s8(vget_high_s8(lo), vget_high_s8(x0));
+        int16x8_t a2 = vmull_s8(vget_low_s8(hi), vget_low_s8(x1));
+        int16x8_t a3 = vmull_s8(vget_high_s8(hi), vget_high_s8(x1));
+        int32x4_t p = vaddq_s32(vaddq_s32(vpaddlq_s16(a0), vpaddlq_s16(a1)), vaddq_s32(vpaddlq_s16(a2), vpaddlq_s16(a3)));
+#endif
+        acc = vmlaq_n_f32(acc, vcvtq_f32_s32(p), fp16_to_fp32(w[i].d) * x[i].d);
+        corr += fp16_to_fp32(w[i].m) * x[i].s;
+    }
+    sum = vaddvq_f32(acc) + corr;
+#endif
+    for (; i < nb; i++) {
+        int s = 0;
+        for (int j = 0; j < QK / 2; j++) {
+            s += (int)(w[i].qs[j] & 0x0F) * (int)x[i].qs[j];
+            s += (int)(w[i].qs[j] >> 4) * (int)x[i].qs[j + QK / 2];
+        }
+        sum += fp16_to_fp32(w[i].d) * x[i].d * (float)s + fp16_to_fp32(w[i].m) * x[i].s;
+    }
+    return sum;
+}
+
 /* ---- matrix helpers ------------------------------------------------------- */
-int mat_wants_q8a(const borg_mat *m) { return m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0; }
+int mat_wants_q8a(const borg_mat *m) { return m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0 || m->dtype == DT_Q4_1; }
 
 void mat_get_row(const borg_mat *m, int r, float *out) {
     const uint8_t *row = (const uint8_t *)m->data + (size_t)r * m->row_bytes;
@@ -394,6 +454,17 @@ void mat_get_row(const borg_mat *m, int r, float *out) {
         }
         break;
     }
+    case DT_Q4_1: {
+        const block_q4_1 *b = (const block_q4_1 *)row;
+        for (int i = 0; i < n / QK; i++) {
+            const float d = fp16_to_fp32(b[i].d), mn = fp16_to_fp32(b[i].m);
+            for (int j = 0; j < QK / 2; j++) {
+                out[i * QK + j] = d * (float)(b[i].qs[j] & 0x0F) + mn;
+                out[i * QK + j + QK / 2] = d * (float)(b[i].qs[j] >> 4) + mn;
+            }
+        }
+        break;
+    }
     default: memset(out, 0, (size_t)n * 4);
     }
 }
@@ -406,12 +477,108 @@ float mat_dot_row(const borg_mat *m, int r, const float *xf, const block_q8a *xq
     case DT_BF16: return vec_dot_bf16_f32((const uint16_t *)row, xf, m->cols);
     case DT_Q8_0: return vec_dot_q8_0_q8a((const block_q8_0 *)row, xq, m->cols / QK);
     case DT_Q4_0: return vec_dot_q4_0_q8a((const block_q4_0 *)row, xq, m->cols / QK);
+    case DT_Q4_1: return vec_dot_q4_1_q8a((const block_q4_1 *)row, xq, m->cols / QK);
     default: return 0.0f;
     }
 }
 
+/* ---- multi-token kernels --------------------------------------------------
+ * Batched evaluation (prompt prefill, speculative verification) multiplies each weight
+ * row with several activation rows. These kernels load and unpack every weight block
+ * once for 4 tokens instead of once per token. */
+#if defined(BORG_AVX2)
+static void dot_q8_0_q8a_x4(const block_q8_0 *w, const block_q8a *const x[4], int nb, float out[4]) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const __m256i qw = _mm256_loadu_si256((const __m256i *)w[i].qs);
+        const __m256i aw = _mm256_sign_epi8(qw, qw);
+        const float dw = fp16_to_fp32(w[i].d);
+#define STEP(c, acc)                                                                          \
+    {                                                                                         \
+        const __m256i sx = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)x[c][i].qs), qw); \
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * x[c][i].d), _mm256_cvtepi32_ps(dot_u8_i8(aw, sx)), acc); \
+    }
+        STEP(0, acc0) STEP(1, acc1) STEP(2, acc2) STEP(3, acc3)
+#undef STEP
+    }
+    out[0] = hsum256(acc0);
+    out[1] = hsum256(acc1);
+    out[2] = hsum256(acc2);
+    out[3] = hsum256(acc3);
+}
+
+static void dot_q4_0_q8a_x4(const block_q4_0 *w, const block_q8a *const x[4], int nb, float out[4]) {
+    const __m256i lowmask = _mm256_set1_epi8(0x0F);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    float corr[4] = {0, 0, 0, 0};
+    for (int i = 0; i < nb; i++) {
+        const __m128i raw = _mm_loadu_si128((const __m128i *)w[i].qs);
+        const __m256i q = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw, 4), raw), lowmask);
+        const float dw = fp16_to_fp32(w[i].d);
+#define STEP(c, acc)                                                                          \
+    {                                                                                         \
+        const __m256i qx = _mm256_loadu_si256((const __m256i *)x[c][i].qs);                   \
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * x[c][i].d), _mm256_cvtepi32_ps(dot_u8_i8(q, qx)), acc); \
+        corr[c] += dw * x[c][i].s;                                                            \
+    }
+        STEP(0, acc0) STEP(1, acc1) STEP(2, acc2) STEP(3, acc3)
+#undef STEP
+    }
+    out[0] = hsum256(acc0) - 8.0f * corr[0];
+    out[1] = hsum256(acc1) - 8.0f * corr[1];
+    out[2] = hsum256(acc2) - 8.0f * corr[2];
+    out[3] = hsum256(acc3) - 8.0f * corr[3];
+}
+
+static void dot_q4_1_q8a_x4(const block_q4_1 *w, const block_q8a *const x[4], int nb, float out[4]) {
+    const __m256i lowmask = _mm256_set1_epi8(0x0F);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    float corr[4] = {0, 0, 0, 0};
+    for (int i = 0; i < nb; i++) {
+        const __m128i raw = _mm_loadu_si128((const __m128i *)w[i].qs);
+        const __m256i q = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw, 4), raw), lowmask);
+        const float dw = fp16_to_fp32(w[i].d), mw = fp16_to_fp32(w[i].m);
+#define STEP(c, acc)                                                                          \
+    {                                                                                         \
+        const __m256i qx = _mm256_loadu_si256((const __m256i *)x[c][i].qs);                   \
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * x[c][i].d), _mm256_cvtepi32_ps(dot_u8_i8(q, qx)), acc); \
+        corr[c] += mw * x[c][i].s;                                                            \
+    }
+        STEP(0, acc0) STEP(1, acc1) STEP(2, acc2) STEP(3, acc3)
+#undef STEP
+    }
+    out[0] = hsum256(acc0) + corr[0];
+    out[1] = hsum256(acc1) + corr[1];
+    out[2] = hsum256(acc2) + corr[2];
+    out[3] = hsum256(acc3) + corr[3];
+}
+#endif
+
 void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
                   int ldxq, float *out, int ldo) {
+#if defined(BORG_AVX2)
+    if ((m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0 || m->dtype == DT_Q4_1) && T >= 4) {
+        const int nb = m->cols / QK;
+        for (int r = r0; r < r1; r++) {
+            const uint8_t *row = (const uint8_t *)m->data + (size_t)r * m->row_bytes;
+            int t = 0;
+            for (; t + 4 <= T; t += 4) {
+                const block_q8a *xs[4] = {xq + (size_t)t * ldxq, xq + (size_t)(t + 1) * ldxq,
+                                          xq + (size_t)(t + 2) * ldxq, xq + (size_t)(t + 3) * ldxq};
+                float o[4];
+                if (m->dtype == DT_Q8_0) dot_q8_0_q8a_x4((const block_q8_0 *)row, xs, nb, o);
+                else if (m->dtype == DT_Q4_0) dot_q4_0_q8a_x4((const block_q4_0 *)row, xs, nb, o);
+                else dot_q4_1_q8a_x4((const block_q4_1 *)row, xs, nb, o);
+                for (int c = 0; c < 4; c++) out[(size_t)(t + c) * ldo + r] = o[c];
+            }
+            for (; t < T; t++) out[(size_t)t * ldo + r] = mat_dot_row(m, r, NULL, xq + (size_t)t * ldxq);
+        }
+        return;
+    }
+#endif
     for (int r = r0; r < r1; r++)
         for (int t = 0; t < T; t++)
             out[(size_t)t * ldo + r] = mat_dot_row(m, r, x ? x + (size_t)t * ldx : NULL, xq ? xq + (size_t)t * ldxq : NULL);

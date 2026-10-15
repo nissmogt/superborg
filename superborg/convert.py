@@ -98,34 +98,117 @@ def quantize_q8_0(x: np.ndarray) -> bytes:
     return out.tobytes()
 
 
-def quantize_q4_0(x: np.ndarray) -> bytes:
-    """Q4_0 (ggml layout). The scale is chosen per block from a few candidates to
-    minimise squared error, which is lossless with respect to the format."""
+def _block_weights(imp: np.ndarray | None, cols: int) -> np.ndarray:
+    """Per-column importance reshaped to broadcast over [rows, blocks, QK]."""
+    if imp is None:
+        return np.ones((1, cols // QK, QK), dtype=np.float32)
+    w = np.asarray(imp, dtype=np.float32).reshape(1, cols // QK, QK)
+    return np.maximum(w, w.mean() * 1e-3) + 1e-12  # keep every column at least slightly weighted
+
+
+def _f16(a: np.ndarray) -> np.ndarray:
+    return a.astype(np.float16).astype(np.float32)
+
+
+def _safe_inv(d: np.ndarray) -> np.ndarray:
+    return np.where(d != 0, 1.0 / np.where(d != 0, d, 1), 0.0).astype(np.float32)
+
+
+ROW_CHUNK = 512  # quantize big matrices in row slices to bound temporary memory
+
+
+def quantize_q4_0(x: np.ndarray, imp: np.ndarray | None = None) -> bytes:
+    """Q4_0 (ggml layout): x = d * (q - 8). The scale is chosen per block from several
+    candidates, each refined by a weighted least-squares fit, to minimise the squared error
+    weighted by `imp` (mean squared activation per input column, if given)."""
     rows, cols = x.shape
     assert cols % QK == 0
-    b = x.reshape(-1, QK).astype(np.float32)
-    idx = np.abs(b).argmax(axis=1)
-    vmax = b[np.arange(b.shape[0]), idx]  # signed value with the largest magnitude
-    best_err = np.full(b.shape[0], np.inf, dtype=np.float32)
-    best_d = np.zeros(b.shape[0], dtype=np.float32)
-    best_q = np.zeros(b.shape, dtype=np.uint8)
-    for div in (-8.0, -7.75, -7.5, -7.25, -7.0, -6.75, 7.0, 7.25, 7.5):
-        d = (vmax / div).astype(np.float16).astype(np.float32)
-        inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1), 0.0)
-        q = np.clip(np.rint(b * inv[:, None]) + 8, 0, 15)
-        err = ((q - 8) * d[:, None] - b) ** 2
-        err = err.sum(axis=1)
-        better = err < best_err
-        best_err = np.where(better, err, best_err)
-        best_d = np.where(better, d, best_d)
-        best_q = np.where(better[:, None], q.astype(np.uint8), best_q)
-    lo = best_q[:, :16]
-    hi = best_q[:, 16:]
-    packed = (lo | (hi << 4)).astype(np.uint8)
-    out = np.empty(b.shape[0], dtype=[("d", "<f2"), ("qs", "u1", (16,))])
-    out["d"] = best_d.astype(np.float16)
-    out["qs"] = packed
-    return out.tobytes()
+    w = _block_weights(imp, cols)
+    parts = []
+    for r0 in range(0, rows, ROW_CHUNK):
+        b = x[r0:r0 + ROW_CHUNK].reshape(-1, cols // QK, QK).astype(np.float32)
+        idx = np.abs(b).argmax(axis=2)
+        vmax = np.take_along_axis(b, idx[..., None], axis=2)[..., 0]  # signed value of largest magnitude
+        best_err = np.full(b.shape[:2], np.inf, dtype=np.float32)
+        best_d = np.zeros(b.shape[:2], dtype=np.float32)
+        best_q = np.zeros(b.shape, dtype=np.uint8)
+        for div in (-8.0, -7.75, -7.5, -7.25, -7.0, -6.75, -6.5, 7.0, 7.25, 7.5):
+            d0 = _f16(vmax / div)
+            q0 = np.clip(np.rint(b * _safe_inv(d0)[..., None]), -8, 7)
+            num = (w * b * q0).sum(axis=2)
+            den = (w * q0 * q0).sum(axis=2)
+            d1 = _f16(np.where(den > 0, num / np.where(den > 0, den, 1), d0))
+            q1 = np.clip(np.rint(b * _safe_inv(d1)[..., None]), -8, 7)
+            for d, q in ((d0, q0), (d1, q1)):
+                err = (w * (q * d[..., None] - b) ** 2).sum(axis=2)
+                better = err < best_err
+                best_err = np.where(better, err, best_err)
+                best_d = np.where(better, d, best_d)
+                best_q = np.where(better[..., None], (q + 8).astype(np.uint8), best_q)
+        n = b.shape[0] * b.shape[1]
+        qb = best_q.reshape(n, QK)
+        out = np.empty(n, dtype=[("d", "<f2"), ("qs", "u1", (16,))])
+        out["d"] = best_d.reshape(n).astype(np.float16)
+        out["qs"] = (qb[:, :16] | (qb[:, 16:] << 4)).astype(np.uint8)
+        parts.append(out.tobytes())
+    return b"".join(parts)
+
+
+def quantize_q4_1(x: np.ndarray, imp: np.ndarray | None = None) -> bytes:
+    """Q4_1: x = d * q + m with q in 0..15, f16 d and m per 32 values (5 bits per weight).
+    (d, m) start from the block range and are refined by alternating rounding with a
+    weighted least-squares fit; the best fit seen is kept."""
+    rows, cols = x.shape
+    assert cols % QK == 0
+    w = _block_weights(imp, cols)
+    parts = []
+    for r0 in range(0, rows, ROW_CHUNK):
+        b = x[r0:r0 + ROW_CHUNK].reshape(-1, cols // QK, QK).astype(np.float32)
+        mn, mx = b.min(axis=2), b.max(axis=2)
+        d = (mx - mn) / 15.0
+        m = mn.copy()
+        sw = np.broadcast_to(w, b.shape).sum(axis=2)
+        sx = (w * b).sum(axis=2)
+        best_err = np.full(b.shape[:2], np.inf, dtype=np.float32)
+        best_d = np.zeros(b.shape[:2], dtype=np.float32)
+        best_m = np.zeros(b.shape[:2], dtype=np.float32)
+        best_q = np.zeros(b.shape, dtype=np.uint8)
+        for it in range(6):
+            df, mf = _f16(d), _f16(m)
+            q = np.clip(np.rint((b - mf[..., None]) * _safe_inv(df)[..., None]), 0, 15)
+            err = (w * (q * df[..., None] + mf[..., None] - b) ** 2).sum(axis=2)
+            better = err < best_err
+            best_err = np.where(better, err, best_err)
+            best_d = np.where(better, df, best_d)
+            best_m = np.where(better, mf, best_m)
+            best_q = np.where(better[..., None], q.astype(np.uint8), best_q)
+            if it == 5:
+                break
+            # least squares for (d, m) given q
+            sq = (w * q).sum(axis=2)
+            sqq = (w * q * q).sum(axis=2)
+            sqx = (w * q * b).sum(axis=2)
+            det = sw * sqq - sq * sq
+            ok = det > 1e-30
+            dn = np.where(ok, (sw * sqx - sq * sx) / np.where(ok, det, 1), d)
+            mnew = np.where(ok, (sqq * sx - sq * sqx) / np.where(ok, det, 1), m)
+            d = np.where(dn > 0, dn, d)
+            m = np.where(dn > 0, mnew, m)
+        n = b.shape[0] * b.shape[1]
+        qb = best_q.reshape(n, QK)
+        out = np.empty(n, dtype=[("d", "<f2"), ("m", "<f2"), ("qs", "u1", (16,))])
+        out["d"] = best_d.reshape(n).astype(np.float16)
+        out["m"] = best_m.reshape(n).astype(np.float16)
+        out["qs"] = (qb[:, :16] | (qb[:, 16:] << 4)).astype(np.uint8)
+        parts.append(out.tobytes())
+    return b"".join(parts)
+
+
+QUANT_BYTES = {"q8_0": 34, "q4_0": 18, "q4_1": 20}  # bytes per block of QK values
+FOUR_BIT = ("q4_0", "q4_1")
+# Tensors that dominate the 4-bit error: with these at 8 bits and calibrated q4_1 for the rest,
+# Qwen2.5-0.5B loses 0.7% perplexity versus 11% for plain q4_0 (bench/quant_eval.py).
+Q4_RECIPE_KEEP = ("attn_v", "ffn_down")
 
 
 def dequantize(dtype: str, data: bytes, shape: list[int]) -> np.ndarray:
@@ -145,11 +228,15 @@ def dequantize(dtype: str, data: bytes, shape: list[int]) -> np.ndarray:
         hi = (blk["qs"] >> 4).astype(np.int8) - 8
         q = np.concatenate([lo, hi], axis=1).astype(np.float32)
         return (blk["d"].astype(np.float32)[:, None] * q).reshape(shape)
+    if dtype == "q4_1":
+        blk = np.frombuffer(data, dtype=[("d", "<f2"), ("m", "<f2"), ("qs", "u1", (16,))])
+        q = np.concatenate([blk["qs"] & 0x0F, blk["qs"] >> 4], axis=1).astype(np.float32)
+        return (blk["d"].astype(np.float32)[:, None] * q + blk["m"].astype(np.float32)[:, None]).reshape(shape)
     raise ValueError(dtype)
 
 
-def encode_tensor(x: np.ndarray, dtype: str) -> tuple[str, bytes]:
-    if dtype in ("q8_0", "q4_0") and (x.ndim != 2 or x.shape[1] % QK != 0):
+def encode_tensor(x: np.ndarray, dtype: str, imp: np.ndarray | None = None) -> tuple[str, bytes]:
+    if dtype in QUANT_BYTES and (x.ndim != 2 or x.shape[1] % QK != 0):
         dtype = "f16"
     if dtype == "f32":
         return dtype, np.ascontiguousarray(x, dtype=np.float32).tobytes()
@@ -162,8 +249,44 @@ def encode_tensor(x: np.ndarray, dtype: str) -> tuple[str, bytes]:
     if dtype == "q8_0":
         return dtype, quantize_q8_0(x)
     if dtype == "q4_0":
-        return dtype, quantize_q4_0(x)
+        return dtype, quantize_q4_0(x, imp)
+    if dtype == "q4_1":
+        return dtype, quantize_q4_1(x, imp)
     raise ValueError(f"unknown dtype {dtype}")
+
+
+# ---------------------------------------------------------------------------
+# calibration (importance matrix)
+
+# which activation site feeds each weight matrix (see borg_ctx_stats in engine/borg.h)
+_SITE = {"attn_q": 0, "attn_k": 0, "attn_v": 0, "attn_o": 1, "ffn_gate": 2, "ffn_up": 2, "ffn_down": 3}
+CALIBRATION_TEXT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "calibration.txt")
+
+
+def collect_importance(model_path: str, text: str, max_tokens: int = 8192, threads: int = 0,
+                       log=print) -> dict[tuple[int, int], np.ndarray]:
+    """Mean squared activation per input column of every matrix, measured by running the
+    engine on `text`. Returns {(layer, site): array}."""
+    from .engine import Model  # needs the compiled engine
+
+    m = Model(model_path, threads=threads)
+    n_ctx = min(m.max_seq_len, 2048)
+    ctx = m.context(n_ctx=n_ctx)
+    ctx.enable_stats()
+    toks = m.tokenize(text)[:max_tokens]
+    for s in range(0, len(toks), n_ctx):
+        ctx.reset()
+        ctx.decode(toks[s:s + n_ctx], logits=None)
+    n = ctx.stats_tokens()
+    out = {}
+    for layer in range(m.config["n_layers"]):
+        for site in range(4):
+            out[(layer, site)] = ctx.stats(layer, site) / max(n, 1)
+    if log:
+        log(f"calibration: {n} tokens")
+    ctx.close()
+    m.close()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -512,16 +635,38 @@ def weight_plan(st: SafeTensors, config: dict) -> list[tuple[str, str]]:
     return plan
 
 
-def tensor_dtype(borg_name: str, ndim: int, qtype: str) -> str:
+def tensor_dtype(borg_name: str, ndim: int, qtype: str, keep_q8: tuple[str, ...] = ()) -> str:
     if ndim == 1:
         return "f32"
-    if qtype == "q4_0" and borg_name in ("tok_embd", "output"):
+    if qtype in FOUR_BIT and borg_name in ("tok_embd", "output"):
         return "q8_0"  # embeddings/output stay at 8 bits: small cost, large quality gain
+    if qtype in FOUR_BIT and any(borg_name.endswith(k) for k in keep_q8):
+        return "q8_0"
     return qtype
 
 
 def convert(model_dir: str, out_path: str, qtype: str = "q8_0", source: str | None = None,
-            log=print) -> dict:
+            log=print, keep_q8: tuple[str, ...] = (), calibration: str | None = None) -> dict:
+    """Write `out_path`. With a 4-bit qtype and `calibration` (text, or "builtin"), the
+    model is first converted to q8_0, run on the text to measure activation statistics,
+    and the 4-bit rounding then minimises the error weighted by them."""
+    if qtype == "q4":  # recommended 4-bit recipe
+        qtype = "q4_1"
+        keep_q8 = keep_q8 or Q4_RECIPE_KEEP
+        calibration = calibration or "builtin"
+    importance = None
+    if calibration is not None and qtype in FOUR_BIT:
+        text = calibration
+        if calibration == "builtin":
+            with open(CALIBRATION_TEXT, encoding="utf-8") as f:
+                text = f.read()
+        tmp_q8 = out_path + ".calib.borg"
+        try:
+            convert(model_dir, tmp_q8, "q8_0", source=source, log=None)
+            importance = collect_importance(tmp_q8, text, log=log)
+        finally:
+            if os.path.exists(tmp_q8):
+                os.remove(tmp_q8)
     with open(os.path.join(model_dir, "config.json")) as f:
         hf_cfg = json.load(f)
     arch, config = convert_config(hf_cfg)
@@ -537,12 +682,11 @@ def convert(model_dir: str, out_path: str, qtype: str = "q8_0", source: str | No
         shape = list(info["shape"])
         if bn == "tok_embd" and shape[0] != config["vocab_size"]:
             config["vocab_size"] = shape[0]
-        dt = tensor_dtype(bn, len(shape), qtype)
-        if dt in ("q8_0", "q4_0") and shape[-1] % QK != 0:
+        dt = tensor_dtype(bn, len(shape), qtype, keep_q8)
+        if dt in QUANT_BYTES and shape[-1] % QK != 0:
             dt = "f16"
         n = int(np.prod(shape))
-        nbytes = {"f32": 4 * n, "f16": 2 * n, "bf16": 2 * n,
-                  "q8_0": n // QK * 34, "q4_0": n // QK * 18}[dt]
+        nbytes = n // QK * QUANT_BYTES[dt] if dt in QUANT_BYTES else {"f32": 4 * n, "f16": 2 * n, "bf16": 2 * n}[dt]
         entries.append((hf, bn, dt, shape, offset, nbytes))
         offset = (offset + nbytes + ALIGN - 1) // ALIGN * ALIGN
     tok_entries = []
@@ -555,7 +699,7 @@ def convert(model_dir: str, out_path: str, qtype: str = "q8_0", source: str | No
         "version": VERSION,
         "arch": arch,
         "source": source or os.path.basename(os.path.normpath(model_dir)),
-        "quant": qtype,
+        "quant": qtype + ("+imatrix" if importance is not None else ""),
         "config": config,
         "tokenizer": tok_meta,
         "tensors": {},
@@ -573,7 +717,12 @@ def convert(model_dir: str, out_path: str, qtype: str = "q8_0", source: str | No
         f.write(b"\0" * (data_start - f.tell()))
         for k, (hf, bn, dt, shape, off, nb) in enumerate(entries):
             x = st.get(hf)
-            got_dt, blob = encode_tensor(x, dt)
+            imp = None
+            if importance is not None and bn.startswith("blk.") and x.ndim == 2:
+                layer, kind = int(bn.split(".")[1]), bn.split(".")[2]
+                if kind in _SITE:
+                    imp = importance[(layer, _SITE[kind])][: x.shape[1]]
+            got_dt, blob = encode_tensor(x, dt, imp)
             assert got_dt == dt and len(blob) == nb, (bn, got_dt, dt, len(blob), nb)
             f.seek(data_start + off)
             f.write(blob)
@@ -612,11 +761,24 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Convert a Hugging Face model directory to .borg")
     ap.add_argument("model_dir")
     ap.add_argument("out")
-    ap.add_argument("--qtype", default="q8_0", choices=["f32", "f16", "bf16", "q8_0", "q4_0"])
+    ap.add_argument("--qtype", default="q8_0", choices=["f32", "f16", "bf16", "q8_0", "q4", "q4_0", "q4_1"],
+                    help="q8_0: near-lossless (default). q4: recommended 4-bit recipe = q4_1 with calibrated "
+                         "rounding and attn_v/ffn_down kept at q8_0. q4_0/q4_1: plain 4-bit formats")
+    ap.add_argument("--calibrate", nargs="?", const="builtin", default=None, metavar="TEXT_FILE",
+                    help="4-bit only: weight rounding errors by activation statistics measured on a text "
+                         "(the built-in sample when no file is given); needs the compiled engine")
     ap.add_argument("--source", default=None, help="model id recorded in the header")
+    ap.add_argument("--keep-q8", default="", help="4-bit only: comma-separated tensor name suffixes "
+                    "kept at q8_0, e.g. ffn_down,attn_v")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
-    h = convert(a.model_dir, a.out, a.qtype, a.source, log=None if a.quiet else print)
+    keep = tuple(k.strip() for k in a.keep_q8.split(",") if k.strip())
+    calib = a.calibrate
+    if calib not in (None, "builtin"):
+        with open(calib, encoding="utf-8") as f:
+            calib = f.read()
+    h = convert(a.model_dir, a.out, a.qtype, a.source, log=None if a.quiet else print, keep_q8=keep,
+                calibration=calib)
     size = os.path.getsize(a.out)
     print(f"wrote {a.out}: {h['arch']} {h['config']['n_layers']} layers, {a.qtype}, {size / 1e6:.1f} MB",
           file=sys.stderr)
