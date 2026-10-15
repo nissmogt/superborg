@@ -91,6 +91,15 @@ BORG_API void borg_ctx_truncate(borg_ctx *ctx, int n_keep);
  * logits_mode 0: write nothing; 1: last token's logits (vocab_size floats);
  * 2: logits of every token (n * vocab_size floats). Returns 0 on success. */
 BORG_API int borg_decode(borg_ctx *ctx, const int32_t *tokens, int n, float *logits, int logits_mode);
+/* Decode one token for each of n contexts of the same model in a single batched pass
+ * (token i is appended to ctxs[i]). Weights are read once for all sequences, so sampling
+ * several continuations costs little more than one on memory-bound devices. All contexts
+ * must be distinct, share n_ctx, and n must not exceed ctxs[0]'s n_batch. logits (optional)
+ * receives n * vocab_size floats. Returns 0 on success. */
+BORG_API int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logits);
+/* Copy the cached tokens and keys/values of src into dst (same model). */
+BORG_API int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src);
+
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);
 
@@ -159,6 +168,17 @@ BORG_API borg_gen_params borg_gen_default_params(void);
  * Returns the number of generated tokens, or a negative value on error. */
 BORG_API int borg_generate(borg_ctx *ctx, const int32_t *prompt, int n_prompt, const borg_gen_params *params,
                            borg_token_cb cb, void *user, int32_t *out, int max_out, borg_gen_stats *stats);
+
+/* Sample n_seq independent continuations of one prompt in lockstep (batched decoding).
+ * The prompt is evaluated once in ctxs[0] (reusing its cached prefix) and copied to the
+ * other contexts. Sequence i samples with seed params->sampling.seed + i. Speculative
+ * fields of params are ignored. cb gets the sequence index; returning nonzero stops that
+ * sequence. n_generated (optional, n_seq ints) receives per-sequence token counts and
+ * stop_reasons (optional) the reason codes of borg_gen_stats. Returns total tokens. */
+typedef int (*borg_multi_cb)(int seq, int32_t tok, const char *piece, int piece_len, void *user);
+BORG_API int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n_prompt,
+                                 const borg_gen_params *params, borg_multi_cb cb, void *user, int *n_generated,
+                                 int *stop_reasons, borg_gen_stats *stats);
 
 #ifdef __cplusplus
 }

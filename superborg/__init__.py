@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Callable, Iterable, Sequence
 
 from .chat import ChatFormatter, formatter_for
-from .engine import Context, Generation, Model, Pool, Sampling, simd
+from .engine import Context, Generation, Model, Pool, Sampling, generate_multi, simd
 
 __all__ = ["LLM", "Model", "Context", "Sampling", "Generation", "Pool", "ChatFormatter", "simd"]
 __version__ = "0.1.0"
@@ -33,6 +33,8 @@ class LLM:
         self.draft_model = Model(draft, pool=self.pool) if draft else None
         self.draft_ctx = self.draft_model.context(n_ctx=self.ctx.n_ctx, kv_f16=kv_f16) if draft else None
         self.n_draft = n_draft
+        self._kv_f16 = kv_f16
+        self._extra: list[Context] = []  # contexts for batched multi-sample generation
 
     @property
     def name(self) -> str:
@@ -67,6 +69,45 @@ class LLM:
         return self.ctx.generate(prompt_tokens, max_tokens=max_tokens, sampling=sampling, stop=stop, stream=stream,
                                  draft=draft, n_draft=self.n_draft, lookup_ngram=lookup if speculative else 0)
 
+    def sample_n(self, prompt_tokens: Sequence[int], n: int, max_tokens: int = 256, temperature: float = 0.7,
+                 top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0, repeat_penalty: float = 1.0,
+                 seed: int = 0x5EED, stop: Iterable[str] = (),
+                 stream: Callable[[int, str], None] | None = None) -> list[Generation]:
+        """n independent samples of one prompt, decoded together in batches (sequence i uses
+        seed + i). On CPUs this costs far less than n separate generate calls because the
+        weights are read once per step for all sequences."""
+        if n <= 1:
+            g = self.generate_tokens(prompt_tokens, max_tokens=max_tokens, temperature=temperature, top_k=top_k,
+                                     top_p=top_p, min_p=min_p, repeat_penalty=repeat_penalty, seed=seed,
+                                     stop=stop, stream=(lambda t: stream(0, t)) if stream else None,
+                                     speculative=False)
+            return [g]
+        prompt_tokens = list(prompt_tokens)
+        room = self.ctx.n_ctx - len(prompt_tokens) - 1
+        if room <= 0:
+            raise ValueError(f"prompt ({len(prompt_tokens)} tokens) does not fit the {self.ctx.n_ctx}-token context")
+        while len(self._extra) < n - 1:
+            self._extra.append(self.model.context(n_ctx=self.ctx.n_ctx, kv_f16=self._kv_f16))
+        sampling = Sampling(temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+                            repeat_penalty=repeat_penalty, seed=seed)
+        results: list[Generation] = []
+        batch = 32  # contexts decoded per pass (the context's n_batch bounds it)
+        for start in range(0, n, batch):
+            k = min(batch, n - start)
+            ctxs = [self.ctx] + self._extra[start: start + k - 1] if start == 0 else self._extra[start - 1: start - 1 + k]
+            sampling.seed = seed + start
+            res = generate_multi(ctxs, prompt_tokens, max_tokens=min(max_tokens, room), sampling=sampling, stop=stop,
+                                 stream=(lambda i, t, o=start: stream(i + o, t)) if stream else None)
+            results.extend(res)
+        return results
+
+    def chat_n(self, messages: list[dict], n: int, max_tokens: int = 512, enable_thinking: bool = False,
+               **kw) -> list[Generation]:
+        """n sampled answers to the last message (see sample_n)."""
+        text = self.render(messages, enable_thinking=enable_thinking)
+        stop = list(kw.pop("stop", ())) + self.formatter.stop_strings()
+        return self.sample_n(self.tokenize(text, add_bos=False), n, max_tokens=max_tokens, stop=stop, **kw)
+
     def complete(self, prompt: str, max_tokens: int = 256, add_bos: bool | None = None, **kw) -> Generation:
         """Continue raw text."""
         return self.generate_tokens(self.tokenize(prompt, add_bos=add_bos), max_tokens=max_tokens, **kw)
@@ -95,6 +136,9 @@ class LLM:
         return float(self.ctx.score(full[:k], full[k:]).sum())
 
     def close(self):
+        for c in self._extra:
+            c.close()
+        self._extra = []
         for obj in (self.draft_ctx, self.draft_model, self.ctx, self.model):
             if obj is not None:
                 obj.close()

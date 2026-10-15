@@ -74,6 +74,8 @@ void borg_ctx_free(borg_ctx *c) {
     free(c->xq);
     free(c->att);
     free(c->embd);
+    free(c->row_ctx);
+    free(c->row_pos);
     free(c->stats);
     free(c);
 }
@@ -115,7 +117,9 @@ borg_ctx *borg_ctx_new(borg_model *m, borg_pool *pool, const borg_ctx_params *pa
     c->xq = (block_q8a *)calloc((size_t)B * (c->max_cols / QK), sizeof(block_q8a));
     c->att = (float *)calloc((size_t)nthreads * c->n_ctx, sizeof(float));
     c->embd = (float *)calloc((size_t)D, sizeof(float));
-    if (!c->tokens || !c->k_cache || !c->v_cache || !c->inv_freq || !c->x || !c->xb || !c->xb2 || !c->q ||
+    c->row_ctx = (borg_ctx **)calloc((size_t)B, sizeof(borg_ctx *));
+    c->row_pos = (int *)calloc((size_t)B, sizeof(int));
+    if (!c->row_ctx || !c->row_pos || !c->tokens || !c->k_cache || !c->v_cache || !c->inv_freq || !c->x || !c->xb || !c->xb2 || !c->q ||
         !c->k || !c->v || !c->hb || !c->hb2 || !c->xq || !c->att || !c->embd) {
         borg_ctx_free(c);
         return NULL;
@@ -284,12 +288,12 @@ static void matmul1(borg_ctx *c, const borg_mat *m, float *out, int ldo, int T, 
 
 /* ---- per-token work ------------------------------------------------------- */
 typedef struct {
-    borg_ctx *c;
-    int layer, T, pos0;
+    borg_ctx *c;  /* owner of the scratch buffers */
+    int layer, T;
 } tok_task;
 
-/* bias, q/k norm, RoPE, and store k/v into the cache */
-static void qkv_post(borg_ctx *c, int l, int t, int pos) {
+/* bias, q/k norm, RoPE, and store k/v of row t into the cache of kc at pos */
+static void qkv_post(borg_ctx *c, borg_ctx *kc, int l, int t, int pos) {
     const borg_model *m = c->model;
     const borg_config *cfg = &m->cfg;
     const borg_layer *L = &m->layers[l];
@@ -314,18 +318,18 @@ static void qkv_post(borg_ctx *c, int l, int t, int pos) {
     }
     for (int h = 0; h < cfg->n_heads; h++) rope_head(q + h * HD, HD, cosv, sinv);
     for (int h = 0; h < cfg->n_kv_heads; h++) rope_head(k + h * HD, HD, cosv, sinv);
-    const size_t layer_off = (size_t)l * NKV * c->n_ctx;
+    const size_t layer_off = (size_t)l * NKV * kc->n_ctx;
     for (int h = 0; h < cfg->n_kv_heads; h++) {
-        const size_t off = layer_off + ((size_t)h * c->n_ctx + (size_t)pos) * HD;
-        if (c->kv_f16) {
-            uint16_t *kc = (uint16_t *)c->k_cache + off, *vc = (uint16_t *)c->v_cache + off;
+        const size_t off = layer_off + ((size_t)h * kc->n_ctx + (size_t)pos) * HD;
+        if (kc->kv_f16) {
+            uint16_t *kd = (uint16_t *)kc->k_cache + off, *vd = (uint16_t *)kc->v_cache + off;
             for (int i = 0; i < HD; i++) {
-                kc[i] = fp32_to_fp16(k[h * HD + i]);
-                vc[i] = fp32_to_fp16(v[h * HD + i]);
+                kd[i] = fp32_to_fp16(k[h * HD + i]);
+                vd[i] = fp32_to_fp16(v[h * HD + i]);
             }
         } else {
-            memcpy((float *)c->k_cache + off, k + h * HD, (size_t)HD * sizeof(float));
-            memcpy((float *)c->v_cache + off, v + h * HD, (size_t)HD * sizeof(float));
+            memcpy((float *)kc->k_cache + off, k + h * HD, (size_t)HD * sizeof(float));
+            memcpy((float *)kc->v_cache + off, v + h * HD, (size_t)HD * sizeof(float));
         }
     }
 }
@@ -333,7 +337,7 @@ static void qkv_post(borg_ctx *c, int l, int t, int pos) {
 static void qkv_post_range(void *arg, int b, int e, int ith) {
     (void)ith;
     tok_task *t = (tok_task *)arg;
-    for (int i = b; i < e; i++) qkv_post(t->c, t->layer, i, t->pos0 + i);
+    for (int i = b; i < e; i++) qkv_post(t->c, t->c->row_ctx[i], t->layer, i, t->c->row_pos[i]);
 }
 
 static void attention_range(void *arg, int b, int e, int ith) {
@@ -344,28 +348,28 @@ static void attention_range(void *arg, int b, int e, int ith) {
     const int group = cfg->n_heads / cfg->n_kv_heads;
     const float scale = 1.0f / sqrtf((float)HD);
     float *att = c->att + (size_t)ith * c->n_ctx;
-    const size_t layer_off = (size_t)t->layer * NKV * c->n_ctx;
     for (int item = b; item < e; item++) {
         const int tok = item / cfg->n_heads, h = item % cfg->n_heads;
-        const int pos = t->pos0 + tok;
+        const borg_ctx *kc = c->row_ctx[tok];
+        const int pos = c->row_pos[tok];
         const int kvh = h / group;
         const float *q = c->q + (size_t)tok * NQ + (size_t)h * HD;
         float *out = c->xb + (size_t)tok * NQ + (size_t)h * HD;
-        const size_t base = layer_off + (size_t)kvh * c->n_ctx * HD;
-        if (c->kv_f16) {
-            const uint16_t *K = (const uint16_t *)c->k_cache + base;
+        const size_t base = (size_t)t->layer * NKV * kc->n_ctx + (size_t)kvh * kc->n_ctx * HD;
+        if (kc->kv_f16) {
+            const uint16_t *K = (const uint16_t *)kc->k_cache + base;
             for (int j = 0; j <= pos; j++) att[j] = vec_dot_f16_f32(K + (size_t)j * HD, q, HD) * scale;
         } else {
-            const float *K = (const float *)c->k_cache + base;
+            const float *K = (const float *)kc->k_cache + base;
             for (int j = 0; j <= pos; j++) att[j] = vec_dot_f32(K + (size_t)j * HD, q, HD) * scale;
         }
         softmax(att, pos + 1);
         memset(out, 0, (size_t)HD * sizeof(float));
-        if (c->kv_f16) {
-            const uint16_t *V = (const uint16_t *)c->v_cache + base;
+        if (kc->kv_f16) {
+            const uint16_t *V = (const uint16_t *)kc->v_cache + base;
             for (int j = 0; j <= pos; j++) vec_axpy_f16(out, att[j], V + (size_t)j * HD, HD);
         } else {
-            const float *V = (const float *)c->v_cache + base;
+            const float *V = (const float *)kc->v_cache + base;
             for (int j = 0; j <= pos; j++) vec_axpy_f32(out, att[j], V + (size_t)j * HD, HD);
         }
     }
@@ -405,7 +409,9 @@ static void run_norm(borg_ctx *c, float *out, const float *in, const float *w, i
 }
 
 /* ---- the forward pass ----------------------------------------------------- */
-static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, int pos0, float *logits, int logits_mode) {
+/* Rows of the chunk may belong to different caches: c->row_ctx[t] / c->row_pos[t] say where
+ * row t's keys and values go. c provides the scratch buffers. */
+static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, float *logits, int logits_mode) {
     borg_model *m = c->model;
     const borg_config *cfg = &m->cfg;
     const int D = cfg->dim, HD = cfg->head_dim;
@@ -424,7 +430,7 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, int pos0, flo
             int ldos[3] = {NQ, NKV, NKV};
             matmul(c, 3, ms, outs, ldos, T, c->xb, D);
         }
-        tok_task tt = {c, l, T, pos0};
+        tok_task tt = {c, l, T};
         pool_for(c->pool, T, 1, qkv_post_range, &tt);
         pool_for(c->pool, T * cfg->n_heads, 1, attention_range, &tt);
         record_stats(c, l, SITE_ATTN_OUT, c->xb, T, NQ);
@@ -481,11 +487,57 @@ int borg_decode(borg_ctx *c, const int32_t *tokens, int n, float *logits, int lo
             mode = 1;
             out = logits;
         }
-        forward_chunk(c, tokens + done, T, c->n_past, out, mode);
+        for (int t = 0; t < T; t++) {
+            c->row_ctx[t] = c;
+            c->row_pos[t] = c->n_past + t;
+        }
+        forward_chunk(c, tokens + done, T, out, mode);
         if (c->stats) c->stats_tokens += T;
         memcpy(c->tokens + c->n_past, tokens + done, (size_t)T * sizeof(int32_t));
         c->n_past += T;
         done += T;
     }
+    return 0;
+}
+
+int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logits) {
+    if (n <= 0) return 0;
+    borg_ctx *lead = ctxs[0];
+    if (n > lead->n_batch) return -4;
+    const int V = lead->model->cfg.vocab_size;
+    for (int i = 0; i < n; i++) {
+        const borg_ctx *c = ctxs[i];
+        if (c->model != lead->model || c->n_ctx != lead->n_ctx) return -5;
+        if (c->n_past + 1 > c->n_ctx) return -1;
+        if (tokens[i] < 0 || tokens[i] >= V) return -3;
+        for (int j = 0; j < i; j++)
+            if (ctxs[j] == c) return -6;
+    }
+    for (int i = 0; i < n; i++) {
+        lead->row_ctx[i] = ctxs[i];
+        lead->row_pos[i] = ctxs[i]->n_past;
+    }
+    forward_chunk(lead, tokens, n, logits, logits ? 2 : 0);
+    for (int i = 0; i < n; i++) {
+        borg_ctx *c = ctxs[i];
+        c->tokens[c->n_past++] = tokens[i];
+    }
+    return 0;
+}
+
+int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src) {
+    if (dst == src) return 0;
+    if (dst->model != src->model || dst->kv_f16 != src->kv_f16 || src->n_past > dst->n_ctx) return -1;
+    const borg_config *cfg = &src->model->cfg;
+    const size_t esz = src->kv_f16 ? 2 : 4, HD = (size_t)cfg->head_dim, n = (size_t)src->n_past;
+    for (int l = 0; l < cfg->n_layers; l++)
+        for (int h = 0; h < cfg->n_kv_heads; h++) {
+            const size_t so = (((size_t)l * cfg->n_kv_heads + h) * src->n_ctx) * HD * esz;
+            const size_t d_o = (((size_t)l * cfg->n_kv_heads + h) * dst->n_ctx) * HD * esz;
+            memcpy((char *)dst->k_cache + d_o, (const char *)src->k_cache + so, n * HD * esz);
+            memcpy((char *)dst->v_cache + d_o, (const char *)src->v_cache + so, n * HD * esz);
+        }
+    memcpy(dst->tokens, src->tokens, n * sizeof(int32_t));
+    dst->n_past = src->n_past;
     return 0;
 }

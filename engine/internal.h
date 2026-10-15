@@ -133,6 +133,8 @@ struct borg_ctx {
     block_q8a *xq;       /* [B, max(dim, hidden_dim, n_heads*head_dim) / QK] */
     float *att;          /* [n_threads, n_ctx] attention scores */
     float *embd;         /* [dim] final hidden state of the last token */
+    borg_ctx **row_ctx;  /* [n_batch] cache owner of each row in the current chunk */
+    int *row_pos;        /* [n_batch] position of each row */
     double *stats;       /* optional [n_layers][SITE_COUNT][max_cols] sums of x^2 per input column */
     int64_t stats_tokens;
     int max_cols;        /* columns of xq rows */

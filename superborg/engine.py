@@ -68,6 +68,8 @@ class _Config(ctypes.Structure):
 
 
 _TOKEN_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int32, ctypes.POINTER(ctypes.c_char), ctypes.c_int, ctypes.c_void_p)
+_MULTI_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int32, ctypes.POINTER(ctypes.c_char), ctypes.c_int,
+                             ctypes.c_void_p)
 
 _lib = None
 
@@ -102,6 +104,12 @@ def lib():
         "borg_ctx_truncate": (None, [vp, ctypes.c_int]),
         "borg_decode": (ctypes.c_int, [vp, i32p, ctypes.c_int, fp, ctypes.c_int]),
         "borg_ctx_embedding": (fp, [vp]),
+        "borg_decode_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, fp]),
+        "borg_ctx_copy": (ctypes.c_int, [vp, vp]),
+        "borg_generate_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, ctypes.c_int,
+                                               ctypes.POINTER(_GenParams), _MULTI_CB, vp,
+                                               ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                               ctypes.POINTER(_GenStats)]),
         "borg_ctx_enable_stats": (ctypes.c_int, [vp, ctypes.c_int]),
         "borg_ctx_stats": (ctypes.POINTER(ctypes.c_double), [vp, ctypes.c_int, ctypes.c_int,
                                                               ctypes.POINTER(ctypes.c_int)]),
@@ -348,6 +356,11 @@ class Context:
             self.decode(tokens[common:], logits=None)
         return common
 
+    def copy_from(self, src: "Context") -> None:
+        """Make this context hold the same cached tokens as src (same model)."""
+        if lib().borg_ctx_copy(self._c, src._c) != 0:
+            raise ValueError("contexts are incompatible (model, kv type or size)")
+
     def embedding(self) -> np.ndarray:
         p = lib().borg_ctx_embedding(self._c)
         return np.ctypeslib.as_array(p, shape=(self.model.config["dim"],)).copy()
@@ -457,3 +470,100 @@ class Context:
                           n_prompt=st.n_prompt, n_reused=st.n_reused, n_drafted=st.n_drafted,
                           n_accepted=st.n_accepted, n_target_evals=st.n_target_evals,
                           prompt_ms=st.t_prompt_ms, gen_ms=st.t_gen_ms)
+
+
+class _StopTracker:
+    """Incremental UTF-8 decoding and stop-string detection for one sequence."""
+
+    def __init__(self, stops: Sequence[str], stream: Callable[[str], None] | None):
+        self.stops = [x for x in stops if x]
+        self.hold = max((len(x) for x in self.stops), default=0)
+        self.stream = stream
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.text = ""
+        self.emitted = 0
+        self.stopped = False
+
+    def feed(self, data: bytes) -> bool:
+        """Add token bytes; returns True when a stop string was found."""
+        self.text += self.decoder.decode(data)
+        if self.stops:
+            lo = max(0, self.emitted - self.hold)
+            cut = min((i for i in (self.text.find(x, lo) for x in self.stops) if i >= 0), default=-1)
+            if cut >= 0:
+                self.text = self.text[:cut]
+                self.stopped = True
+                self._flush(cut)
+                return True
+        self._flush(len(self.text) - (self.hold - 1 if self.hold > 1 else 0))
+        return False
+
+    def _flush(self, upto: int) -> None:
+        if self.stream and upto > self.emitted:
+            self.stream(self.text[self.emitted:upto])
+        self.emitted = max(self.emitted, upto)
+
+    def finish(self) -> None:
+        self.text += self.decoder.decode(b"", final=True)
+        if not self.stopped:
+            self._flush(len(self.text))
+
+
+def generate_multi(contexts: Sequence[Context], prompt: Sequence[int], max_tokens: int = 256,
+                   sampling: Sampling | None = None, stop: Iterable[str] = (),
+                   stream: Callable[[int, str], None] | None = None, ignore_eos: bool = False,
+                   stop_tokens: Sequence[int] = ()) -> list[Generation]:
+    """Sample len(contexts) continuations of `prompt` in lockstep with batched decoding.
+
+    Sequence i uses seed sampling.seed + i. The prompt is evaluated once (in contexts[0],
+    reusing its cached prefix) and copied to the other contexts. stream(i, text) receives
+    the text pieces of sequence i.
+    """
+    n = len(contexts)
+    if n == 0:
+        return []
+    sampling = sampling or Sampling(temperature=0.7)
+    stops = list(stop)
+    trackers = [_StopTracker(stops, (lambda t, i=i: stream(i, t)) if stream else None) for i in range(n)]
+    toks: list[list[int]] = [[] for _ in range(n)]
+    gp = lib().borg_gen_default_params()
+    gp.max_tokens = int(max_tokens)
+    gp.sampling = sampling._c()
+    gp.ignore_eos = int(ignore_eos)
+    stop_arr = None
+    if stop_tokens:
+        stop_arr = (ctypes.c_int32 * len(stop_tokens))(*stop_tokens)
+        gp.stop_tokens = stop_arr
+        gp.n_stop_tokens = len(stop_tokens)
+
+    def on_token(seq, tok, piece, nbytes, user):
+        try:
+            toks[seq].append(tok)
+            return 1 if trackers[seq].feed(ctypes.string_at(piece, nbytes)) else 0
+        except Exception:  # noqa: BLE001 - never let exceptions cross the C boundary
+            trackers[seq].stopped = True
+            return 1
+
+    cb = _MULTI_CB(on_token)
+    prompt = list(prompt)
+    if not prompt:
+        raise ValueError("empty prompt")
+    if len(prompt) >= contexts[0].n_ctx:
+        raise ValueError(f"prompt has {len(prompt)} tokens; context holds {contexts[0].n_ctx}")
+    carr = (ctypes.c_void_p * n)(*[c._c for c in contexts])
+    parr = (ctypes.c_int32 * len(prompt))(*prompt)
+    ngen = (ctypes.c_int * n)()
+    reasons = (ctypes.c_int * n)()
+    st = _GenStats()
+    rc = lib().borg_generate_multi(carr, n, parr, len(prompt), ctypes.byref(gp), cb, None, ngen, reasons,
+                                   ctypes.byref(st))
+    if rc < 0:
+        raise RuntimeError(f"generation failed ({rc})")
+    out = []
+    for i in range(n):
+        trackers[i].finish()
+        reason = "stop" if trackers[i].stopped else _STOP_REASONS.get(reasons[i], "length")
+        out.append(Generation(text=trackers[i].text, tokens=toks[i], stop_reason=reason,
+                              n_prompt=st.n_prompt, n_reused=st.n_reused, prompt_ms=st.t_prompt_ms,
+                              gen_ms=st.t_gen_ms, n_target_evals=st.n_target_evals))
+    return out

@@ -287,3 +287,110 @@ done:
     free(dlog);
     return rc ? rc : g.n_gen;
 }
+
+int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n_prompt,
+                        const borg_gen_params *params, borg_multi_cb cb, void *user, int *n_generated,
+                        int *stop_reasons, borg_gen_stats *stats) {
+    borg_gen_params p = params ? *params : borg_gen_default_params();
+    borg_gen_stats st;
+    memset(&st, 0, sizeof st);
+    if (n_seq <= 0 || n_prompt <= 0) return -1;
+    borg_ctx *lead = ctxs[0];
+    if (n_seq > lead->n_batch) return -4;
+    if (n_prompt >= lead->n_ctx) return -1;
+    const borg_model *m = lead->model;
+    const int Vt = m->cfg.vocab_size, Vs = m->cfg.n_vocab;
+    const int hist_cap = lead->n_ctx + 1;
+
+    int rc = 0;
+    float *logits = (float *)malloc(sizeof(float) * (size_t)Vt * (size_t)n_seq);
+    float **row = (float **)calloc((size_t)n_seq, sizeof(float *));
+    int32_t *hist = (int32_t *)malloc(sizeof(int32_t) * (size_t)hist_cap * (size_t)n_seq);
+    int *len = (int *)calloc((size_t)n_seq, sizeof(int));
+    int *ngen = (int *)calloc((size_t)n_seq, sizeof(int));
+    int *reason = (int *)calloc((size_t)n_seq, sizeof(int));
+    int *active = (int *)calloc((size_t)n_seq, sizeof(int));
+    borg_ctx **act_ctx = (borg_ctx **)calloc((size_t)n_seq, sizeof(borg_ctx *));
+    int32_t *act_tok = (int32_t *)calloc((size_t)n_seq, sizeof(int32_t));
+    int *act_idx = (int *)calloc((size_t)n_seq, sizeof(int));
+    borg_sampler **smp = (borg_sampler **)calloc((size_t)n_seq, sizeof(borg_sampler *));
+    char piece[4096];
+    if (!logits || !row || !hist || !len || !ngen || !reason || !active || !act_ctx || !act_tok || !act_idx || !smp) {
+        rc = -4;
+        goto done;
+    }
+    for (int i = 0; i < n_seq; i++) {
+        borg_sampling sp = p.sampling;
+        sp.seed = p.sampling.seed + (uint64_t)i;
+        smp[i] = borg_sampler_new(&sp, Vs);
+        if (!smp[i]) { rc = -4; goto done; }
+    }
+
+    double t0 = borg_time_ms();
+    if (sync_ctx(lead, prompt, n_prompt, logits, &st.n_reused)) { rc = -5; goto done; }
+    st.n_prompt = n_prompt - st.n_reused;
+    for (int i = 0; i < n_seq; i++) {
+        if (i > 0) {
+            if (borg_ctx_copy(ctxs[i], lead)) { rc = -5; goto done; }
+            memcpy(logits + (size_t)i * Vt, logits, sizeof(float) * (size_t)Vt);
+        }
+        row[i] = logits + (size_t)i * Vt;
+        memcpy(hist + (size_t)i * hist_cap, prompt, sizeof(int32_t) * (size_t)n_prompt);
+        len[i] = n_prompt;
+        active[i] = p.max_tokens > 0;
+    }
+    double t1 = borg_time_ms();
+    st.t_prompt_ms = t1 - t0;
+
+    float *step = (float *)malloc(sizeof(float) * (size_t)Vt * (size_t)n_seq);
+    if (!step) { rc = -4; goto done; }
+    for (;;) {
+        int na = 0;
+        for (int i = 0; i < n_seq; i++) {
+            if (!active[i]) continue;
+            int32_t *h = hist + (size_t)i * hist_cap;
+            const int32_t tok = borg_sampler_sample(smp[i], row[i], h, len[i]);
+            int stop = !p.ignore_eos && borg_is_eog(m, tok);
+            for (int k = 0; k < p.n_stop_tokens && !stop; k++) stop = p.stop_tokens[k] == tok;
+            if (stop) { active[i] = 0; reason[i] = 1; continue; }
+            h[len[i]++] = tok;
+            ngen[i]++;
+            st.n_gen++;
+            if (cb) {
+                int n = borg_token_bytes(m, tok, piece, (int)sizeof piece);
+                if (n > (int)sizeof piece) n = (int)sizeof piece;
+                if (cb(i, tok, piece, n, user)) { active[i] = 0; reason[i] = 2; continue; }
+            }
+            if (ngen[i] >= p.max_tokens) { active[i] = 0; reason[i] = 0; continue; }
+            if (ctxs[i]->n_past + 1 >= ctxs[i]->n_ctx) { active[i] = 0; reason[i] = 3; continue; }
+            act_ctx[na] = ctxs[i];
+            act_tok[na] = tok;
+            act_idx[na] = i;
+            na++;
+        }
+        if (na == 0) break;
+        if (borg_decode_multi(act_ctx, na, act_tok, step)) { rc = -5; break; }
+        st.n_target_evals++;
+        for (int k = 0; k < na; k++) memcpy(row[act_idx[k]], step + (size_t)k * Vt, sizeof(float) * (size_t)Vt);
+    }
+    free(step);
+    st.t_gen_ms = borg_time_ms() - t1;
+    if (n_generated) memcpy(n_generated, ngen, sizeof(int) * (size_t)n_seq);
+    if (stop_reasons) memcpy(stop_reasons, reason, sizeof(int) * (size_t)n_seq);
+done:
+    if (stats) *stats = st;
+    if (smp)
+        for (int i = 0; i < n_seq; i++) borg_sampler_free(smp[i]);
+    free(smp);
+    free(logits);
+    free(row);
+    free(hist);
+    free(len);
+    free(ngen);
+    free(reason);
+    free(active);
+    free(act_ctx);
+    free(act_tok);
+    free(act_idx);
+    return rc ? rc : st.n_gen;
+}
