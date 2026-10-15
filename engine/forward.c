@@ -541,3 +541,64 @@ int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src) {
     dst->n_past = src->n_past;
     return 0;
 }
+
+/* KV cache file: "BKV1", u32 kv_f16, n_layers, n_kv_heads, head_dim, vocab_size, n_past, then the
+ * 64-bit FNV-1a hash of the model header (so a cache never loads into a different model of the same
+ * shape), i32 tokens[n_past], then per layer and kv head: K[n_past][head_dim], V[n_past][head_dim]. */
+static uint64_t header_hash(const borg_model *m) {
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)m->header_json; *p; p++) h = (h ^ *p) * 1099511628211ull;
+    return h;
+}
+
+int borg_ctx_save(const borg_ctx *c, const char *path) {
+    const borg_config *cfg = &c->model->cfg;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    const uint64_t hh = header_hash(c->model);
+    const uint32_t hdr[8] = {(uint32_t)c->kv_f16, (uint32_t)cfg->n_layers, (uint32_t)cfg->n_kv_heads,
+                             (uint32_t)cfg->head_dim, (uint32_t)cfg->vocab_size, (uint32_t)c->n_past,
+                             (uint32_t)hh, (uint32_t)(hh >> 32)};
+    const size_t esz = c->kv_f16 ? 2 : 4, row = (size_t)cfg->head_dim * esz * (size_t)c->n_past;
+    int ok = fwrite("BKV1", 1, 4, f) == 4 && fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+             fwrite(c->tokens, sizeof(int32_t), (size_t)c->n_past, f) == (size_t)c->n_past;
+    for (int l = 0; ok && l < cfg->n_layers; l++)
+        for (int h = 0; ok && h < cfg->n_kv_heads; h++) {
+            const size_t off = (((size_t)l * cfg->n_kv_heads + h) * c->n_ctx) * cfg->head_dim * esz;
+            ok = (!row || fwrite((const char *)c->k_cache + off, 1, row, f) == row) &&
+                 (!row || fwrite((const char *)c->v_cache + off, 1, row, f) == row);
+        }
+    if (fclose(f) != 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
+int borg_ctx_load(borg_ctx *c, const char *path) {
+    const borg_config *cfg = &c->model->cfg;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[4];
+    uint32_t hdr[8];
+    const uint64_t hh = header_hash(c->model);
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "BKV1", 4) || fread(hdr, sizeof hdr, 1, f) != 1 ||
+        hdr[0] != (uint32_t)c->kv_f16 || hdr[1] != (uint32_t)cfg->n_layers || hdr[2] != (uint32_t)cfg->n_kv_heads ||
+        hdr[3] != (uint32_t)cfg->head_dim || hdr[4] != (uint32_t)cfg->vocab_size || hdr[5] > (uint32_t)c->n_ctx ||
+        hdr[6] != (uint32_t)hh || hdr[7] != (uint32_t)(hh >> 32)) {
+        fclose(f);
+        return -2;
+    }
+    const int n = (int)hdr[5];
+    const size_t esz = c->kv_f16 ? 2 : 4, row = (size_t)cfg->head_dim * esz * (size_t)n;
+    c->n_past = 0;
+    int ok = fread(c->tokens, sizeof(int32_t), (size_t)n, f) == (size_t)n;
+    for (int i = 0; ok && i < n; i++) ok = c->tokens[i] >= 0 && c->tokens[i] < cfg->vocab_size;
+    for (int l = 0; ok && l < cfg->n_layers; l++)
+        for (int h = 0; ok && h < cfg->n_kv_heads; h++) {
+            const size_t off = (((size_t)l * cfg->n_kv_heads + h) * c->n_ctx) * cfg->head_dim * esz;
+            ok = (!row || fread((char *)c->k_cache + off, 1, row, f) == row) &&
+                 (!row || fread((char *)c->v_cache + off, 1, row, f) == row);
+        }
+    fclose(f);
+    if (!ok) return -3;
+    c->n_past = n;
+    return 0;
+}

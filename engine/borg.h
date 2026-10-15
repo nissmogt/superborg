@@ -99,6 +99,11 @@ BORG_API int borg_decode(borg_ctx *ctx, const int32_t *tokens, int n, float *log
 BORG_API int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logits);
 /* Copy the cached tokens and keys/values of src into dst (same model). */
 BORG_API int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src);
+/* Save the cached tokens and keys/values to a file, or restore them (prompt caching across
+ * runs). Loading checks that the file was written for a model of the same shape and that it
+ * fits the context. Return 0 on success. */
+BORG_API int borg_ctx_save(const borg_ctx *ctx, const char *path);
+BORG_API int borg_ctx_load(borg_ctx *ctx, const char *path);
 
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);

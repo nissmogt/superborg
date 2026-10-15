@@ -106,6 +106,8 @@ def lib():
         "borg_ctx_embedding": (fp, [vp]),
         "borg_decode_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, fp]),
         "borg_ctx_copy": (ctypes.c_int, [vp, vp]),
+        "borg_ctx_save": (ctypes.c_int, [vp, ctypes.c_char_p]),
+        "borg_ctx_load": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_generate_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, ctypes.c_int,
                                                ctypes.POINTER(_GenParams), _MULTI_CB, vp,
                                                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
@@ -360,6 +362,18 @@ class Context:
         """Make this context hold the same cached tokens as src (same model)."""
         if lib().borg_ctx_copy(self._c, src._c) != 0:
             raise ValueError("contexts are incompatible (model, kv type or size)")
+
+    def save(self, path: str) -> None:
+        """Write the cached tokens and keys/values to `path`."""
+        if lib().borg_ctx_save(self._c, os.fsencode(path)) != 0:
+            raise OSError(f"cannot write {path}")
+
+    def load(self, path: str) -> None:
+        """Restore a cache written by save() for a model of the same shape."""
+        rc = lib().borg_ctx_load(self._c, os.fsencode(path))
+        if rc != 0:
+            raise ValueError(f"cannot load KV cache {path}: " + {-1: "cannot open", -2: "incompatible model or "
+                             "context too small", -3: "truncated or corrupt file"}.get(rc, str(rc)))
 
     def embedding(self) -> np.ndarray:
         p = lib().borg_ctx_embedding(self._c)
