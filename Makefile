@@ -62,8 +62,12 @@ $(BUILD)/borg: engine/main.c $(LIB_OBJ)
 $(BUILD)/test_kernels: tests/c/test_kernels.c $(LIB_OBJ)
 	$(CC) $(CFLAGS) -Iengine -o $@ $^ $(LDLIBS)
 
-test-c: $(BUILD)/test_kernels
+$(BUILD)/test_json_mode: tests/c/test_json_mode.c $(LIB_OBJ)
+	$(CC) $(CFLAGS) -Iengine -o $@ $^ $(LDLIBS)
+
+test-c: $(BUILD)/test_kernels $(BUILD)/test_json_mode
 	$(BUILD)/test_kernels
+	$(BUILD)/test_json_mode
 
 clean:
 	rm -rf $(BUILD)
