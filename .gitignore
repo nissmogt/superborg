@@ -1,0 +1,11 @@
+build/
+__pycache__/
+*.pyc
+*.borg
+*.borg.tmp
+*.part
+.pytest_cache/
+models/
+superborg/_lib/
+*.egg-info/
+dist/

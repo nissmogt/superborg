@@ -1,0 +1,47 @@
+The river town woke slowly. Fishing boats knocked against the pier while the baker on Mill Street lifted the shutters and set out trays of rye bread. By eight o'clock the square was full: farmers selling potatoes and late apples, a man repairing bicycles from the back of a van, children counting coins in front of the sweet stall. Nobody in town remembered when the market had first opened, but everyone agreed it had never once closed for rain.
+
+A hash table stores key-value pairs in an array of buckets. To insert a key, the table computes a hash of the key, reduces it modulo the number of buckets, and places the entry there. When two keys land in the same bucket, a collision occurs; open addressing resolves it by probing nearby slots, while separate chaining keeps a short list per bucket. Lookups take constant time on average as long as the load factor stays below a threshold, after which the table grows and every entry is rehashed.
+
+def merge_sorted(a: list[int], b: list[int]) -> list[int]:
+    """Merge two sorted lists into one sorted list in O(len(a) + len(b))."""
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            out.append(a[i]); i += 1
+        else:
+            out.append(b[j]); j += 1
+    out.extend(a[i:]); out.extend(b[j:])
+    return out
+
+Question: A bookstore sells notebooks for $3 each and pens for $1.50 each. Maria buys 4 notebooks and 6 pens and pays with a $25 bill. How much change does she receive?
+Solution: The notebooks cost 4 * 3 = 12 dollars. The pens cost 6 * 1.50 = 9 dollars. The total is 12 + 9 = 21 dollars. Her change is 25 - 21 = 4 dollars.
+Answer: 4
+
+Question: A train travels 180 kilometers in 2 hours and then 150 kilometers in 3 hours. What is its average speed for the whole trip?
+Solution: The total distance is 180 + 150 = 330 km and the total time is 2 + 3 = 5 hours, so the average speed is 330 / 5 = 66 km/h.
+Answer: 66
+
+{"id": 1042, "name": "sensor-7", "location": {"lat": 47.37, "lon": 8.54}, "readings": [21.4, 21.9, 22.3], "active": true}
+
+<|im_start|>user
+Can you explain why the sky is blue?<|im_end|>
+<|im_start|>assistant
+Sunlight contains every visible color. As it passes through the atmosphere, it scatters off nitrogen and oxygen molecules, and shorter wavelengths scatter much more strongly than longer ones (Rayleigh scattering grows with the inverse fourth power of the wavelength). Blue light is therefore scattered across the whole sky and reaches your eyes from every direction, while the sun itself looks slightly yellow.<|im_end|>
+
+La ville se réveille lentement et les cafés ouvrent leurs terrasses. El tren llega a la estación a las nueve y media, pero hoy viene con retraso. Die Bibliothek bleibt am Sonntag geschlossen, öffnet aber am Montag früher. 今天的天气很好，我们去公园散步吧。
+
+SELECT customer_id, COUNT(*) AS orders, SUM(total) AS revenue
+FROM orders
+WHERE created_at >= '2024-01-01'
+GROUP BY customer_id
+HAVING COUNT(*) > 3
+ORDER BY revenue DESC;
+
+In 1858 the first transatlantic telegraph cable carried a message from Queen Victoria to President Buchanan; it took more than sixteen hours to transmit ninety-eight words, and the cable failed within a month. A durable link only arrived in 1866, after engineers learned to measure the cable's resistance and insulation at sea.
+
+Step 1: Let x be the number of red marbles. Then the number of blue marbles is 2x + 3. Step 2: The total is x + (2x + 3) = 27, so 3x = 24 and x = 8. Step 3: There are 8 red marbles and 19 blue marbles. Check: 8 + 19 = 27.
+
+for (int i = 0; i < n; i++) {
+    sum += a[i] * b[i];
+}
+printf("dot = %f\n", sum);

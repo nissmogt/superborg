@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superborg"
+version = "0.1.0"
+description = "Fast local inference for open-weight transformers, with test-time reasoning"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+keywords = ["llm", "inference", "transformer", "local", "quantization"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+chat = ["jinja2"]
+test = ["pytest"]
+
+[project.scripts]
+superborg = "superborg.cli:main"
+
+[tool.setuptools]
+packages = ["superborg"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+# the engine library is compiled into superborg/_lib/ by setup.py at build time;
+# data/ holds files the modules read at run time (e.g. the converter's calibration text)
+superborg = ["_lib/*", "data/*"]

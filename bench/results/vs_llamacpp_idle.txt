@@ -1,0 +1,12 @@
+borg      run 1: prefill: 128 tokens in 673.4 ms = 190.1 tok/s
+borg      run 1: decode:  64 tokens in 1388.4 ms = 46.1 tok/s
+llama.cpp run 1: prefill 128 tokens = 308.7 tok/s
+llama.cpp run 1: decode  64 tokens = 40.6 tok/s
+borg      run 2: prefill: 128 tokens in 549.8 ms = 232.8 tok/s
+borg      run 2: decode:  64 tokens in 1352.3 ms = 47.3 tok/s
+llama.cpp run 2: prefill 128 tokens = 342.1 tok/s
+llama.cpp run 2: decode  64 tokens = 42.6 tok/s
+borg      run 3: prefill: 128 tokens in 578.4 ms = 221.3 tok/s
+borg      run 3: decode:  64 tokens in 1415.3 ms = 45.2 tok/s
+llama.cpp run 3: prefill 128 tokens = 298.7 tok/s
+llama.cpp run 3: decode  64 tokens = 42.9 tok/s
