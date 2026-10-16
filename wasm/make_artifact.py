@@ -60,7 +60,10 @@ def wasm_wrap(payload: bytes, name: bytes = b"borg-part") -> bytes:
 def bundle_worker(asm: Path | None) -> str:
     parts = []
     for name in ("borg-runtime.js", "trace-session.js", "worker.js"):
-        parts.append(f"// ---- {name} ----\n" + (WASM_DIR / name).read_text())
+        text = (WASM_DIR / name).read_text()
+        if name == "worker.js":  # its own scope: its top-level names must not clash with the page's
+            text = "(function () {\n" + text + "\n})();"
+        parts.append(f"// ---- {name} ----\n" + text)
     if asm is not None:
         parts.insert(0, f"// ---- {asm.name} ----\n" + asm.read_text())
     return "\n".join(parts)

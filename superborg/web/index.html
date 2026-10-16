@@ -1453,10 +1453,23 @@ function showEngineStatus(m) {
   if (S.ready || !m) return;
   const st = $("status");
   setText($("statusText"), m.text || "");
+  if (m.error) showEngineFailure(m);
   let pg = st.querySelector(".prog");
   if (m.progress == null) { if (pg) pg.remove(); return; }
   if (!pg) { pg = el("span", "prog"); pg.append(el("b")); st.append(pg); }
   pg.firstChild.style.width = (clamp(m.progress, 0, 1) * 100).toFixed(1) + "%";
+}
+// The status line is short on phones: the full failure, with what the browser offers, goes in the
+// chat column where it can be read and copied.
+function showEngineFailure(m) {
+  let box = $("engineFail");
+  if (!box) {
+    box = el("div", "intro"); box.id = "engineFail";
+    const intro = $("intro");
+    if (intro) intro.replaceWith(box); else msgs.prepend(box);
+  }
+  box.replaceChildren(el("p", "err", "The engine could not start: " + (m.text || "unknown error")),
+                      el("p", "", "Copy this when reporting it:"), el("pre", "mono", m.diag || ""));
 }
 function renderHeader() {
   const i = S.info, m = $("modelInfo");

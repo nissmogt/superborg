@@ -33,7 +33,13 @@ let running = null;               // {requestId, stopped} of the generation in p
 const started = [];               // request ids of the last 64 generations
 const earlyStops = new Map();     // request_id -> time, for stops that came before their chat
 
-const post = (m) => self.postMessage(m);
+// Inside a Worker, messages go through postMessage. Loaded on the page's main thread instead
+// (a web view that refuses Workers), the page drives handleMessage directly and receives
+// replies through self.borgEngine.onmessage; the engine then runs between the page's frames.
+const IN_WORKER = typeof WorkerGlobalScope !== "undefined" ? self instanceof WorkerGlobalScope
+                                                          : typeof document === "undefined";
+const post = IN_WORKER ? (m) => self.postMessage(m)
+                       : (m) => { const h = self.borgEngine && self.borgEngine.onmessage; if (h) h({ data: m }); };
 const status = (text, progress = null) => post({ status: { text, progress } });
 
 // Let queued messages (stop) run between tokens: a MessageChannel round trip is not clamped like setTimeout.
@@ -344,8 +350,7 @@ async function chat(id, body) {
 }
 
 let ready = null;
-self.onmessage = async (e) => {
-  const m = e.data || {};
+async function handleMessage(m) {
   if (m.fetchResult) return onPageFetch(Object.assign({ done: true }, m.fetchResult));
   if (m.fetchProgress) return onPageFetch(m.fetchProgress);
   try {
@@ -368,4 +373,6 @@ self.onmessage = async (e) => {
   } catch (err) {
     post({ fatal: String(err && err.message ? err.message : err) });
   }
-};
+}
+if (IN_WORKER) self.onmessage = (e) => handleMessage(e.data || {});
+else self.borgEngine = { send: (m) => handleMessage(m || {}), onmessage: null };
