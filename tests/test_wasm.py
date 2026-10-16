@@ -171,6 +171,28 @@ def test_javascript_build_matches_native(asm_bin, tmp_path):
     assert int(logits.argmax()) == int(ref.argmax())
 
 
+def test_fused_lens_matches_javascript_summary(wasm_bin, tmp_path):
+    """Context.lensSummary (borg_ctx_lens_summary in WebAssembly) against the full logits
+    summarized in JavaScript, the trace session's old path: the same tokens and ranks,
+    probabilities within 1e-6 and the same log-sum-exp; the reports agree to their rounding."""
+    out = node_case("lens", {"wasm": str(wasm_bin), "model": need(Q8), "chat": "What is the capital of France?",
+                             "max_tokens": 6, "k": 4}, tmp_path)
+    assert out["simd"] == "wasm-simd128" and len(out["tokens"]) == 6
+    for tok in out["tokens"]:
+        f, o = tok["fused"], tok["old"]
+        assert f["top"] == o["top"] and f["rank"] == o["rank"]
+        assert len(f["top"]) == 4 * len(tok["layers"]) and len(tok["layers"]) == 31
+        np.testing.assert_allclose(f["p"], o["p"], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(f["p_top"], o["p_top"], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(f["lse"], o["lse"], rtol=0, atol=1e-5)
+        assert f["rank"][-1] == 0  # greedy: the chosen token tops the last layer
+        for a, b in zip(tok["report"], tok["plain_report"]):
+            assert a["layer"] == b["layer"] and a["rank"] == b["rank"]
+            assert [x[2] for x in a["top"]] == [x[2] for x in b["top"]] and len(a["top"]) == 4
+            assert abs(a["p"] - b["p"]) <= 1.1e-5
+            assert all(abs(x[1] - y[1]) <= 1.1e-4 for x, y in zip(a["top"], b["top"]))
+
+
 def make_artifact():
     import importlib.util
     spec = importlib.util.spec_from_file_location("make_artifact", ROOT / "wasm" / "make_artifact.py")
@@ -366,7 +388,7 @@ def test_worker_info_and_part_cache(site, tmp_path):
 def test_worker_missing_manifest(tmp_path):
     (tmp_path / "site").mkdir()
     out = run_worker(tmp_path / "site", [["init", None]], tmp_path)
-    assert out == [{"fatal": "cannot download model.json: HTTP 404"}]
+    assert out == [{"fatal": "cannot download http://site.test/model.json: HTTP 404"}]
 
 
 def test_worker_chat_events(site, tmp_path):
