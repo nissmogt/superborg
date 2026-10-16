@@ -560,20 +560,28 @@ void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int 
                   int ldxq, float *out, int ldo) {
 #if defined(BORG_AVX2)
     if ((m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0 || m->dtype == DT_Q4_1) && T >= 4) {
+        /* Tile 16 weight rows x 4 tokens: the rows stay in L1 while every group of 4 activation
+         * rows is read once per tile instead of once per weight row (which made prefill
+         * L2-bandwidth bound). Each dot product is computed exactly as before. */
+        enum { RB = 16 };
         const int nb = m->cols / QK;
-        for (int r = r0; r < r1; r++) {
-            const uint8_t *row = (const uint8_t *)m->data + (size_t)r * m->row_bytes;
+        for (int rb = r0; rb < r1; rb += RB) {
+            const int re = rb + RB < r1 ? rb + RB : r1;
             int t = 0;
             for (; t + 4 <= T; t += 4) {
                 const block_q8a *xs[4] = {xq + (size_t)t * ldxq, xq + (size_t)(t + 1) * ldxq,
                                           xq + (size_t)(t + 2) * ldxq, xq + (size_t)(t + 3) * ldxq};
-                float o[4];
-                if (m->dtype == DT_Q8_0) dot_q8_0_q8a_x4((const block_q8_0 *)row, xs, nb, o);
-                else if (m->dtype == DT_Q4_0) dot_q4_0_q8a_x4((const block_q4_0 *)row, xs, nb, o);
-                else dot_q4_1_q8a_x4((const block_q4_1 *)row, xs, nb, o);
-                for (int c = 0; c < 4; c++) out[(size_t)(t + c) * ldo + r] = o[c];
+                for (int r = rb; r < re; r++) {
+                    const uint8_t *row = (const uint8_t *)m->data + (size_t)r * m->row_bytes;
+                    float o[4];
+                    if (m->dtype == DT_Q8_0) dot_q8_0_q8a_x4((const block_q8_0 *)row, xs, nb, o);
+                    else if (m->dtype == DT_Q4_0) dot_q4_0_q8a_x4((const block_q4_0 *)row, xs, nb, o);
+                    else dot_q4_1_q8a_x4((const block_q4_1 *)row, xs, nb, o);
+                    for (int c = 0; c < 4; c++) out[(size_t)(t + c) * ldo + r] = o[c];
+                }
             }
-            for (; t < T; t++) out[(size_t)t * ldo + r] = mat_dot_row(m, r, NULL, xq + (size_t)t * ldxq);
+            for (; t < T; t++)
+                for (int r = rb; r < re; r++) out[(size_t)t * ldo + r] = mat_dot_row(m, r, NULL, xq + (size_t)t * ldxq);
         }
         return;
     }

@@ -173,6 +173,10 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
     }
 
     int pending = -1; /* last emitted token, not yet in the cache */
+    /* Adaptive draft length: propose at most one token more than the last step accepted. When
+     * drafts keep failing (open-ended text) a step costs a 2-token pass instead of K+1, and a
+     * draft model runs once instead of K times; long accepted runs grow back to K. */
+    int k_next = K;
     while (g.stop < 0) {
         const int room = c->n_ctx - c->n_past - (pending >= 0 ? 1 : 0);
         if (room < 0) {
@@ -181,7 +185,7 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
         }
         /* propose */
         int k = 0;
-        int kmax = K;
+        int kmax = k_next;
         if (kmax > room) kmax = room;
         if (kmax > p.max_tokens - g.n_gen - 1) kmax = p.max_tokens - g.n_gen - 1;
         if (kmax > 0) {
@@ -285,6 +289,7 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
             break;
         }
         st.n_accepted += acc;
+        if (k > 0) k_next = acc + 1 < K ? acc + 1 : K;
         /* the cache holds pending + all drafts; keep pending + the accepted ones */
         borg_ctx_truncate(c, cache_base + acc);
         pending = -1;
