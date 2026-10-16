@@ -84,11 +84,13 @@ finished dispatch. Idle workers spin briefly, then yield, then sleep.
 
 ### Forward pass
 
-Prompt tokens are processed in chunks (64 by default). Within a chunk every weight row is
-multiplied with all token vectors while it is in cache, and dedicated kernels unpack each
-weight block once for four tokens. The same batched path serves speculative verification
-and multi-sequence decoding: each row of a chunk carries its own KV cache and position,
-so rows may belong to different sequences.
+Prompt tokens are processed in chunks (64 by default). Matrix products work on tiles of
+16 weight rows by 4 tokens, so the rows stay in L1 while each group of activations is read
+once per tile, and dedicated kernels unpack each weight block once for the four tokens.
+These kernels add up in the same order as the single-token kernels, so a token's logits do
+not depend on how it was batched (`tests/c/test_kernels.c` checks this bit for bit). The
+same batched path serves speculative verification and multi-sequence decoding: each row of
+a chunk carries its own KV cache and position, so rows may belong to different sequences.
 
 ### Generation
 
@@ -98,7 +100,9 @@ so rows may belong to different sequences.
   (continuations of earlier n-gram matches in the context), proposes up to K tokens; the
   target scores them in one batched pass. Greedy output is identical to plain greedy
   decoding; with sampling, the rejection rule of Leviathan et al. (2023) preserves the
-  target distribution.
+  target distribution. The draft length adapts: each proposal is at most one token longer
+  than the last accepted run, so text where drafts keep failing costs 2-token passes
+  instead of K+1. Prompt lookup needs a match of at least 2 tokens.
 * **Batched multi-sequence sampling**: `borg_generate_multi` evaluates a prompt once,
   copies its KV cache to N contexts, and decodes all N continuations in lockstep. Weights
   are read once per step for all sequences, which is what self-consistency voting needs.
