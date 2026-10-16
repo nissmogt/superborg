@@ -19,8 +19,39 @@
     for (const cb of statusCbs) { try { cb(s); } catch (e) { /* ignore */ } }
   }
 
+  // Fetch on the worker's behalf (see fetchVia in worker.js): the page's own requests carry
+  // its referer and credentials. Progress goes back every 256 KB, the body as one transfer.
+  async function fetchForWorker(w, { id, url }) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      let buffer;
+      if (res.body && res.body.getReader) {
+        const reader = res.body.getReader(), chunks = [];
+        let n = 0, told = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          n += value.length;
+          if (n - told >= 262144) { told = n; w.postMessage({ fetchProgress: { id, loaded: n } }); }
+        }
+        const out = new Uint8Array(n);
+        let off = 0;
+        for (const c of chunks) { out.set(c, off); off += c.length; }
+        buffer = out.buffer;
+      } else {
+        buffer = await res.arrayBuffer();
+      }
+      w.postMessage({ fetchResult: { id, url, buffer } }, [buffer]);
+    } catch (e) {
+      w.postMessage({ fetchResult: { id, url, error: String(e.message || e) } });
+    }
+  }
+
   function onMessage(e) {
     const m = e.data || {};
+    if (m.fetch) return void fetchForWorker(worker, m.fetch);
     if (m.status) return setStatus(m.status);
     if (m.ready) { setStatus({ text: "", progress: null, ready: true }); return readyResolve(m.ready); }
     if (m.fatal) {
@@ -59,7 +90,9 @@
       const what = e && e.message ? e.message : "its script did not load";
       onMessage({ data: { fatal: `the engine's worker (${how}) failed: ${what}` } });
     };
-    w.postMessage({ op: "init", base });
+    // a blob: worker sends no Referer, which some hosts require even for the page's own files:
+    // let it fall back to fetching through the page
+    w.postMessage({ op: "init", base, fetchVia: how === "file" ? "worker+page" : "page" });
   }
 
   async function startFetched() {

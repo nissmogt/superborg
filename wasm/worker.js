@@ -1,7 +1,9 @@
 // Web Worker that runs the borg engine (WebAssembly) and streams chat traces to the page.
 //
 // Messages from the page:
-//   {op: "init", base?}                 download the engine and model listed in model.json
+//   {op: "init", base?, fetchVia?}      download the engine and model listed in model.json; fetchVia
+//                                       "page" (the page answers {fetch} requests) or "worker+page"
+//                                       (try here first)
 //   {op: "info", id}                    -> {id, info}
 //   {op: "chat", id, body}              -> {id, event} for every TraceSession event, then {id, end: true};
 //                                       body as POST /api/chat (superborg/ui.py), with "request_id"?
@@ -100,9 +102,7 @@ function unwrapPart(b) {
   return b.subarray(i, end);
 }
 
-async function fetchBytes(url, onProgress) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`cannot download ${url}: HTTP ${res.status}`);
+async function readBody(res, onProgress) {
   if (!res.body || !res.body.getReader) {
     const b = new Uint8Array(await res.arrayBuffer());
     onProgress(b.length);
@@ -123,12 +123,54 @@ async function fetchBytes(url, onProgress) {
   return out;
 }
 
-async function init(base) {
+// Downloads can go through the page instead ({fetch: {id, url}} to it, {fetchProgress} and
+// {fetchResult} back): a worker started from a blob: URL sends no Referer, and a host may
+// refuse such requests for the page's own files while the page's fetches succeed.
+let fetchVia = "worker";          // "page" once the page says it answers fetches
+const pageFetches = new Map();    // id -> {resolve, reject, onProgress}
+let nextFetch = 1;
+function pageFetch(url, onProgress) {
+  return new Promise((resolve, reject) => {
+    const id = nextFetch++;
+    pageFetches.set(id, { resolve, reject, onProgress });
+    post({ fetch: { id, url } });
+  });
+}
+function onPageFetch(m) {
+  const f = pageFetches.get(m.id);
+  if (!f) return;
+  if (m.loaded != null && !m.done) { f.onProgress(m.loaded); return; }
+  pageFetches.delete(m.id);
+  if (m.error) f.reject(new Error(`cannot download ${m.url || ""}: ${m.error}`));
+  else { f.onProgress(m.buffer.byteLength); f.resolve(new Uint8Array(m.buffer)); }
+}
+
+async function fetchBytes(url, onProgress) {
+  if (fetchVia === "page") return pageFetch(url, onProgress);
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    if (fetchVia !== "worker+page") throw new Error(`cannot fetch ${url}: ${e.message}`);
+    res = null;
+  }
+  if (res && res.ok) return readBody(res, onProgress);
+  if (fetchVia !== "worker+page") throw new Error(`cannot download ${url}: HTTP ${res.status}`);
+  console.warn("[borg] the worker cannot fetch", url, res ? "HTTP " + res.status : "", "- asking the page");
+  fetchVia = "page";
+  return pageFetch(url, onProgress);
+}
+
+async function init(base, via) {
   const url = (p) => new URL(p, base || self.location.href).href;
+  if (via === "page" || via === "worker+page") fetchVia = via;
   status("Loading the engine");
-  const res = await fetch(url("model.json")).catch((e) => { throw new Error(`cannot fetch ${url("model.json")}: ${e.message}`); });
-  if (!res.ok) throw new Error(`cannot download ${url("model.json")}: HTTP ${res.status}`);
-  const manifest = await res.json().catch(() => { throw new Error("model.json is not valid JSON"); });
+  let manifest;
+  try {
+    manifest = JSON.parse(new TextDecoder().decode(await fetchBytes(url("model.json"), () => {})));
+  } catch (e) {
+    throw new Error(e instanceof SyntaxError ? "model.json is not valid JSON" : e.message);
+  }
   nCtx = manifest.n_ctx || 2048;
   const log = (s) => console.warn("[borg]", s);
   let borg, slow = false;
@@ -304,9 +346,11 @@ async function chat(id, body) {
 let ready = null;
 self.onmessage = async (e) => {
   const m = e.data || {};
+  if (m.fetchResult) return onPageFetch(Object.assign({ done: true }, m.fetchResult));
+  if (m.fetchProgress) return onPageFetch(m.fetchProgress);
   try {
     if (m.op === "init") {
-      if (!ready) ready = init(m.base);
+      if (!ready) ready = init(m.base, m.fetchVia);
       post({ ready: await ready });
     } else if (m.op === "stop") {
       const rid = m.request_id ?? null;
