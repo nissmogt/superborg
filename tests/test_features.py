@@ -256,3 +256,93 @@ def test_trace_matches_reference_and_own_logits(f32):
         c.lens([nl + 1])
     fresh = f32.context(n_ctx=16)
     assert fresh.trace() is None
+
+
+def _reference_summary(z: np.ndarray, k: int, chosen: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """top ids (logit descending, id ascending), rank (strictly greater logits) and float64 lse."""
+    ids = np.lexsort((np.broadcast_to(np.arange(z.shape[1]), z.shape), -z), axis=1)[:, :k]
+    rank = (z > z[:, chosen][:, None]).sum(axis=1)
+    z64 = z.astype(np.float64)
+    m = z64.max(axis=1)
+    return ids, rank, m + np.log(np.exp(z64 - m[:, None]).sum(axis=1))
+
+
+def test_lens_summary_with_ties(pool, tmp_path):
+    """borg_ctx_lens_summary on a copy of smollm2-135m-q8_0 whose output rows a - 7, a + 5 and
+    a + 9 are made copies of row a, the most likely token after a prompt: four tokens then tie
+    for the top logit of the last layer (and tie at some rank in every lens row). The top list
+    orders ties by id, a rank counts strictly greater logits only (ties share it), the chosen
+    logit is the kernel's own value and the log-sum-exp is float64-accurate."""
+    from superborg.convert import read_borg
+    src = need(Q8)
+    probe = Model(src, pool=pool)
+    toks = probe.tokenize("The capital of France is")
+    c = probe.context(n_ctx=64)
+    a = int(c.decode(toks, "last")[: probe.n_vocab].argmax())
+    c.close()
+    probe.close()
+    header, mm, data_start = read_borg(src)
+    t = header["tensors"]["tok_embd"]  # tied embeddings: the output matrix
+    assert t["dtype"] == "q8_0" and "output" not in header["tensors"]
+    row_bytes = t["shape"][1] // QK * 34
+    copies = [a - 7, a + 5, a + 9]
+    assert a - 7 >= 0 and a + 9 < header["config"]["vocab_size"] and not set(copies + [a]) & set(toks)
+    data = bytearray(bytes(mm))
+    base = data_start + t["offset"]
+    for r in copies:
+        data[base + r * row_bytes: base + (r + 1) * row_bytes] = data[base + a * row_bytes: base + (a + 1) * row_bytes]
+    path = tmp_path / "ties.borg"
+    path.write_bytes(data)
+    m = Model(str(path), pool=pool)
+    c = m.context(n_ctx=64)
+    c.enable_trace()
+    c.decode(toks, "last")
+    layers = list(range(m.config["n_layers"] + 1))
+    z = c.lens(layers)[:, : m.n_vocab]
+    tied = sorted(copies + [a])
+    assert np.all(z[:, tied] == z[:, [a]]) and int(z[-1].argmax()) == tied[0]
+    chosen = a + 5
+    for k in (2, 4, 6):
+        s = c.lens_summary(layers, k, chosen)
+        ids, rank, lse = _reference_summary(z, k, chosen)
+        assert np.array_equal(s["top_ids"], ids)
+        assert np.array_equal(s["top_logits"], np.take_along_axis(z, ids, axis=1))
+        assert np.array_equal(s["chosen_rank"], rank) and s["chosen_rank"][-1] == 0
+        assert np.array_equal(s["chosen_logit"], z[:, chosen])
+        assert np.abs(s["lse"] - lse).max() <= 1e-9
+        assert s["top_ids"][-1].tolist()[: min(k, 4)] == tied[: min(k, 4)]  # the tie, in id order
+    # rank and top list of a token tied with others in the middle of a row: the same rules
+    s = c.lens_summary(layers, 4, a - 7)
+    assert np.array_equal(s["chosen_rank"], (z > z[:, a - 7][:, None]).sum(axis=1))
+    # every row of the output matrix (vocab_size, here the tokenizer's size) and the errors
+    assert np.array_equal(c.lens_summary(layers, 4, chosen, n_vocab=0)["top_ids"], s["top_ids"])
+    for kw in ({"k": 0}, {"k": m.n_vocab + 1}, {"chosen": m.n_vocab}, {"chosen": -1}, {"n_vocab": m.vocab_size + 1},
+               {"layers": [m.config["n_layers"] + 1]}):
+        args = dict(layers=layers, k=4, chosen=chosen)
+        args.update(kw)
+        with pytest.raises(ValueError):
+            c.lens_summary(**args)
+    with pytest.raises(ValueError, match="nothing traced"):
+        m.context(n_ctx=16).lens_summary(layers, 4, chosen)
+    assert c.lens_summary([], 4, chosen)["top_ids"].shape == (0, 4)
+    c.close()
+    m.close()
+
+
+def test_lens_summary_vocab_restriction(pool):
+    """Qwen2.5's output matrix has 271 rows past the tokenizer's vocabulary: by default they take
+    no part; with n_vocab = 0 they do, so ranks and normalizers can only grow."""
+    m = Model(need(QWEN), pool=pool)
+    assert m.vocab_size > m.n_vocab
+    c = m.context(n_ctx=64)
+    c.enable_trace()
+    c.decode(m.tokenize("Hello"), None)
+    layers = [0, m.config["n_layers"]]
+    chosen = int(c.lens([m.config["n_layers"]])[0, : m.n_vocab].argmax())
+    within = c.lens_summary(layers, 3, chosen)
+    every = c.lens_summary(layers, 3, chosen, n_vocab=0)
+    assert (within["top_ids"] < m.n_vocab).all()
+    assert (every["chosen_rank"] >= within["chosen_rank"]).all() and (every["lse"] >= within["lse"]).all()
+    assert np.array_equal(every["chosen_logit"], within["chosen_logit"])
+    c.close()
+    m.close()

@@ -40,21 +40,25 @@ QTYPES = ["q8_0", "q4_0", "q4_1", "q4"]
 # (Qwen2.5), 0.27 (Qwen3) and 0.095 (TinyLlama), so a single 0.15 bound does not hold.
 # The loss is inherent to plain 4-bit blocks at these sizes, not the converter:
 # re-quantizing with ggml's reference Q4_0 rounding gives 0.35 (SmolLM2) and 0.24
-# (Qwen2.5). Plain q4_1 measures 0.22 (SmolLM2); the "q4" recipe (calibrated q4_1,
-# attn_v/ffn_down at q8_0) measures 0.071 (SmolLM2) and 0.070 (Qwen2.5). The bounds are
-# ~1.5x the measurements: loose enough for float noise, tight enough to catch layout or
-# scale bugs (those push KL well above 1).
+# (Qwen2.5). Plain q4_1 measures 0.22 (SmolLM2), 0.36 (Qwen2.5), 0.33 (Qwen3) and 0.087
+# (TinyLlama); the "q4" recipe (calibrated q4_1, attn_v/ffn_down at q8_0) measures 0.071
+# (SmolLM2), 0.070 (Qwen2.5), 0.17 (Qwen3) and 0.009 (TinyLlama). The Qwen means are
+# dominated by position 0, the prediction from the first token alone (the position whose
+# hidden state carries the first-token massive activations): of the KL summed over the 52
+# positions, position 0 holds 6.5 of 8.7 for Qwen3 q4, 9.8 of 16.9 for Qwen3 q4_1 and 9.5 of
+# 18.6 for Qwen2.5 q4_1; without it the Qwen3 q4 mean is 0.043. The bounds are ~1.5x the
+# measurements: loose enough for float noise, tight enough to catch layout or scale bugs
+# (those push KL well above 1).
 QUANT_BOUNDS = {"q8_0": (0.9, 0.02), "q4_0": (0.7, 0.15), "q4_1": (0.7, 0.15), "q4": (0.75, 0.11)}
 KL_BOUND = {
     ("smollm2-135m", "q4_0"): 0.4, ("qwen2.5-0.5b", "q4_0"): 0.36, ("qwen3-0.6b", "q4_0"): 0.4,
-    ("tinyllama-1.1b", "q4_0"): 0.15, ("smollm2-135m", "q4_1"): 0.33,
+    ("tinyllama-1.1b", "q4_0"): 0.15, ("smollm2-135m", "q4_1"): 0.33, ("qwen2.5-0.5b", "q4_1"): 0.54,
+    ("qwen3-0.6b", "q4_1"): 0.49, ("tinyllama-1.1b", "q4_1"): 0.13, ("qwen3-0.6b", "q4"): 0.25,
 }
 
 
 def quant_bounds(key: str, qtype: str) -> tuple[float, float]:
     top1, kl = QUANT_BOUNDS[qtype]
-    if qtype == "q4_1" and (key, qtype) not in KL_BOUND:
-        kl = KL_BOUND.get((key, "q4_0"), kl)  # unmeasured: q4_1 is at least as precise as q4_0
     return top1, KL_BOUND.get((key, qtype), kl)
 
 

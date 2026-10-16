@@ -88,6 +88,7 @@
     get u8() { return new Uint8Array(this.x.memory.buffer); }
     get i32() { return new Int32Array(this.x.memory.buffer); }
     get f32() { return new Float32Array(this.x.memory.buffer); }
+    get f64() { return new Float64Array(this.x.memory.buffer); }
 
     malloc(n) {
       const p = this.x.malloc(n) >>> 0;
@@ -309,6 +310,27 @@
       b.free(lp);
       if (rc !== 0) throw new Error("lens failed (" + rc + ")");
       return b.f32.slice(out >>> 2, (out >>> 2) + n * this.m.vocabSize);
+    }
+
+    /** The logit lens summarized inside the engine (borg_ctx_lens_summary): per listed layer the k
+     *  most likely tokens (topIds / topLogits, [n * k], logit descending then id ascending), the
+     *  logit and rank (strictly greater logits) of `chosen`, and the row's log-sum-exp (lse,
+     *  Float64Array), so a probability is exp(logit - lse). Only the first nVocab logits take part
+     *  (default: the tokenizer's vocabulary). The [n, vocab] logits never leave the engine. */
+    lensSummary(layers, k, chosen, nVocab = this.m.nVocab) {
+      const b = this.b, n = layers.length;
+      const lp = b.malloc(n * 4), ids = b.malloc(n * k * 4), vals = b.malloc(n * k * 4);
+      const zc = b.malloc(n * 4), rank = b.malloc(n * 4), lse = b.malloc(n * 8);
+      b.i32.set(layers, lp >>> 2);
+      const rc = b.x.borg_ctx_lens_summary(this.ptr, lp, n, nVocab, k, chosen, ids, vals, zc, rank, lse);
+      const out = rc === 0 ? {
+        topIds: b.i32.slice(ids >>> 2, (ids >>> 2) + n * k), topLogits: b.f32.slice(vals >>> 2, (vals >>> 2) + n * k),
+        chosenLogit: b.f32.slice(zc >>> 2, (zc >>> 2) + n), chosenRank: b.i32.slice(rank >>> 2, (rank >>> 2) + n),
+        lse: b.f64.slice(lse >>> 3, (lse >>> 3) + n),
+      } : null;
+      for (const p of [lp, ids, vals, zc, rank, lse]) b.free(p);
+      if (!out) throw new Error("lens summary failed (" + rc + ")");
+      return out;
     }
   }
 

@@ -60,6 +60,69 @@ def test_lens_report_matches_float64_softmax(session):
     assert n >= 2
 
 
+def _old_lens_summary(ts, chosen: int, k: int) -> dict:
+    """The summary of lens_report's NumPy path (TraceOptions.fused_lens = False), unrounded."""
+    layers = ts.lens_layers()
+    z = ts.llm.ctx.lens(layers)[:, : ts.llm.model.n_vocab]
+    n_vocab = z.shape[1]
+    zc = z[:, chosen].copy()
+    rank = (z > zc[:, None]).sum(axis=1)
+    top = np.argpartition(z, n_vocab - k, axis=1)[:, n_vocab - k:]
+    zt = np.take_along_axis(z, top, axis=1)
+    order = np.argsort(-zt, axis=1, kind="stable")
+    top = np.take_along_axis(top, order, axis=1)
+    zt = np.take_along_axis(zt, order, axis=1).astype(np.float64)
+    m = zt[:, :1]
+    lse = m[:, 0] + np.log(np.exp(z - m.astype(np.float32)).sum(axis=1, dtype=np.float64))
+    z64 = z.astype(np.float64)
+    m64 = z64.max(axis=1)
+    return {"top": top, "p_top": np.exp(zt - lse[:, None]), "p": np.exp(zc.astype(np.float64) - lse), "rank": rank,
+            "lse": lse, "lse64": m64 + np.log(np.exp(z64 - m64[:, None]).sum(axis=1))}
+
+
+PROMPTS = [Q, [{"role": "user", "content": "Write a haiku about the sea."}],
+           [{"role": "user", "content": "List three prime numbers."}]]
+
+
+def test_fused_lens_matches_the_numpy_path(session):
+    """The summary computed inside the engine (borg_ctx_lens_summary) against the full logits
+    summarized by NumPy: the same tokens and ranks, probabilities within 1e-6, and a log-sum-exp
+    within 1e-5 of NumPy's float64 one. The reports of both paths agree to their rounding."""
+    session.opt.lens_stride = 1
+    k = session.opt.lens_top
+    n = 0
+    for msgs in PROMPTS:
+        for ev in session.stream_chat(msgs, max_tokens=8):
+            if ev["type"] != "token":
+                continue
+            chosen = ev["id"]
+            layers = session.lens_layers()
+            fused = session.llm.ctx.lens_summary(layers, k, chosen)
+            old = _old_lens_summary(session, chosen, k)
+            assert np.array_equal(fused["top_ids"], old["top"])
+            assert np.array_equal(fused["chosen_rank"], old["rank"])
+            p_fused = np.exp(fused["chosen_logit"].astype(np.float64) - fused["lse"])
+            assert np.abs(p_fused - old["p"]).max() <= 1e-6
+            assert np.abs(np.exp(fused["top_logits"] - fused["lse"][:, None]) - old["p_top"]).max() <= 1e-6
+            assert np.abs(fused["lse"] - old["lse64"]).max() <= 1e-5
+            assert fused["lse"].dtype == np.float64
+            # the reports: ev["lens"] came from the fused path (the default)
+            session.opt.fused_lens = False
+            try:
+                plain = session.lens_report(chosen)
+            finally:
+                session.opt.fused_lens = True
+            assert len(plain) == len(ev["lens"]) == session.cfg["n_layers"] + 1
+            for a, b in zip(ev["lens"], plain):
+                assert a["layer"] == b["layer"] and a["rank"] == b["rank"]
+                assert [x[2] for x in a["top"]] == [x[2] for x in b["top"]]
+                assert [x[0] for x in a["top"]] == [x[0] for x in b["top"]]
+                assert a["p"] == pytest.approx(b["p"], abs=1.1e-5)
+                assert [x[1] for x in a["top"]] == pytest.approx([x[1] for x in b["top"]], abs=1.1e-4)
+            n += 1
+    assert n == 24
+
+
 def test_lens_stride_keeps_the_output_layer(session):
     n_layers = session.cfg["n_layers"]
     session.opt.lens_stride = 7

@@ -114,6 +114,9 @@ def lib():
         "borg_ctx_trace_mlp": (fp, [vp, ctypes.c_int]),
         "borg_ctx_trace_norms": (fp, [vp]),
         "borg_ctx_lens": (ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.c_int, fp]),
+        "borg_ctx_lens_summary": (ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,
+                                                 ctypes.c_int, ctypes.c_int32, i32p, fp, fp, i32p,
+                                                 ctypes.POINTER(ctypes.c_double)]),
         "borg_ctx_save": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_ctx_load": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_generate_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, ctypes.c_int,
@@ -442,6 +445,36 @@ class Context:
             raise ValueError({-1: "nothing traced yet (enable_trace, then decode)",
                               -3: "layer out of range"}.get(rc, f"lens failed ({rc})"))
         return out
+
+    def lens_summary(self, layers: Sequence[int], k: int, chosen: int, n_vocab: int | None = None) -> dict:
+        """The logit lens of the traced token summarized inside the engine (borg_ctx_lens_summary),
+        without the [n_lens, vocab] logits ever leaving C. Per listed layer: the k most likely
+        tokens (top_ids [n, k], logit descending then id ascending, and their top_logits), the
+        logit of `chosen` (chosen_logit [n]), its rank (chosen_rank [n]: the number of strictly
+        greater logits) and the row's log-sum-exp (lse [n], float64), so that a probability is
+        exp(logit - lse). Only the first n_vocab logits take part (None: the tokenizer's
+        vocabulary; 0: every row of the output matrix)."""
+        layers = list(layers)
+        n = len(layers)
+        nv = self.model.n_vocab if n_vocab is None else int(n_vocab)
+        top_ids = np.empty((n, k), dtype=np.int32)
+        top_logits = np.empty((n, k), dtype=np.float32)
+        chosen_logit = np.empty(n, dtype=np.float32)
+        chosen_rank = np.empty(n, dtype=np.int32)
+        lse = np.empty(n, dtype=np.float64)
+        if n:
+            arr = (ctypes.c_int * n)(*layers)
+            i32p, fp = ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float)
+            rc = lib().borg_ctx_lens_summary(self._c, arr, n, nv, int(k), int(chosen), top_ids.ctypes.data_as(i32p),
+                                             top_logits.ctypes.data_as(fp), chosen_logit.ctypes.data_as(fp),
+                                             chosen_rank.ctypes.data_as(i32p),
+                                             lse.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+            if rc != 0:
+                raise ValueError({-1: "nothing traced yet (enable_trace, then decode)", -3: "layer out of range",
+                                  -4: "k must be between 1 and n_vocab", -5: "chosen token out of range",
+                                  -6: "n_vocab out of range", -7: "out of memory"}.get(rc, f"lens failed ({rc})"))
+        return {"top_ids": top_ids, "top_logits": top_logits, "chosen_logit": chosen_logit,
+                "chosen_rank": chosen_rank, "lse": lse}
 
     def embedding(self) -> np.ndarray:
         p = lib().borg_ctx_embedding(self._c)

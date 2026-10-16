@@ -13,7 +13,8 @@ inside the model while it produced that token:
   * MLP neurons: the most strongly activated hidden units of every layer.
 
 All of it comes from one forward pass per token (borg_ctx_enable_trace) plus one batched
-projection of the per-layer residuals through the output matrix (borg_ctx_lens).
+projection of the per-layer residuals through the output matrix, summarized inside the engine
+(borg_ctx_lens_summary) so that the per-layer logits never leave C.
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ class TraceOptions:
     attn_top: int = 8      # most attended positions reported per layer
     mlp_top: int = 6       # most active neurons reported per layer
     final_top: int = 5     # alternatives reported from the output distribution
+    fused_lens: bool = True  # summarize the lens in C (borg_ctx_lens_summary); False: full logits + NumPy
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -104,14 +106,27 @@ class TraceSession:
         and rank of `chosen`.
 
         Only a few entries of each row's softmax are reported, so the full distribution is never
-        materialized: a log-sum-exp per row (float32 exponentials, float64 sums) gives the
-        normalizer, and ranks compare logits. For a 150k vocabulary this is several times faster
-        than a float64 softmax of every row, with the same results to the reported precision."""
+        materialized: a log-sum-exp per row gives the normalizer, and ranks compare logits. With
+        fused_lens the engine computes the top tokens, the rank and the log-sum-exp itself while
+        it projects the residuals (borg_ctx_lens_summary), so the [n_lens, vocab] logits are never
+        written out at all; otherwise they are, and NumPy summarizes them (float32 exponentials,
+        float64 sums). Both give the same tokens and ranks, and probabilities within 1e-6."""
         o = self.opt
         layers = self.lens_layers()
-        z = self.llm.ctx.lens(layers)[:, : self.llm.model.n_vocab]   # [n_lens, V] float32 logits
-        n_vocab = z.shape[1]
+        n_vocab = self.llm.model.n_vocab
         k = max(1, min(o.lens_top, n_vocab))
+        if o.fused_lens:
+            s = self.llm.ctx.lens_summary(layers, k, chosen, n_vocab)
+            lse = s["lse"]
+            p_top = np.exp(s["top_logits"].astype(np.float64) - lse[:, None])
+            p_chosen = np.exp(s["chosen_logit"].astype(np.float64) - lse)
+            return [{"layer": li,
+                     "top": [[self.token_text(int(t)), round(float(p), 4), int(t)]
+                             for t, p in zip(s["top_ids"][j], p_top[j])],
+                     "p": round(float(p_chosen[j]), 5),
+                     "rank": int(s["chosen_rank"][j])}
+                    for j, li in enumerate(layers)]
+        z = self.llm.ctx.lens(layers)[:, :n_vocab]   # [n_lens, V] float32 logits
         zc = z[:, chosen].copy()
         rank = (z > zc[:, None]).sum(axis=1)
         top = np.argpartition(z, n_vocab - k, axis=1)[:, n_vocab - k:]

@@ -105,7 +105,10 @@
     constructor(model, ctx, options = {}) {
       this.model = model;
       this.ctx = ctx;
-      this.opt = Object.assign({ lensStride: 1, lensTop: 3, attnTop: 8, mlpTop: 6, finalTop: 5 }, options);
+      // fusedLens: the lens summarized inside the engine (borg_ctx_lens_summary); false reads the
+      // full per-layer logits and summarizes them here (the same tokens and ranks, p within 1e-6)
+      this.opt = Object.assign({ lensStride: 1, lensTop: 3, attnTop: 8, mlpTop: 6, finalTop: 5, fusedLens: true },
+                               options);
       this.cfg = model.config;
       ctx.enableTrace(true);
     }
@@ -176,15 +179,26 @@
       return cand;
     }
 
-    tokenReport(chosen, probs) {
-      const o = this.opt, m = this.model, c = this.cfg;
-      const L = c.n_layers, H = c.n_heads, F = c.hidden_dim, D = c.dim, V = m.vocabSize, n = m.nVocab;
-      const tr = this.ctx.trace();
+    /** The logit lens rows of the report (as lens_report in superborg/interp.py): per lens layer
+     *  the top tokens as [text, p, id], and the probability and rank of `chosen`. */
+    lensReport(chosen) {
+      const o = this.opt, m = this.model, n = m.nVocab, k = Math.max(1, Math.min(o.lensTop, n));
       const layers = this.lensLayers();
-      const lensLogits = this.ctx.lens(layers);
-      // per lens row: log-sum-exp for the normalizer, ranks and top tokens from the logits, so
-      // no full softmax is materialized (as lens_report in superborg/interp.py)
-      const lens = layers.map((li, r) => {
+      if (o.fusedLens) {
+        const s = this.ctx.lensSummary(layers, k, chosen, n);
+        return layers.map((li, r) => {
+          const lse = s.lse[r], top = [];
+          for (let i = 0; i < k; i++) {
+            const t = s.topIds[r * k + i];
+            top.push([m.tokenText(t), r4(Math.exp(s.topLogits[r * k + i] - lse)), t]);
+          }
+          return { layer: li, top, p: r5(Math.exp(s.chosenLogit[r] - lse)), rank: s.chosenRank[r] };
+        });
+      }
+      // the full per-layer logits, then per row: log-sum-exp for the normalizer, ranks and top
+      // tokens from the logits, so no full softmax is materialized
+      const V = m.vocabSize, lensLogits = this.ctx.lens(layers);
+      return layers.map((li, r) => {
         const z = lensLogits.subarray(r * V, r * V + n);
         const zc = z[chosen];
         let mx = -Infinity, rank = 0;
@@ -192,9 +206,16 @@
         let s = 0;
         for (let i = 0; i < n; i++) s += Math.exp(z[i] - mx);
         const lse = mx + Math.log(s);
-        return { layer: li, top: topK(z, o.lensTop).map((t) => [m.tokenText(t), r4(Math.exp(z[t] - lse)), t]),
+        return { layer: li, top: topK(z, k).map((t) => [m.tokenText(t), r4(Math.exp(z[t] - lse)), t]),
                  p: r5(Math.exp(zc - lse)), rank };
       });
+    }
+
+    tokenReport(chosen, probs) {
+      const o = this.opt, m = this.model, c = this.cfg;
+      const L = c.n_layers, H = c.n_heads, F = c.hidden_dim, D = c.dim;
+      const tr = this.ctx.trace();
+      const lens = this.lensReport(chosen);
       const attnN = [], mlpN = [], resid = [];
       for (let l = 0; l < L; l++) { attnN.push(r3(tr.norms[l * 3])); mlpN.push(r3(tr.norms[l * 3 + 1])); }
       for (let l = 0; l <= L; l++) {
