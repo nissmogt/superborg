@@ -504,7 +504,7 @@ def test_agent_runs_code_then_answers():
             return "The product is 42.\nFinal Answer: 42"
         return "Let me compute.\n```python\nprint(6 * 7)\n```\nOutput: 41 (hallucinated)"
     llm = FakeLLM(responder)
-    res = run_agent(llm, "What is 6 times 7?")
+    res = run_agent(llm, "What is 6 times 7?", code_first=False)
     assert res.answer == "42" and res.stop_reason == "final"
     assert len(res.steps) == 2 and res.steps[0].code == "print(6 * 7)" and "42" in res.steps[0].observation
     assert "hallucinated" not in llm.calls[1]["prompt"]
@@ -519,9 +519,21 @@ def test_agent_handles_bare_fence_and_max_steps():
             return "Final Answer: 2"
         return "Sure:\n```\nprint(1 + 1)\n```\n"
     llm = FakeLLM(responder)
-    res = run_agent(llm, "1+1?", max_steps=2)
+    res = run_agent(llm, "1+1?", max_steps=2, code_first=False)
     assert all(s.code == "print(1 + 1)" for s in res.steps[:2])
     assert res.answer == "2" and res.stop_reason == "max_steps"
+
+
+def test_agent_code_first_prefills_a_python_block():
+    def responder(c):
+        if "Output:" in c["prompt"]:
+            return "Final Answer: 121932631112635269"
+        assert c["prompt"].endswith("```python\n")  # the first turn starts inside a code block
+        return "print(123456789 * 987654321)\n```\n"
+    llm = FakeLLM(responder)
+    res = run_agent(llm, "Use Python to compute 123456789 * 987654321.")
+    assert res.steps[0].code == "print(123456789 * 987654321)"
+    assert res.answer == "121932631112635269"
 
 
 def test_agent_without_tool_call():

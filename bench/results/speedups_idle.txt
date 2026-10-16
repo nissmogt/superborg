@@ -1,0 +1,6 @@
+target qwen2.5-1.5b-q4.borg, draft qwen2.5-0.5b-q4.borg
+  code edit    plain  18.1 tok/s | lookup  23.3 (x1.29) | draft  19.6 (x1.09) | identical output: True
+  document QA  plain  17.6 tok/s | lookup  30.5 (x1.74) | draft  14.4 (x0.82) | identical output: True
+  open-ended   plain  18.5 tok/s | lookup  18.2 (x0.98) | draft  15.3 (x0.82) | identical output: True
+  sample 4: sequential  29.3s ( 17.5 tok/s) | batched  12.2s ( 41.9 tok/s) | x2.40 throughput
+  sample 8: sequential  58.3s ( 17.6 tok/s) | batched  22.6s ( 45.3 tok/s) | x2.58 throughput

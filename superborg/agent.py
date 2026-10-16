@@ -64,15 +64,25 @@ def _pending_code(text: str) -> str | None:
     return body.strip("\n") or None
 
 
+def _needs_computation(question: str) -> bool:
+    """Questions with several numbers or an explicit request to compute/run code."""
+    return len(re.findall(r"\d+(?:\.\d+)?", question)) >= 2 or bool(
+        re.search(r"\b(python|compute|calculate|code)\b", question, re.I))
+
+
 def run_agent(llm, question: str, max_steps: int = 5, max_tokens: int = 512, system: str = AGENT_SYSTEM,
               temperature: float = 0.0, seed: int = 0, timeout: float = 10.0,
               stream: Callable[[str], None] | None = None, enable_thinking: bool = False,
-              numeric: bool | None = None) -> AgentResult:
+              numeric: bool | None = None, code_first: bool | None = None) -> AgentResult:
     """Alternate model turns and Python executions until a final answer or max_steps.
 
     max_tokens bounds each model turn; observations are truncated so the conversation
-    stays well inside the context window of small models.
+    stays well inside the context window of small models. code_first (default: when the
+    question involves calculation) starts the first turn inside a python block: small models
+    otherwise often state a guessed result instead of computing it.
     """
+    if code_first is None:
+        code_first = _needs_computation(question)
     t0 = time.perf_counter()
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": question}]
     steps: list[Step] = []
@@ -82,7 +92,9 @@ def run_agent(llm, question: str, max_steps: int = 5, max_tokens: int = 512, sys
     text = ""
     for i in range(max_steps):
         prompt = llm.render(msgs, enable_thinking=enable_thinking)
-        raw = ""
+        raw = "```python\n" if (i == 0 and code_first) else ""
+        if raw and stream:
+            stream(raw)
         budget = max_tokens
         for _ in range(3):
             g = llm.generate_tokens(llm.tokenize(prompt + raw, add_bos=False), max_tokens=budget,
