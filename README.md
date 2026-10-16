@@ -147,6 +147,27 @@ ans = solve(llm, "If 3 pencils cost $0.75, how much do 20 pencils cost?", strate
 print(ans.answer, ans.strategy)
 ```
 
+## In the browser
+
+The same C engine compiles to WebAssembly (`wasm/build.sh`, clang with the wasm32-wasi
+target) and runs in a Web Worker. `wasm/make_artifact.py` packages the chat and activation
+UI with the engine and a model as a static site:
+
+```sh
+wasm/build.sh                    # build/borg.wasm (SIMD128, single thread)
+wasm/build-js.sh                 # optional build/borg-asm.js for pages that block WebAssembly
+python wasm/make_artifact.py smollm2-135m-q4.borg site/
+cd site && python -m http.server # open http://localhost:8000/
+```
+
+Measured on this machine in headless Chromium with SmolLM2-135M q4 (110.8 MB, downloaded
+in 8 parts and cached in IndexedDB): about 32 ms per decoded token, and 6.6–9.4 tok/s for
+chat with the full trace (logit lens on every third layer, attention, MLP, norms) recorded
+for every token. The lens costs more than the decode step itself (11 rows through the
+49,152 × 576 output matrix, about 43 ms). The wasm2js fallback runs the same chat at
+1.6 tok/s. `tests/test_wasm.py` checks the WebAssembly build against the native engine:
+identical tokenization, logits within 4e-4 of the native f32 result, the same trace events.
+
 ## Supported models
 
 Decoder-only models with these Hugging Face `model_type` values: `llama` (Llama 2/3,
@@ -181,6 +202,7 @@ tests/               pytest suites (tokenizer parity, reference, engine, server,
 tests/c/             C kernel and JSON-mode tests (make test-c)
 bench/               benchmarks and their logs
 eval/gsm8k.py        GSM8K evaluation of the reasoning strategies
+wasm/                WebAssembly build, browser runtime, Web Worker and static-site packager
 tools/               Unicode table generator, Hugging Face oracle, fixture builder
 ```
 

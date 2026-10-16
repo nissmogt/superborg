@@ -50,21 +50,35 @@
   }
 
   class Borg {
+    /** `wasmBytes`: borg.wasm. With `options.asm` (borgAsmInstantiate from build-js.sh) and no
+     *  bytes, run the JavaScript build instead, for pages that may not compile WebAssembly. */
     static async create(wasmBytes, options = {}) {
       let memory = null;
       const log = options.log || ((s) => console.warn("[borg]", s));
-      const imports = { wasi_snapshot_preview1: wasiShim(() => memory, log) };
-      const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
-      memory = instance.exports.memory;
-      if (instance.exports._initialize) instance.exports._initialize();
-      return new Borg(instance);
+      const wasi = wasiShim(() => memory, log);
+      let exports;
+      if (wasmBytes) {
+        const { instance } = await WebAssembly.instantiate(wasmBytes, { wasi_snapshot_preview1: wasi });
+        exports = instance.exports;
+      } else {
+        // wasm2js splits 64-bit arguments in two 32-bit halves ("legalized" imports)
+        const legal = Object.assign({}, wasi, {
+          clock_time_get: (id, precLo, precHi, out) => wasi.clock_time_get(id, 0n, out),
+          fd_seek: () => ENOSYS,
+          path_open: () => ENOSYS,
+        });
+        exports = options.asm({ wasi_snapshot_preview1: legal, env: { setTempRet0: () => {} } });
+      }
+      memory = exports.memory;
+      if (exports._initialize) exports._initialize();
+      return new Borg(exports, wasmBytes ? "" : " (JavaScript build)");
     }
 
-    constructor(instance) {
-      this.x = instance.exports;
+    constructor(exports, note = "") {
+      this.x = exports;
       this.enc = new TextEncoder();
       this.dec = new TextDecoder("utf-8", { fatal: false });
-      this.simd = this.str(this.x.borg_simd());
+      this.simd = this.str(this.x.borg_simd()) + note;
       this.version = this.str(this.x.borg_version());
     }
 

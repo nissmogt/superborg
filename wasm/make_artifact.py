@@ -5,10 +5,13 @@
 Writes to out_dir:
   index.html      the UI page with the WebAssembly transport inlined (no server needed); with
                   --fragment, without <!doctype>/<html>/<head>/<body>, for hosts that wrap pages
-  worker.js       borg-runtime.js + trace-session.js + worker.js in one file
+  worker.js       borg-runtime.js + trace-session.js + worker.js in one file, plus the
+                  JavaScript build (build/borg-asm.js from wasm/build-js.sh) when it exists
   borg.wasm       the engine (built with wasm/build.sh if missing)
   model.json      manifest: engine file, model parts and sizes, context length
-  model/part-NN.bin  the .borg file split into parts of at most --part-size bytes
+  model/part-NN.wasm the .borg file split into parts of at most --part-size bytes, each stored as
+                  the custom section "borg-part" of an otherwise empty WebAssembly module, so
+                  hosts that serve only web file types (.wasm, not .bin) serve the parts
 
 Serve the directory over HTTP (python -m http.server) and open index.html. Browsers do not run
 WebAssembly from file:// URLs.
@@ -37,10 +40,28 @@ def read_header(path: Path) -> dict:
         return json.loads(f.read(n))
 
 
-def bundle_worker() -> str:
+def leb128(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def wasm_wrap(payload: bytes, name: bytes = b"borg-part") -> bytes:
+    """A valid WebAssembly module whose only content is a custom section holding `payload`."""
+    body = leb128(len(name)) + name + payload
+    return b"\0asm" + (1).to_bytes(4, "little") + b"\x00" + leb128(len(body)) + body
+
+
+def bundle_worker(asm: Path | None) -> str:
     parts = []
     for name in ("borg-runtime.js", "trace-session.js", "worker.js"):
         parts.append(f"// ---- {name} ----\n" + (WASM_DIR / name).read_text())
+    if asm is not None:
+        parts.insert(0, f"// ---- {asm.name} ----\n" + asm.read_text())
     return "\n".join(parts)
 
 
@@ -52,8 +73,7 @@ def page_for_static(page: str, transport: str, fragment: bool) -> str:
         page = re.sub(r"</?(html|head|body)\b[^>]*>", "", page, flags=re.I)
         page = re.sub(r"<meta\s+charset[^>]*>", "", page, flags=re.I)
         page = re.sub(r'<meta\s+name="viewport"[^>]*>', "", page, flags=re.I)
-        if "claude:viewport-fit-sides" not in page:
-            page = '<meta name="claude:viewport-fit-sides" content="cover">\n' + page.lstrip()
+        page = re.sub(r'<link\s+rel="icon"[^>]*>', "", page, flags=re.I)
     m = re.search(r"<script\b", page, flags=re.I)
     if not m:
         raise SystemExit("the page has no <script>")
@@ -67,6 +87,9 @@ def main(argv=None) -> int:
     ap.add_argument("out", type=Path)
     ap.add_argument("--page", type=Path, default=ROOT / "superborg" / "web" / "index.html")
     ap.add_argument("--wasm", type=Path, default=ROOT / "build" / "borg.wasm")
+    ap.add_argument("--asm", type=Path, default=ROOT / "build" / "borg-asm.js",
+                    help="JavaScript build for pages that block WebAssembly (wasm/build-js.sh); bundled if it exists")
+    ap.add_argument("--no-asm", action="store_true", help="do not bundle the JavaScript build")
     ap.add_argument("--part-size", type=int, default=14_500_000)
     ap.add_argument("--n-ctx", type=int, default=2048)
     ap.add_argument("--lens-stride", type=int, default=3)
@@ -79,7 +102,7 @@ def main(argv=None) -> int:
         subprocess.run([str(WASM_DIR / "build.sh"), str(a.wasm)], check=True)
     out = a.out
     (out / "model").mkdir(parents=True, exist_ok=True)
-    for old in (out / "model").glob("part-*.bin"):
+    for old in (out / "model").glob("part-*.*"):
         old.unlink()
 
     size = a.model.stat().st_size
@@ -92,8 +115,8 @@ def main(argv=None) -> int:
             if not chunk:
                 break
             digest.update(chunk)
-            rel = f"model/part-{i:02d}.bin"
-            (out / rel).write_bytes(chunk)
+            rel = f"model/part-{i:02d}.wasm"
+            (out / rel).write_bytes(wasm_wrap(chunk))
             parts.append({"path": rel, "size": len(chunk)})
             i += 1
     manifest = {
@@ -101,14 +124,16 @@ def main(argv=None) -> int:
         "n_ctx": a.n_ctx,
         "lens_stride": a.lens_stride,
         "model": {"name": a.name or header.get("source") or a.model.stem, "id": digest.hexdigest()[:16],
-                  "size": size, "quant": header.get("quant"), "parts": parts},
+                  "size": size, "quant": header.get("quant"), "wrap": "wasm-custom-section", "parts": parts},
     }
     (out / "model.json").write_text(json.dumps(manifest, indent=1) + "\n")
     shutil.copyfile(a.wasm, out / "borg.wasm")
-    (out / "worker.js").write_text(bundle_worker())
+    asm = None if a.no_asm or not a.asm.exists() else a.asm
+    (out / "worker.js").write_text(bundle_worker(asm))
     transport = (WASM_DIR / "wasm-transport.js").read_text()
     (out / "index.html").write_text(page_for_static(a.page.read_text(), transport, a.fragment))
-    print(f"wrote {out}: {len(parts)} model parts, {size / 1e6:.1f} MB")
+    print(f"wrote {out}: {len(parts)} model parts, {size / 1e6:.1f} MB"
+          + ("" if asm else " (no JavaScript fallback: run wasm/build-js.sh)"))
     return 0
 
 

@@ -8,12 +8,15 @@
 //   {op: "reset"}                       drop the KV cache
 // Messages to the page without an id: {status: {text, progress}}, {ready: info}, {fatal: message}.
 //
-// model.json: {"wasm": "borg.wasm", "model": {"name", "size", "parts": [{"path", "size"}...]}, "n_ctx"}
+// model.json: {"wasm": "borg.wasm", "n_ctx", "lens_stride",
+//              "model": {"name", "id", "size", "wrap"?, "parts": [{"path", "size"}...]}}
 // Model parts are cached in IndexedDB when the browser allows it, so a second visit skips the download.
 // The worker expects Borg (borg-runtime.js) and TraceSession (trace-session.js) as globals: either
 // concatenated into one file (wasm/make_artifact.py does that) or loaded with importScripts.
+// When the bundle also holds borgAsmInstantiate (wasm/build-js.sh), pages that block WebAssembly
+// run that JavaScript build instead.
 
-/* global self, Borg, TraceSession, importScripts, indexedDB */
+/* global self, Borg, TraceSession, borgAsmInstantiate, importScripts, indexedDB, WebAssembly */
 "use strict";
 
 if (typeof Borg === "undefined") importScripts("borg-runtime.js", "trace-session.js");
@@ -63,6 +66,20 @@ function cachePut(db, key, value) {
   });
 }
 
+// make_artifact.py stores each model part as the custom section of a WebAssembly module
+// (hosts serve .wasm files but not arbitrary binary types): return the section's payload.
+function unwrapPart(b) {
+  let i = 8;
+  const leb = () => { let v = 0, shift = 0, c; do { c = b[i++]; v += (c & 0x7f) * 2 ** shift; shift += 7; } while (c & 0x80); return v; };
+  if (b.length < 10 || b[0] !== 0 || b[1] !== 0x61 || b[2] !== 0x73 || b[3] !== 0x6d || b[8] !== 0)
+    throw new Error("model part is not a wrapped WebAssembly module");
+  i = 9;
+  const end = leb() + i;
+  const nameLen = leb();
+  i += nameLen;
+  return b.subarray(i, end);
+}
+
 async function fetchBytes(url, onProgress) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`cannot download ${url}: HTTP ${res.status}`);
@@ -91,12 +108,18 @@ async function init(base) {
   status("Loading the engine");
   const manifest = await (await fetch(url("model.json"))).json();
   nCtx = manifest.n_ctx || 2048;
-  const wasmBytes = await fetchBytes(url(manifest.wasm || "borg.wasm"), () => {});
-  let borg;
+  const log = (s) => console.warn("[borg]", s);
+  let borg, slow = false;
   try {
-    borg = await Borg.create(wasmBytes, { log: (s) => console.warn("[borg]", s) });
+    if (typeof WebAssembly === "undefined") throw new Error("WebAssembly is not available");
+    borg = await Borg.create(await fetchBytes(url(manifest.wasm || "borg.wasm"), () => {}), { log });
   } catch (e) {
-    throw new Error("this browser or page does not allow WebAssembly here (" + e.message + ")");
+    // e.g. a Content-Security-Policy without 'wasm-unsafe-eval': fall back to the wasm2js build
+    if (typeof borgAsmInstantiate === "undefined")
+      throw new Error("this page cannot run WebAssembly (" + e.message + ")");
+    console.warn("[borg] WebAssembly unavailable, using the JavaScript build:", e.message);
+    borg = await Borg.create(null, { asm: borgAsmInstantiate, log });
+    slow = true;
   }
   const mm = manifest.model, total = mm.size;
   const reservation = borg.reserveModel(total);
@@ -112,8 +135,9 @@ async function init(base) {
     } else {
       bytes = await fetchBytes(url(part.path), (n) =>
         status(`Downloading ${mm.name} (${pct(done + n)}% of ${(total / 1e6).toFixed(0)} MB)`, (done + n) / total));
+      if (mm.wrap === "wasm-custom-section") bytes = unwrapPart(bytes);
       if (bytes.length !== part.size) throw new Error(`${part.path}: expected ${part.size} bytes, got ${bytes.length}`);
-      await cachePut(db, key, bytes.buffer);
+      await cachePut(db, key, bytes.slice().buffer);
     }
     reservation.write(bytes, off);
     off += bytes.length;
@@ -125,7 +149,8 @@ async function init(base) {
   await tick();
   model = reservation.load();
   ctx = model.context({ nCtx, kvF16: true });
-  session = new TraceSession(model, ctx, { lensStride: manifest.lens_stride || 3 });
+  // the JavaScript build is about 4x slower: trace fewer lens layers by default
+  session = new TraceSession(model, ctx, { lensStride: (manifest.lens_stride || 3) * (slow ? 2 : 1) });
   const info = session.info();
   info.model = mm.name || info.model;
   return info;

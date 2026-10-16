@@ -112,3 +112,64 @@ def test_trace_events_match_python_schema(wasm, native):
         assert len(g["norms"]["resid"]) == native.model.config["n_layers"] + 1
         np.testing.assert_allclose(g["norms"]["resid"], r["norms"]["resid"], rtol=5e-2, atol=1e-2)
     assert got[-1]["text"] == ref[-1]["text"]
+
+
+def test_javascript_build_matches_native(tmp_path):
+    """wasm/build-js.sh (wasm2js) for pages that block WebAssembly: same tokens and logits."""
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    if not (os.environ.get("BINARYEN_WASM2JS") or shutil.which("wasm2js")):
+        pytest.skip("wasm2js not available (set BINARYEN_WASM2JS)")
+    if not os.path.exists(Q8):
+        pytest.skip(f"{Q8} not available")
+    out = tmp_path / "borg-asm.js"
+    r = subprocess.run([str(ROOT / "wasm" / "build-js.sh"), str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    got = run_wasm(out, Q8, tmp_path, max_tokens=2)
+    assert got["simd"] == "scalar (JavaScript build)"
+    llm = LLM(Q8, n_ctx=256, threads=2)
+    for text, toks in zip(TEXTS, got["tokens"]):
+        assert toks == llm.model.tokenize(text, add_bos=False), text
+    llm.close()
+    logits = np.array(got["logits"], np.float32)
+    ref = native_logits(Q8)
+    assert np.abs(logits - ref).max() <= 5e-2 * np.abs(ref).max()
+    assert int(logits.argmax()) == int(ref.argmax())
+
+
+def test_make_artifact_parts_reassemble(tmp_path):
+    """make_artifact.py splits the model into WebAssembly-wrapped parts that rebuild the file."""
+    import importlib.util
+    small = os.path.join(MODELS, "smollm2-135m-q4_0.borg")
+    if not os.path.exists(small):
+        pytest.skip(f"{small} not available")
+    page = tmp_path / "page.html"
+    page.write_text("<!doctype html><html><head><title>t</title></head><body><script>1</script></body></html>")
+    spec = importlib.util.spec_from_file_location("make_artifact", ROOT / "wasm" / "make_artifact.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    wasm = tmp_path / "fake.wasm"
+    wasm.write_bytes(b"\0asm\x01\0\0\0")
+    out = tmp_path / "site"
+    assert mod.main([small, str(out), "--page", str(page), "--wasm", str(wasm), "--no-asm", "--fragment",
+                     "--part-size", "30000000"]) == 0
+    man = json.loads((out / "model.json").read_text())
+    data = b""
+    for part in man["model"]["parts"]:
+        b = (out / part["path"]).read_bytes()
+        assert b[:8] == b"\0asm\x01\0\0\0" and b[8] == 0          # module header, custom section
+        i, n, shift = 9, 0, 0
+        while True:                                                 # section size (LEB128)
+            c = b[i]; i += 1; n |= (c & 0x7F) << shift; shift += 7
+            if not c & 0x80:
+                break
+        end = i + n
+        name_len = b[i]; i += 1
+        assert b[i:i + name_len] == b"borg-part"
+        payload = b[i + name_len:end]
+        assert end == len(b) and len(payload) == part["size"]
+        data += payload
+    assert data == Path(small).read_bytes()
+    html = (out / "index.html").read_text()
+    assert "<html" not in html and "<body" not in html and "BORG_TRANSPORT" in html
+    assert html.index("BORG_TRANSPORT") < html.index("<script>1</script>")

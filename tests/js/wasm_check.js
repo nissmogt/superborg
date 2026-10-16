@@ -1,5 +1,5 @@
 // Driven by tests/test_wasm.py: load a model in the WebAssembly engine and print results as JSON.
-//   node wasm_check.js borg.wasm model.borg request.json
+//   node wasm_check.js borg.wasm|borg-asm.js model.borg request.json
 const fs = require("fs");
 const path = require("path");
 const root = path.resolve(__dirname, "..", "..");
@@ -9,7 +9,10 @@ const { TraceSession } = require(path.join(root, "wasm", "trace-session.js"));
 (async () => {
   const [wasmPath, modelPath, reqPath] = process.argv.slice(2);
   const req = JSON.parse(fs.readFileSync(reqPath, "utf8"));
-  const borg = await Borg.create(fs.readFileSync(wasmPath), { log: () => {} });
+  // a .js path is the wasm2js build (wasm/build-js.sh)
+  const borg = wasmPath.endsWith(".js")
+    ? await Borg.create(null, { asm: require(path.resolve(wasmPath)).borgAsmInstantiate, log: () => {} })
+    : await Borg.create(fs.readFileSync(wasmPath), { log: () => {} });
   // load in 3 parts, as the browser worker does
   const file = fs.readFileSync(modelPath);
   const third = Math.floor(file.length / 3);
