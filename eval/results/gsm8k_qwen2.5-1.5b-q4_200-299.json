@@ -56,7 +56,8 @@
    "tokens_per_q": 298.13,
    "samples_per_q": 1.0,
    "wins_vs_direct": 14,
-   "losses_vs_direct": 6
+   "losses_vs_direct": 6,
+   "p_vs_direct": 0.11531829833984375
   },
   "vote": {
    "n": 100,
@@ -70,7 +71,8 @@
    "tokens_per_q": 1462.65,
    "samples_per_q": 5.0,
    "wins_vs_direct": 16,
-   "losses_vs_direct": 4
+   "losses_vs_direct": 4,
+   "p_vs_direct": 0.01181793212890625
   },
   "pal_vote": {
    "n": 100,
@@ -84,7 +86,8 @@
    "tokens_per_q": 475.34,
    "samples_per_q": 5.14,
    "wins_vs_direct": 18,
-   "losses_vs_direct": 13
+   "losses_vs_direct": 13,
+   "p_vs_direct": 0.47312965989112854
   }
  },
  "records": [
