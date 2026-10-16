@@ -403,6 +403,36 @@ def _token_id(tok_cfg_value, vocab: dict[str, int]) -> int:
     return vocab.get(tok_cfg_value, -1)
 
 
+def _named_template(template, name: str = "default") -> str | None:
+    """One of a checkpoint's named templates: a list of {"name", "template"} (older
+    tokenizer_config.json files) or a dict, `name` if present, else the first."""
+    if isinstance(template, dict):
+        template = template.get(name, next(iter(template.values()), None))
+    elif isinstance(template, list):
+        template = next((t.get("template") for t in template if t.get("name") == name),
+                        template[0].get("template") if template else None)
+    return template if isinstance(template, str) and template else None
+
+
+def load_chat_template(model_dir: str, tc: dict | None = None) -> str | None:
+    """The checkpoint's default chat template. transformers >= 5 saves it as chat_template.jinja
+    (named extra templates in additional_chat_templates/) and drops the chat_template field of
+    tokenizer_config.json, so the files take precedence over the field (`tc`, read here when
+    not given); SmolLM3 and Gemma 3/4 checkpoints only have the file."""
+    for p in (os.path.join(model_dir, "chat_template.jinja"),
+              os.path.join(model_dir, "additional_chat_templates", "default.jinja")):
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read() or None
+    if tc is None:
+        tc = {}
+        p = os.path.join(model_dir, "tokenizer_config.json")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                tc = json.load(f)
+    return _named_template(tc.get("chat_template"))
+
+
 def _chat_format(template: str | None) -> str:
     if not template:
         return "plain"
@@ -562,9 +592,7 @@ def convert_tokenizer(model_dir: str, cfg: dict) -> tuple[dict, dict[str, tuple[
     pad_id = _token_id(tc.get("pad_token"), vocab)
     unk_id = vocab.get(model["unk_token"], -1) if model.get("unk_token") else -1
 
-    template = tc.get("chat_template")
-    if isinstance(template, list):  # named templates
-        template = next((t["template"] for t in template if t.get("name") == "default"), template[0]["template"])
+    template = load_chat_template(model_dir, tc)
 
     meta = {
         "byte_level": byte_level,

@@ -86,6 +86,40 @@ const cases = {
     }));
   },
 
+  // chat template parity with superborg/chat.py: every template x conversation x setting through
+  // renderChat (the vendored @huggingface/jinja), the rendered text or the error's message
+  async template(req) {
+    const out = {};
+    for (const [name, info] of Object.entries(req.templates)) {
+      out[name] = {};
+      for (const [cn, conv] of Object.entries(req.conversations)) {
+        req.settings.forEach((s, i) => {
+          const extra = Object.assign({}, s.extra || {});
+          if (s.tools) extra.tools = req.tools;
+          let r;
+          try {
+            r = { text: renderChat(info, conv, s.add_generation_prompt, "enable_thinking" in s ? s.enable_thinking : null,
+                                   extra) };
+          } catch (e) { r = { error: e.message }; }
+          out[name][`${cn}#${i}`] = r;
+        });
+      }
+    }
+    return out;
+  },
+
+  // the vendored library's strftime_now (patched to Python's C-locale directives) at given times:
+  // Date without arguments is pinned to each time, as the library creates it
+  async strftime(req) {
+    require(path.join(root, "wasm", "vendor", "hfjinja.js"));
+    const tpl = new HFJinja.Template("{{ strftime_now(fmt) }}"), RealDate = Date, out = [];
+    for (const ms of req.times) {
+      globalThis.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [ms])); } };
+      try { out.push(req.formats.map((fmt) => tpl.render({ fmt }))); } finally { globalThis.Date = RealDate; }
+    }
+    return out;
+  },
+
   // the lens summarized in the engine (ctx.lensSummary) against the full logits summarized in
   // JavaScript, for every token of a short chat: unrounded, and as TraceSession's reports
   async lens(req) {

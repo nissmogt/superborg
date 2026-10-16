@@ -17,6 +17,9 @@ Extensions to the OpenAI request body:
   "samples": K                samples for voting strategies (default 5)
   "context": "text"           reference text for retrieval-augmented answering ("rag")
   "enable_thinking": bool     Qwen3 thinking mode (also "chat_template_kwargs": {"enable_thinking": ...})
+  "chat_template_kwargs": {}  further variables for the model's chat template (date_string,
+                              reasoning_effort, ...), as llama.cpp and vLLM take them; the
+                              "enable_thinking" field above wins over one given here
   "repeat_penalty": R         repetition penalty (alias "repetition_penalty")
   "lookup": N                 prompt-lookup speculative decoding with N-gram matching
 
@@ -266,6 +269,25 @@ def _reasoning_strategy(body: dict) -> str | None:
     return r
 
 
+def _template_kwargs(body: dict) -> tuple[bool, dict]:
+    """(enable_thinking, the other chat template variables) of a chat body: the enable_thinking
+    field, else chat_template_kwargs' one, else off; the rest of chat_template_kwargs goes to the
+    template as it is (reasoning strategies render without it)."""
+    tmpl = body.get("chat_template_kwargs")
+    if tmpl is None:
+        tmpl = {}
+    elif not isinstance(tmpl, dict):
+        raise APIError(400, "'chat_template_kwargs' must be an object", param="chat_template_kwargs")
+    for key in ("messages", "add_generation_prompt"):
+        if key in tmpl:
+            raise APIError(400, f"'chat_template_kwargs' cannot set '{key}'", param="chat_template_kwargs")
+    if tmpl.get("enable_thinking") is not None and not isinstance(tmpl["enable_thinking"], bool):
+        raise APIError(400, "'chat_template_kwargs.enable_thinking' must be a boolean", param="chat_template_kwargs")
+    thinking = _flag(body, "enable_thinking") if body.get("enable_thinking") is not None \
+        else bool(tmpl.get("enable_thinking", False))
+    return thinking, {k: v for k, v in tmpl.items() if k != "enable_thinking"}
+
+
 def _split_thinking(text: str) -> tuple[str | None, str]:
     """Separate a leading <think>...</think> block (Qwen3 thinking mode) from the answer."""
     start = text.find("<think>")
@@ -416,8 +438,7 @@ class Service:
         max_tokens_given = kw.pop("max_tokens_given")
         n = self._n_choices(body, stream)
         strategy = _reasoning_strategy(body)
-        tmpl = body.get("chat_template_kwargs") if isinstance(body.get("chat_template_kwargs"), dict) else {}
-        thinking = bool(body.get("enable_thinking", tmpl.get("enable_thinking", False)))
+        thinking, template_kwargs = _template_kwargs(body)
         cid = "chatcmpl-" + secrets.token_hex(12)
         created = int(time.time())
         include_usage = _include_usage(body)
@@ -442,7 +463,8 @@ class Service:
         with self.lock:
             self.n_requests += 1
             try:
-                text = self.llm.render(messages, enable_thinking=thinking)
+                text = (self.llm.formatter.render(messages, enable_thinking=thinking, **template_kwargs)
+                        if template_kwargs else self.llm.render(messages, enable_thinking=thinking))
             except Exception as e:  # noqa: BLE001 - templates reject some message orders (raise_exception)
                 raise APIError(400, f"the model's chat template rejected the messages: {e}",
                                param="messages") from e

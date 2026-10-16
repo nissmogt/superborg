@@ -6,8 +6,9 @@ Writes to out_dir:
   index.html      the UI page with the WebAssembly transport inlined (no server needed); with
                   --fragment, without <!doctype>/<html>/<head>/<body>, for hosts that wrap pages,
                   and (also with --inline-worker) with worker.js embedded, started from a blob: URL
-  worker.js       borg-runtime.js + trace-session.js + worker.js in one file, plus the
-                  JavaScript build (build/borg-asm.js from wasm/build-js.sh) when it exists
+  worker.js       vendor/hfjinja.js (chat templates) + borg-runtime.js + trace-session.js + worker.js
+                  in one file, plus the JavaScript build (build/borg-asm.js from wasm/build-js.sh)
+                  when it exists
   borg.wasm       the engine (built with wasm/build.sh if missing)
   model.json      manifest: engine file, model parts and sizes, context length
   model/part-NN.wasm the .borg file split into parts of at most --part-size bytes, each stored as
@@ -59,7 +60,8 @@ def wasm_wrap(payload: bytes, name: bytes = b"borg-part") -> bytes:
 
 def bundle_worker(asm: Path | None) -> str:
     parts = []
-    for name in ("borg-runtime.js", "trace-session.js", "worker.js"):
+    # the vendored Jinja port first: trace-session.js renders chat templates with its global
+    for name in ("vendor/hfjinja.js", "borg-runtime.js", "trace-session.js", "worker.js"):
         text = (WASM_DIR / name).read_text()
         if name == "worker.js":  # its own scope: its top-level names must not clash with the page's
             text = "(function () {\n" + text + "\n})();"

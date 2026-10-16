@@ -6,7 +6,9 @@
 //                                       (try here first)
 //   {op: "info", id}                    -> {id, info}
 //   {op: "chat", id, body}              -> {id, event} for every TraceSession event, then {id, end: true};
-//                                       body as POST /api/chat (superborg/ui.py), with "request_id"?
+//                                       body as POST /api/chat (superborg/ui.py), with "request_id"? and
+//                                       "chat_template_kwargs"? (extra chat template variables, as
+//                                       superborg/server.py takes them)
 //   {op: "stop", id?, request_id?}      cancel the running generation (it ends with stop_reason
 //                                       "cancelled"), or only the one with that request_id; a request_id
 //                                       whose chat has not started yet is remembered, and that chat
@@ -281,6 +283,14 @@ function parseChat(body) {
     throw new Error("'request_id' must be 1-64 characters from A-Z, a-z, 0-9, '_' and '-'");
   if (body.enable_thinking != null && typeof body.enable_thinking !== "boolean")
     throw new Error("'enable_thinking' must be true or false");
+  // chat_template_kwargs reach the template as variables; enable_thinking in it counts unless the
+  // field above is given, and off is the default, as in superborg/server.py
+  const tmpl = body.chat_template_kwargs ?? {};
+  if (typeof tmpl !== "object" || Array.isArray(tmpl)) throw new Error("'chat_template_kwargs' must be an object");
+  if (tmpl.enable_thinking != null && typeof tmpl.enable_thinking !== "boolean")
+    throw new Error("'chat_template_kwargs.enable_thinking' must be true or false");
+  for (const k of ["messages", "add_generation_prompt"])
+    if (k in tmpl) throw new Error(`'chat_template_kwargs' cannot set '${k}'`);
   return {
     requestId: rid ?? null,
     messages,
@@ -291,7 +301,8 @@ function parseChat(body) {
     topP: num("top_p", 1, 0, 1, false),
     topK: num("top_k", 0, 0, 2 ** 30),
     seed: num("seed", 0, 0, 2 ** 64 - 1),
-    enableThinking: body.enable_thinking === true,
+    enableThinking: typeof body.enable_thinking === "boolean" ? body.enable_thinking : tmpl.enable_thinking === true,
+    chatTemplateKwargs: Object.keys(tmpl).length ? Object.assign({}, tmpl) : null,
   };
 }
 

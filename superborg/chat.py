@@ -1,22 +1,42 @@
 """Chat prompt formatting.
 
-Renders the model's own Jinja chat template (copied from tokenizer_config.json into the
-.borg header) the way transformers' apply_chat_template does, when jinja2 is installed.
-Otherwise falls back to built-in renderers for the common formats.
+Renders the model's own Jinja chat template (copied from the checkpoint into the .borg header
+by superborg/convert.py) the way transformers' apply_chat_template does, when jinja2 is
+installed. Otherwise falls back to built-in renderers for the common formats.
+wasm/trace-session.js renders the same template in the browser with @huggingface/jinja;
+tests/test_wasm.py checks that the two give the same bytes.
 """
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 from typing import Any
 
 Message = dict[str, Any]
 
 
-def _jinja_render(template: str, messages: list[Message], add_generation_prompt: bool, **kwargs) -> str:
+@functools.lru_cache(maxsize=1)
+def _environment():
+    """transformers' template environment (utils/chat_template_utils.py): a sandbox with
+    trim_blocks and lstrip_blocks, loop controls, its tojson, raise_exception and strftime_now,
+    and the {% generation %} tag (transformers marks assistant tokens with it; here the body
+    just renders, as @huggingface/jinja does)."""
     import jinja2
-    from jinja2.ext import loopcontrols
+    from jinja2 import nodes
+    from jinja2.ext import Extension, loopcontrols
     from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    class GenerationTag(Extension):
+        tags = {"generation"}
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+            return nodes.CallBlock(self.call_method("_render", []), [], [], body).set_lineno(lineno)
+
+        def _render(self, caller):
+            return caller()
 
     def raise_exception(message):
         raise jinja2.exceptions.TemplateError(message)
@@ -27,11 +47,20 @@ def _jinja_render(template: str, messages: list[Message], add_generation_prompt:
     def strftime_now(fmt):
         return datetime.datetime.now().strftime(fmt)
 
-    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[GenerationTag, loopcontrols])
     env.filters["tojson"] = tojson
     env.globals["raise_exception"] = raise_exception
     env.globals["strftime_now"] = strftime_now
-    return env.from_string(template).render(messages=messages, add_generation_prompt=add_generation_prompt, **kwargs)
+    return env
+
+
+@functools.lru_cache(maxsize=16)
+def _compiled(template: str):
+    return _environment().from_string(template)
+
+
+def _jinja_render(template: str, messages: list[Message], add_generation_prompt: bool, **kwargs) -> str:
+    return _compiled(template).render(messages=messages, add_generation_prompt=add_generation_prompt, **kwargs)
 
 
 def _builtin_render(fmt: str, messages: list[Message], add_generation_prompt: bool, enable_thinking: bool = True,
@@ -84,8 +113,14 @@ class ChatFormatter:
         self.fmt = tokenizer_info.get("chat_format", "plain")
         self.token_text = token_text or (lambda i: "")
         bos, eos = tokenizer_info.get("bos_id", -1), tokenizer_info.get("eos_id", -1)
-        self.bos_token = self.token_text(bos) if bos is not None and bos >= 0 else ""
-        self.eos_token = self.token_text(eos) if eos is not None and eos >= 0 else ""
+        self.bos_token = self._text(bos)
+        self.eos_token = self._text(eos)
+        # the end-of-turn tokens' text (the header's eos_ids), in order, without repeats
+        self.eos_tokens: list[str] = []
+        for i in tokenizer_info.get("eos_ids") or ([eos] if eos is not None and eos >= 0 else []):
+            t = self._text(i)
+            if t and t not in self.eos_tokens:
+                self.eos_tokens.append(t)
         self.add_bos = bool(tokenizer_info.get("add_bos"))
         try:
             import jinja2  # noqa: F401
@@ -93,25 +128,39 @@ class ChatFormatter:
         except ImportError:
             self.have_jinja = False
 
+    def _text(self, token_id) -> str:
+        return self.token_text(token_id) if token_id is not None and token_id >= 0 else ""
+
     @property
     def supports_thinking(self) -> bool:
         return bool(self.template and "enable_thinking" in self.template) or self.fmt == "qwen3"
 
-    def render(self, messages: list[Message], add_generation_prompt: bool = True, enable_thinking: bool = False,
-               tools: list | None = None) -> str:
+    def render(self, messages: list[Message], add_generation_prompt: bool = True, enable_thinking: bool | None = None,
+               tools: list | None = None, **chat_template_kwargs) -> str:
+        """The prompt for `messages`. enable_thinking None leaves the variable out, so each
+        template's own default applies (thinking on for Qwen3), as transformers does when the
+        caller passes none; chat_template_kwargs (date_string, documents, ...) reach the template
+        as variables, as apply_chat_template's extra keyword arguments do."""
         if self.template and self.have_jinja:
-            kwargs = dict(bos_token=self.bos_token, eos_token=self.eos_token, enable_thinking=enable_thinking)
-            if tools:
-                kwargs["tools"] = tools
+            kwargs: dict[str, Any] = {"tools": tools, "documents": None}
+            # a special token the header lacks stays undefined, as transformers' special_tokens_map
+            # leaves it (None would render as "None")
+            if self.bos_token:
+                kwargs["bos_token"] = self.bos_token
+            if self.eos_token:
+                kwargs["eos_token"] = self.eos_token
+            kwargs.update(chat_template_kwargs)
+            if enable_thinking is not None:
+                kwargs["enable_thinking"] = enable_thinking
             return _jinja_render(self.template, messages, add_generation_prompt, **kwargs)
         default_system = None
         if self.template and "You are a helpful AI assistant named SmolLM" in self.template:
             default_system = "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
-        return _builtin_render(self.fmt, messages, add_generation_prompt, enable_thinking, default_system)
+        return _builtin_render(self.fmt, messages, add_generation_prompt, bool(enable_thinking), default_system)
 
     def stop_strings(self) -> list[str]:
-        return {"chatml": ["<|im_end|>"], "qwen3": ["<|im_end|>"], "llama3": ["<|eot_id|>"],
-                "zephyr": ["</s>"], "mistral": ["</s>"]}.get(self.fmt, [])
+        """The end-of-turn tokens' text: what the template ends turns with, whatever its format."""
+        return list(self.eos_tokens)
 
 
 def formatter_for(model) -> ChatFormatter:
