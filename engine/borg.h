@@ -42,7 +42,7 @@ BORG_API const char *borg_version(void);
 BORG_API const char *borg_simd(void); /* kernels compiled in: "avx512", "avx2", "neon", "scalar" */
 
 /* ---- threads -------------------------------------------------------------- */
-BORG_API borg_pool *borg_pool_new(int n_threads); /* n_threads <= 0: one per physical-ish core */
+BORG_API borg_pool *borg_pool_new(int n_threads); /* n_threads <= 0: one per CPU available to the process */
 BORG_API void borg_pool_free(borg_pool *pool);
 BORG_API int borg_pool_size(const borg_pool *pool);
 
@@ -94,8 +94,9 @@ BORG_API int borg_decode(borg_ctx *ctx, const int32_t *tokens, int n, float *log
 /* Decode one token for each of n contexts of the same model in a single batched pass
  * (token i is appended to ctxs[i]). Weights are read once for all sequences, so sampling
  * several continuations costs little more than one on memory-bound devices. All contexts
- * must be distinct, share n_ctx, and n must not exceed ctxs[0]'s n_batch. logits (optional)
- * receives n * vocab_size floats. Returns 0 on success. */
+ * must be distinct, share n_ctx, and n must not exceed ctxs[0]'s n_batch; ctxs[0] supplies
+ * the scratch memory and thread pool (and collects activation statistics if enabled).
+ * logits (optional) receives n * vocab_size floats. Returns 0 on success. */
 BORG_API int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logits);
 /* Copy the cached tokens and keys/values of src into dst (same model). */
 BORG_API int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src);
@@ -176,8 +177,9 @@ BORG_API int borg_generate(borg_ctx *ctx, const int32_t *prompt, int n_prompt, c
                            borg_token_cb cb, void *user, int32_t *out, int max_out, borg_gen_stats *stats);
 
 /* Sample n_seq independent continuations of one prompt in lockstep (batched decoding).
- * The prompt is evaluated once in ctxs[0] (reusing its cached prefix) and copied to the
- * other contexts. Sequence i samples with seed params->sampling.seed + i. Speculative
+ * All contexts must share the model and n_ctx, and n_seq must not exceed any context's
+ * n_batch. The prompt is evaluated once in ctxs[0] (reusing its cached prefix) and copied to
+ * the other contexts. Sequence i samples with seed params->sampling.seed + i. Speculative
  * fields of params are ignored. cb gets the sequence index; returning nonzero stops that
  * sequence. n_generated (optional, n_seq ints) receives per-sequence token counts and
  * stop_reasons (optional) the reason codes of borg_gen_stats. Returns total tokens. */

@@ -18,9 +18,12 @@ static int accepts(const char *text, int *complete) {
 int main(void) {
     const char *good[] = {"{}", "[]", "{\"a\": 1}", "[1, 2.5, -3e+4, 0, -0.0, 1E9]", "\"x\\n\\u00e9\\\"\"",
                           "{\"a\": {\"b\": [true, false, null]}, \"c\": \"d\"}", "  [ ]  ", "42", "-0.5e-3",
-                          "{\"k\": \"caf\xc3\xa9\"}", "[[[[]]]]", "\"\""};
+                          "{\"k\": \"caf\xc3\xa9\"}", "[[[[]]]]", "\"\"",
+                          "\"\xe4\xbb\x8a\xf0\x9f\x98\x80\""};
     const char *bad[] = {"{,}", "[1,]", "{\"a\" 1}", "{a: 1}", "[01]", "[1.]", "[.5]", "tru", "[True]", "{\"a\":1}}",
-                         "[1 2]", "\"\x01\"", "\"\\x\"", "[-]", "{\"a\":}", "]"};
+                         "[1 2]", "\"\x01\"", "\"\\x\"", "[-]", "{\"a\":}", "]",
+                         "\"\xc3\"", "\"\x80\"", "\"\xc0\xaf\"", "\"\xed\xa0\x80\"", "\"\xf4\x90\x80\x80\"",
+                         "\"\xf8\""};
     int fails = 0, complete;
     for (size_t i = 0; i < sizeof good / sizeof *good; i++)
         if (!accepts(good[i], &complete) || !complete) { printf("FAIL good: %s\n", good[i]); fails++; }

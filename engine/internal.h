@@ -198,12 +198,18 @@ void vec_axpy_f16(float *y, float a, const uint16_t *x, int n);
 int32_t sampler_draw(borg_sampler *s, const float *probs, int n); /* draw from unnormalized probs */
 float sampler_uniform(borg_sampler *s);
 void sampler_select_top(float *val, int32_t *idx, int n, int k); /* k largest first (unordered) */
+void sampler_penalize(borg_sampler *s, float *logits, const int32_t *history, int n_history);
+
+/* borg_decode_multi with an explicit owner of the scratch buffers and thread pool. */
+int decode_multi_with(borg_ctx *scratch, borg_ctx **ctxs, int n, const int32_t *tokens, float *logits);
 void sampler_sort_desc(float *val, int32_t *idx, int n);
 
 /* ---- JSON-constrained decoding (json_mode.c) ------------------------------ */
 #define JSON_MAX_DEPTH 64
 typedef struct {
     int mode, aux, depth, in_key, just_opened;
+    int u8_need;                /* UTF-8 continuation bytes still expected inside a string */
+    unsigned char u8_lo, u8_hi; /* allowed range of the next continuation byte */
     char stack[JSON_MAX_DEPTH];
 } json_state;
 void json_state_init(json_state *s);

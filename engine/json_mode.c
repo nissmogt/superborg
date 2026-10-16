@@ -110,13 +110,39 @@ int json_state_feed(json_state *s, unsigned char c) {
             }
             return 0;
         case J_STRING:
+            /* RFC 8259 text is UTF-8: validate multi-byte sequences (no overlongs, surrogates
+             * or code points above U+10FFFF), since byte-level tokens can split characters */
+            if (s->u8_need) {
+                if (c < s->u8_lo || c > s->u8_hi) return 0;
+                s->u8_need--;
+                s->u8_lo = 0x80;
+                s->u8_hi = 0xBF;
+                return 1;
+            }
+            if (c >= 0x80) {
+                s->u8_lo = 0x80;
+                s->u8_hi = 0xBF;
+                if (c >= 0xC2 && c <= 0xDF) s->u8_need = 1;
+                else if (c >= 0xE0 && c <= 0xEF) {
+                    s->u8_need = 2;
+                    if (c == 0xE0) s->u8_lo = 0xA0;
+                    if (c == 0xED) s->u8_hi = 0x9F;
+                } else if (c >= 0xF0 && c <= 0xF4) {
+                    s->u8_need = 3;
+                    if (c == 0xF0) s->u8_lo = 0x90;
+                    if (c == 0xF4) s->u8_hi = 0x8F;
+                } else {
+                    return 0;
+                }
+                return 1;
+            }
             if (c == '"') {
                 if (s->in_key) s->mode = J_COLON;
                 else value_done(s);
                 return 1;
             }
             if (c == '\\') { s->mode = J_ESCAPE; return 1; }
-            return c >= 0x20; /* control characters must be escaped; UTF-8 bytes pass through */
+            return c >= 0x20; /* control characters must be escaped */
         case J_ESCAPE:
             if (c == 'u') { s->mode = J_UNICODE; s->aux = 0; return 1; }
             if (strchr("\"\\/bfnrt", c) && c) { s->mode = J_STRING; return 1; }
@@ -220,12 +246,16 @@ void json_constrain(const borg_model *m, const json_state *s, float *logits, int
                 keep[i] = 1;
                 found++;
             }
+    if (!found) /* nothing can continue the text (e.g. the recognizer failed): let it end */
+        for (int i = 0; i < n_vocab; i++)
+            if (borg_is_eog(m, i)) keep[i] = 1;
     for (int i = 0; i < n_vocab; i++)
         if (!keep[i]) logits[i] = -INFINITY;
 }
 
 /* Advance the recognizer over an emitted token. */
 void json_state_feed_token(const borg_model *m, json_state *s, int32_t tok) {
+    if (borg_is_eog(m, tok)) return; /* end-of-generation markers are not part of the JSON text */
     char buf[256];
     int n = borg_token_bytes(m, tok, buf, (int)sizeof buf);
     if (n > (int)sizeof buf) n = (int)sizeof buf;

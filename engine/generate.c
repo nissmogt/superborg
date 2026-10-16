@@ -231,9 +231,16 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
         int32_t next = -1;
         for (int i = 0; i <= k; i++) {
             float *Li = (float *)Lrow[i];
-            if (p.json_mode) json_constrain(m, &js, Li, Vs, jidx, jval, jkeep, json_want);
+            const int32_t *hist_i = g.seq;
+            int nhist_i = g.len;
+            if (p.json_mode) { /* penalize first so the constraint picks among penalized scores */
+                sampler_penalize(smp, Li, g.seq, g.len);
+                json_constrain(m, &js, Li, Vs, jidx, jval, jkeep, json_want);
+                hist_i = NULL;
+                nhist_i = 0;
+            }
             if (greedy) {
-                int32_t y = borg_sampler_sample(smp, Li, g.seq, g.len);
+                int32_t y = borg_sampler_sample(smp, Li, hist_i, nhist_i);
                 if (i < k && y == draft[i]) {
                     acc++;
                     if (emit(&g, y)) break;
@@ -242,7 +249,7 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
                 next = y;
                 break;
             }
-            borg_sampler_probs(smp, Li, g.seq, g.len);
+            borg_sampler_probs(smp, Li, hist_i, nhist_i);
             if (i == k) {
                 next = sampler_draw(smp, Li, Vs);
                 break;
@@ -310,6 +317,10 @@ int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n
     if (n_seq <= 0 || n_prompt <= 0) return -1;
     borg_ctx *lead = ctxs[0];
     if (n_seq > lead->n_batch) return -4;
+    for (int i = 1; i < n_seq; i++)
+        if (!ctxs[i] || ctxs[i]->model != lead->model || ctxs[i]->n_ctx != lead->n_ctx || n_seq > ctxs[i]->n_batch ||
+            ctxs[i]->kv_f16 != lead->kv_f16)
+            return -4;
     if (n_prompt >= lead->n_ctx) return -1;
     const borg_model *m = lead->model;
     const int Vt = m->cfg.vocab_size, Vs = m->cfg.n_vocab;
@@ -369,8 +380,14 @@ int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n
         for (int i = 0; i < n_seq; i++) {
             if (!active[i]) continue;
             int32_t *h = hist + (size_t)i * hist_cap;
-            if (p.json_mode) json_constrain(m, &js[i], row[i], Vs, jidx, jval, jkeep, json_want);
-            const int32_t tok = borg_sampler_sample(smp[i], row[i], h, len[i]);
+            int32_t tok;
+            if (p.json_mode) {
+                sampler_penalize(smp[i], row[i], h, len[i]);
+                json_constrain(m, &js[i], row[i], Vs, jidx, jval, jkeep, json_want);
+                tok = borg_sampler_sample(smp[i], row[i], NULL, 0);
+            } else {
+                tok = borg_sampler_sample(smp[i], row[i], h, len[i]);
+            }
             if (p.json_mode) json_state_feed_token(m, &js[i], tok);
             int stop = !p.ignore_eos && borg_is_eog(m, tok);
             for (int k = 0; k < p.n_stop_tokens && !stop; k++) stop = p.stop_tokens[k] == tok;
@@ -384,14 +401,14 @@ int borg_generate_multi(borg_ctx **ctxs, int n_seq, const int32_t *prompt, int n
                 if (cb(i, tok, piece, n, user)) { active[i] = 0; reason[i] = 2; continue; }
             }
             if (ngen[i] >= p.max_tokens) { active[i] = 0; reason[i] = 0; continue; }
-            if (ctxs[i]->n_past + 1 >= ctxs[i]->n_ctx) { active[i] = 0; reason[i] = 3; continue; }
+            if (ctxs[i]->n_past >= ctxs[i]->n_ctx) { active[i] = 0; reason[i] = 3; continue; }
             act_ctx[na] = ctxs[i];
             act_tok[na] = tok;
             act_idx[na] = i;
             na++;
         }
         if (na == 0) break;
-        if (borg_decode_multi(act_ctx, na, act_tok, step)) { rc = -5; break; }
+        if (decode_multi_with(lead, act_ctx, na, act_tok, step)) { rc = -5; break; }
         st.n_target_evals++;
         for (int k = 0; k < na; k++) memcpy(row[act_idx[k]], step + (size_t)k * Vt, sizeof(float) * (size_t)Vt);
     }

@@ -44,6 +44,7 @@ void pool_for(borg_pool *pool, int n_items, int chunk, borg_range_fn fn, void *c
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -149,15 +150,45 @@ static int default_threads(void) {
     long n = (long)si.dwNumberOfProcessors;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#if defined(__linux__) && defined(CPU_COUNT)
+    /* respect taskset / container cpusets: spinning on CPUs we may not use only hurts */
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        const long a = CPU_COUNT(&set);
+        if (a >= 1 && (n < 1 || a < n)) n = a;
+    }
+#endif
 #endif
     if (n < 1) n = 1;
     if (n > 64) n = 64;
     return (int)n;
 }
 
+/* the struct has 64-byte aligned members, which calloc does not guarantee */
+static borg_pool *pool_alloc(void) {
+    const size_t sz = (sizeof(borg_pool) + 63) & ~(size_t)63;
+    void *mem = NULL;
+#if defined(_WIN32)
+    mem = _aligned_malloc(sz, 64);
+#else
+    if (posix_memalign(&mem, 64, sz) != 0) mem = NULL;
+#endif
+    if (mem) memset(mem, 0, sz);
+    return (borg_pool *)mem;
+}
+
+static void pool_dealloc(borg_pool *p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
 borg_pool *borg_pool_new(int n_threads) {
     if (n_threads <= 0) n_threads = default_threads();
-    borg_pool *p = (borg_pool *)calloc(1, sizeof(borg_pool));
+    borg_pool *p = pool_alloc();
     if (!p) return NULL;
     p->n = n_threads;
     pthread_mutex_init(&p->mu, NULL);
@@ -168,7 +199,7 @@ borg_pool *borg_pool_new(int n_threads) {
         if (!p->threads || !p->args) {
             free(p->threads);
             free(p->args);
-            free(p);
+            pool_dealloc(p);
             return NULL;
         }
         for (int i = 1; i < n_threads; i++) {
@@ -194,7 +225,7 @@ void borg_pool_free(borg_pool *p) {
     pthread_cond_destroy(&p->cv);
     free(p->threads);
     free(p->args);
-    free(p);
+    pool_dealloc(p);
 }
 
 int borg_pool_size(const borg_pool *p) { return p ? p->n : 1; }

@@ -488,24 +488,23 @@ float mat_dot_row(const borg_mat *m, int r, const float *xf, const block_q8a *xq
  * once for 4 tokens instead of once per token. */
 #if defined(BORG_AVX2)
 static void dot_q8_0_q8a_x4(const block_q8_0 *w, const block_q8a *const x[4], int nb, float out[4]) {
-    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    /* Same summation order as vec_dot_q8_0_q8a (even blocks, odd blocks, then the tail in the
+     * even accumulator), so batched and token-by-token evaluation give bit-identical results:
+     * speculative decoding relies on that to reproduce plain greedy decoding exactly. */
+    __m256 a[4][2];
+    for (int c = 0; c < 4; c++) a[c][0] = a[c][1] = _mm256_setzero_ps();
+    const int nb2 = nb & ~1;
     for (int i = 0; i < nb; i++) {
         const __m256i qw = _mm256_loadu_si256((const __m256i *)w[i].qs);
         const __m256i aw = _mm256_sign_epi8(qw, qw);
         const float dw = fp16_to_fp32(w[i].d);
-#define STEP(c, acc)                                                                          \
-    {                                                                                         \
-        const __m256i sx = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)x[c][i].qs), qw); \
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * x[c][i].d), _mm256_cvtepi32_ps(dot_u8_i8(aw, sx)), acc); \
+        const int k = i < nb2 ? (i & 1) : 0;
+        for (int c = 0; c < 4; c++) {
+            const __m256i sx = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)x[c][i].qs), qw);
+            a[c][k] = _mm256_fmadd_ps(_mm256_set1_ps(dw * x[c][i].d), _mm256_cvtepi32_ps(dot_u8_i8(aw, sx)), a[c][k]);
+        }
     }
-        STEP(0, acc0) STEP(1, acc1) STEP(2, acc2) STEP(3, acc3)
-#undef STEP
-    }
-    out[0] = hsum256(acc0);
-    out[1] = hsum256(acc1);
-    out[2] = hsum256(acc2);
-    out[3] = hsum256(acc3);
+    for (int c = 0; c < 4; c++) out[c] = hsum256(_mm256_add_ps(a[c][0], a[c][1]));
 }
 
 static void dot_q4_0_q8a_x4(const block_q4_0 *w, const block_q8a *const x[4], int nb, float out[4]) {

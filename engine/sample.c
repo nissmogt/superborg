@@ -83,8 +83,12 @@ static void apply_penalty(borg_sampler *s, float *logits, const int32_t *hist, i
 static int argmax(const float *x, int n) {
     int best = 0;
     for (int i = 1; i < n; i++)
-        if (x[i] > x[best]) best = i;
+        if (x[i] > x[best] || x[best] != x[best]) best = i;
     return best;
+}
+
+void sampler_penalize(borg_sampler *s, float *logits, const int32_t *history, int n_history) {
+    apply_penalty(s, logits, history, n_history);
 }
 
 /* Partially order val/idx[0..n) so that the k largest values come first (unordered). */
@@ -165,7 +169,7 @@ static int build_candidates(borg_sampler *s, const float *logits) {
     int n = V;
     for (int i = 0; i < V; i++) {
         s->idx[i] = i;
-        s->val[i] = logits[i] * inv_t;
+        s->val[i] = logits[i] == logits[i] ? logits[i] * inv_t : -INFINITY; /* NaN never wins */
     }
     if (s->p.top_k > 0 && s->p.top_k < n) {
         sampler_select_top(s->val, s->idx, n, s->p.top_k);
@@ -173,8 +177,17 @@ static int build_candidates(borg_sampler *s, const float *logits) {
     }
     /* softmax over the candidates */
     float mx = s->val[0];
+    int imx = 0;
     for (int i = 1; i < n; i++)
-        if (s->val[i] > mx) mx = s->val[i];
+        if (s->val[i] > mx) {
+            mx = s->val[i];
+            imx = i;
+        }
+    if (!isfinite(mx)) { /* everything masked (or infinite): fall back to the best candidate */
+        s->idx[0] = s->idx[imx];
+        s->val[0] = 1.0f;
+        return 1;
+    }
     double sum = 0.0;
     for (int i = 0; i < n; i++) {
         s->val[i] = expf(s->val[i] - mx);
@@ -224,7 +237,8 @@ static int build_candidates(borg_sampler *s, const float *logits) {
         float pmax = 0.0f;
         for (int i = 0; i < n; i++)
             if (s->val[i] > pmax) pmax = s->val[i];
-        const float thr = s->p.min_p * pmax;
+        /* min_p > 1 would drop everything; the most likely token always survives */
+        const float thr = (s->p.min_p < 1.0f ? s->p.min_p : 1.0f) * pmax;
         int m = 0;
         for (int i = 0; i < n; i++)
             if (s->val[i] >= thr) {
@@ -241,22 +255,21 @@ static int build_candidates(borg_sampler *s, const float *logits) {
     return n;
 }
 
+/* temperatures this small are greedy in effect and would overflow 1/T */
+#define GREEDY_TEMP 1e-4f
+
 int32_t borg_sampler_sample(borg_sampler *s, float *logits, const int32_t *history, int n_history) {
     apply_penalty(s, logits, history, n_history);
-    if (s->p.temperature <= 0.0f) return argmax(logits, s->vocab);
+    if (s->p.temperature <= GREEDY_TEMP) return argmax(logits, s->vocab);
     const int n = build_candidates(s, logits);
-    const float r = rand_unit(s);
-    float cum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cum += s->val[i];
-        if (r < cum) return s->idx[i];
-    }
-    return s->idx[n - 1];
+    if (n <= 0) return argmax(logits, s->vocab);
+    /* double-precision draw: rounding can never hand the leftover mass to an arbitrary id */
+    return s->idx[sampler_draw(s, s->val, n)];
 }
 
 void borg_sampler_probs(borg_sampler *s, float *logits, const int32_t *history, int n_history) {
     apply_penalty(s, logits, history, n_history);
-    if (s->p.temperature <= 0.0f) {
+    if (s->p.temperature <= GREEDY_TEMP) {
         const int best = argmax(logits, s->vocab);
         memset(logits, 0, sizeof(float) * (size_t)s->vocab);
         logits[best] = 1.0f;

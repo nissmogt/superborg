@@ -1,6 +1,8 @@
 /* Loading .borg files: memory map, header parsing, tensor directory, config. */
 #include "internal.h"
 
+#include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,7 +78,13 @@ static int map_file(const char *path, borg_model *m, char *err, int errlen) {
     size_t got = 0;
     while (got < m->map_size) {
         ssize_t r = read(fd, (char *)m->map + got, m->map_size - got);
-        if (r <= 0) { close(fd); borg_set_err(err, errlen, "read error on %s", path); return -1; }
+        if (r <= 0) {
+            close(fd);
+            free(m->map);
+            m->map = NULL;
+            borg_set_err(err, errlen, "read error on %s", path);
+            return -1;
+        }
         got += (size_t)r;
     }
     close(fd);
@@ -93,6 +101,21 @@ static void unmap_file(borg_model *m) {
 #else
     munmap(m->map, m->map_size);
 #endif
+}
+
+/* Header numbers come from an untrusted file: convert only integral values within [lo, hi]. */
+static int json_int(const json_value *v, double dflt, double lo, double hi, int64_t *out) {
+    const double x = json_num(v, dflt);
+    if (!(x >= lo && x <= hi) || x != floor(x)) return -1;
+    *out = (int64_t)x;
+    return 0;
+}
+
+static int json_int32(const json_value *v, int dflt, int lo, int *out) {
+    int64_t x;
+    if (json_int(v, dflt, lo, INT_MAX, &x)) return -1;
+    *out = (int)x;
+    return 0;
 }
 
 /* ---- tensors -------------------------------------------------------------- */
@@ -179,7 +202,7 @@ static int load_tokenizer(borg_model *m, const json_value *tj, char *err, int er
     t->vocab = (const uint8_t *)get_table(m, "tokenizer.vocab", DT_U8, -1, err, errlen);
     if (!t->vocab_off || !t->token_type || !t->vocab) return -1;
     const borg_tensor *vt = model_find_tensor(m, "tokenizer.vocab");
-    if (t->vocab_off[t->n_vocab] > (uint32_t)vt->shape[0]) { borg_set_err(err, errlen, "tokenizer offsets out of range"); return -1; }
+    if ((size_t)t->vocab_off[t->n_vocab] > vt->nbytes) { borg_set_err(err, errlen, "tokenizer offsets out of range"); return -1; }
     for (int i = 0; i < t->n_vocab; i++)
         if (t->vocab_off[i] > t->vocab_off[i + 1]) { borg_set_err(err, errlen, "tokenizer offsets not monotonic"); return -1; }
     if (t->n_merges) {
@@ -202,21 +225,29 @@ static int load_tokenizer(borg_model *m, const json_value *tj, char *err, int er
     t->ignore_merges = json_bool(json_get(tj, "ignore_merges"), 0);
     t->add_bos = json_bool(json_get(tj, "add_bos"), 0);
     t->add_eos = json_bool(json_get(tj, "add_eos"), 0);
-    t->bos_id = (int)json_num(json_get(tj, "bos_id"), -1);
-    t->eos_id = (int)json_num(json_get(tj, "eos_id"), -1);
-    t->pad_id = (int)json_num(json_get(tj, "pad_id"), -1);
-    t->unk_id = (int)json_num(json_get(tj, "unk_id"), -1);
+    if (json_int32(json_get(tj, "bos_id"), -1, -1, &t->bos_id) || json_int32(json_get(tj, "eos_id"), -1, -1, &t->eos_id) ||
+        json_int32(json_get(tj, "pad_id"), -1, -1, &t->pad_id) || json_int32(json_get(tj, "unk_id"), -1, -1, &t->unk_id)) {
+        borg_set_err(err, errlen, "invalid tokenizer special token id");
+        return -1;
+    }
+    if (t->bos_id >= t->n_vocab) t->bos_id = -1;
+    if (t->eos_id >= t->n_vocab) t->eos_id = -1;
+    if (t->pad_id >= t->n_vocab) t->pad_id = -1;
+    if (t->unk_id >= t->n_vocab) t->unk_id = -1;
     const json_value *eos = json_get(tj, "eos_ids");
     if (eos && eos->type == JS_ARR)
-        for (int i = 0; i < eos->len && t->n_eos_ids < 16; i++) t->eos_ids[t->n_eos_ids++] = (int32_t)eos->items[i].num;
+        for (int i = 0; i < eos->len && t->n_eos_ids < 16; i++) {
+            int id;
+            if (!json_int32(&eos->items[i], -1, 0, &id) && id < t->n_vocab) t->eos_ids[t->n_eos_ids++] = id;
+        }
     if (t->n_eos_ids == 0 && t->eos_id >= 0) t->eos_ids[t->n_eos_ids++] = t->eos_id;
     const json_value *added = json_get(tj, "added_tokens");
     if (added && added->type == JS_ARR && added->len > 0) {
         t->added = (int32_t *)malloc(sizeof(int32_t) * (size_t)added->len);
         if (!t->added) { borg_set_err(err, errlen, "out of memory"); return -1; }
         for (int i = 0; i < added->len; i++) {
-            int id = (int)added->items[i].num;
-            if (id >= 0 && id < t->n_vocab) t->added[t->n_added++] = id;
+            int id;
+            if (!json_int32(&added->items[i], -1, 0, &id) && id < t->n_vocab) t->added[t->n_added++] = id;
         }
     }
     return tokenizer_init(t, err, errlen);
@@ -274,36 +305,43 @@ borg_model *borg_model_load(const char *path, char *err, int errlen) {
             borg_set_err(err, errlen, "tensor %s: bad shape", t->name); goto fail;
         }
         t->ndim = shape->len;
-        for (int d = 0; d < t->ndim; d++) t->shape[d] = (int64_t)shape->items[d].num;
-        double off = json_num(json_get(tv, "offset"), -1);
-        double nb = json_num(json_get(tv, "nbytes"), -1);
-        if (off < 0 || nb < 0 || off != (double)(size_t)off || nb != (double)(size_t)nb ||
-            (size_t)off > m->map_size || (size_t)nb > m->map_size ||
-            data_start + (size_t)off + (size_t)nb > m->map_size) {
+        for (int d = 0; d < t->ndim; d++) /* 2^31 per dimension and ndim <= 4 keep products in int64 */
+            if (json_int(&shape->items[d], -1, 0, (double)INT_MAX, &t->shape[d])) {
+                borg_set_err(err, errlen, "tensor %s: bad shape", t->name); goto fail;
+            }
+        int64_t off64, nb64;
+        if (json_int(json_get(tv, "offset"), -1, 0, (double)m->map_size, &off64) ||
+            json_int(json_get(tv, "nbytes"), -1, 0, (double)m->map_size, &nb64) ||
+            data_start + (size_t)off64 + (size_t)nb64 > m->map_size) {
             borg_set_err(err, errlen, "tensor %s lies outside the file", t->name); goto fail;
         }
-        if ((size_t)off % 64) { /* the format guarantees it; kernels rely on aligned rows */
+        const size_t off = (size_t)off64, nb = (size_t)nb64;
+        if (off % 64) { /* the format guarantees it; kernels rely on aligned rows */
             borg_set_err(err, errlen, "tensor %s is not 64-byte aligned", t->name); goto fail;
         }
-        t->nbytes = (size_t)nb;
+        t->nbytes = nb;
         if (tensor_expected_bytes(t) != t->nbytes) {
             borg_set_err(err, errlen, "tensor %s: size %zu does not match its shape", t->name, t->nbytes); goto fail;
         }
-        t->data = base + data_start + (size_t)off;
+        t->data = base + data_start + off;
     }
 
     /* config */
     const json_value *cj = json_get(root, "config");
     if (!cj) { borg_set_err(err, errlen, "header has no config"); goto fail; }
     borg_config *c = &m->cfg;
-    c->dim = (int)json_num(json_get(cj, "dim"), 0);
-    c->n_layers = (int)json_num(json_get(cj, "n_layers"), 0);
-    c->n_heads = (int)json_num(json_get(cj, "n_heads"), 0);
-    c->n_kv_heads = (int)json_num(json_get(cj, "n_kv_heads"), c->n_heads);
-    c->head_dim = (int)json_num(json_get(cj, "head_dim"), c->n_heads ? c->dim / c->n_heads : 0);
-    c->hidden_dim = (int)json_num(json_get(cj, "hidden_dim"), 0);
-    c->vocab_size = (int)json_num(json_get(cj, "vocab_size"), 0);
-    c->max_seq_len = (int)json_num(json_get(cj, "max_seq_len"), 2048);
+    /* bounds keep every derived product (n_heads * head_dim, n_batch * width, ...) inside int */
+    if (json_int32(json_get(cj, "dim"), 0, 1, &c->dim) || json_int32(json_get(cj, "n_layers"), 0, 1, &c->n_layers) ||
+        json_int32(json_get(cj, "n_heads"), 0, 1, &c->n_heads) ||
+        json_int32(json_get(cj, "n_kv_heads"), c->n_heads, 1, &c->n_kv_heads) ||
+        json_int32(json_get(cj, "head_dim"), c->n_heads ? c->dim / c->n_heads : 0, 1, &c->head_dim) ||
+        json_int32(json_get(cj, "hidden_dim"), 0, 1, &c->hidden_dim) ||
+        json_int32(json_get(cj, "vocab_size"), 0, 1, &c->vocab_size) ||
+        json_int32(json_get(cj, "max_seq_len"), 2048, 1, &c->max_seq_len) || c->dim > (1 << 20) ||
+        c->hidden_dim > (1 << 22) || c->n_layers > 4096 || c->n_heads > 4096 || c->vocab_size > (1 << 24) ||
+        (int64_t)c->n_heads * c->head_dim > (1 << 20)) {
+        borg_set_err(err, errlen, "invalid model config"); goto fail;
+    }
     c->norm_eps = (float)json_num(json_get(cj, "norm_eps"), 1e-5);
     c->rope_theta = (float)json_num(json_get(cj, "rope_theta"), 10000.0);
     c->attn_bias = json_bool(json_get(cj, "attn_bias"), 0);
@@ -327,7 +365,9 @@ borg_model *borg_model_load(const char *path, char *err, int errlen) {
             m->rope_scale_type = ROPE_SCALE_LLAMA3;
             m->rope_low_freq_factor = (float)json_num(json_get(rs, "low_freq_factor"), 1.0);
             m->rope_high_freq_factor = (float)json_num(json_get(rs, "high_freq_factor"), 4.0);
-            m->rope_orig_max_pos = (int)json_num(json_get(rs, "original_max_position_embeddings"), 8192);
+            if (json_int32(json_get(rs, "original_max_position_embeddings"), 8192, 1, &m->rope_orig_max_pos)) {
+                borg_set_err(err, errlen, "invalid rope scaling"); goto fail;
+            }
         } else { borg_set_err(err, errlen, "unsupported rope scaling %s", rt); goto fail; }
     }
 

@@ -176,3 +176,47 @@ def test_quantizers_round_trip(qtype):
         err_plain = ((y - x) ** 2 * imp).sum()
         err_weighted = ((y2 - x) ** 2 * imp).sum()
         assert err_weighted < 0.95 * err_plain
+
+
+# ---- regressions from the engine review ----------------------------------------------
+
+def test_min_p_above_one_keeps_the_best_token(f32):
+    ids = f32.tokenize("The capital of France is")
+    greedy = f32.context(n_ctx=64).generate(ids, max_tokens=8)
+    capped = f32.context(n_ctx=64).generate(ids, max_tokens=8, sampling=Sampling(temperature=0.8, min_p=1.5))
+    assert capped.tokens == greedy.tokens
+    ctxs = [f32.context(n_ctx=64) for _ in range(2)]
+    for g in generate_multi(ctxs, ids, max_tokens=8, sampling=Sampling(temperature=0.8, min_p=1.5)):
+        assert g.tokens == greedy.tokens
+
+
+def test_json_mode_with_ignore_eos(pool):
+    llm = LLM(need(QWEN), pool=pool, n_ctx=512)
+    ids = llm.tokenize(llm.render([{"role": "user", "content": "Reply with the JSON array [1, 2, 3]."}]),
+                       add_bos=False)
+    g = llm.ctx.generate(ids, max_tokens=40, json_mode=True, ignore_eos=True)
+    value, _, rest = g.text.partition("<|")
+    json.loads(value)  # the value stays valid; only end-of-generation markers follow it
+    assert rest == "" or set(rest.replace("im_end|>", "").replace("endoftext|>", "").split("<|")) <= {""}
+
+
+def test_decode_multi_sets_each_embedding(f32):
+    import ctypes
+    from superborg.engine import lib
+    texts = ["Hello there", "Numbers: 1 2 3"]
+    ctxs = [f32.context(n_ctx=64) for _ in texts]
+    for c, t in zip(ctxs, texts):
+        c.decode(f32.tokenize(t), None)
+    arr = (ctypes.c_void_p * 2)(*[c._c for c in ctxs])
+    assert lib().borg_decode_multi(arr, 2, (ctypes.c_int32 * 2)(5, 6), None) == 0
+    for c, t, tok in zip(ctxs, texts, (5, 6)):
+        ref = f32.context(n_ctx=64)
+        ref.decode(f32.tokenize(t) + [tok], None)
+        assert np.allclose(c.embedding(), ref.embedding(), atol=1e-5)
+
+
+def test_generate_multi_rejects_small_batches(f32):
+    ids = f32.tokenize("hi")
+    ctxs = [f32.context(n_ctx=64, n_batch=8)] + [f32.context(n_ctx=64, n_batch=2) for _ in range(3)]
+    with pytest.raises(RuntimeError):
+        generate_multi(ctxs, ids, max_tokens=4)

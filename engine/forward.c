@@ -500,9 +500,8 @@ int borg_decode(borg_ctx *c, const int32_t *tokens, int n, float *logits, int lo
     return 0;
 }
 
-int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logits) {
+int decode_multi_with(borg_ctx *lead, borg_ctx **ctxs, int n, const int32_t *tokens, float *logits) {
     if (n <= 0) return 0;
-    borg_ctx *lead = ctxs[0];
     if (n > lead->n_batch) return -4;
     const int V = lead->model->cfg.vocab_size;
     for (int i = 0; i < n; i++) {
@@ -518,11 +517,20 @@ int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logi
         lead->row_pos[i] = ctxs[i]->n_past;
     }
     forward_chunk(lead, tokens, n, logits, logits ? 2 : 0);
+    const borg_model *m = lead->model;
     for (int i = 0; i < n; i++) {
         borg_ctx *c = ctxs[i];
         c->tokens[c->n_past++] = tokens[i];
+        /* each sequence's final hidden state, as borg_ctx_embedding promises */
+        rmsnorm(c->embd, lead->x + (size_t)i * m->cfg.dim, m->output_norm, m->cfg.dim, m->cfg.norm_eps);
     }
+    if (lead->stats) lead->stats_tokens += n; /* statistics of a batch accumulate in its scratch owner */
     return 0;
+}
+
+int borg_decode_multi(borg_ctx **ctxs, int n, const int32_t *tokens, float *logits) {
+    if (n <= 0) return 0;
+    return decode_multi_with(ctxs[0], ctxs, n, tokens, logits);
 }
 
 int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src) {

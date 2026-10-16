@@ -114,6 +114,18 @@ static void test_dot(borg_dtype dt, int cols) {
     static block_q8a xqs[NT * 4096 / QK];
     if (cols % QK == 0) for (int t = 0; t < NT; t++) memcpy(xqs + t * (cols / QK), xq, sizeof(block_q8a) * (cols / QK));
     mat_mul_rows(&m, 0, rows, NT, xs, cols, xqs, cols / QK, out, rows);
+    /* batched results must equal token-by-token results bit for bit, with distinct tokens */
+    static float xs2[NT * 4096], out2[7 * NT];
+    static block_q8a xqs2[NT * 4096 / QK];
+    for (int i = 0; i < NT * cols; i++) xs2[i] = frand();
+    if (cols % QK == 0) for (int t = 0; t < NT; t++) quantize_row_q8a(xs2 + t * cols, xqs2 + t * (cols / QK), cols);
+    mat_mul_rows(&m, 0, rows, NT, xs2, cols, xqs2, cols / QK, out2, rows);
+    for (int t = 0; t < NT; t++)
+        for (int r = 0; r < rows; r++) {
+            float one[7]; /* mat_mul_rows writes column r of the output row */
+            mat_mul_rows(&m, r, r + 1, 1, xs2 + t * cols, cols, xqs2 + t * (cols / QK), cols / QK, one, rows);
+            CHECK(one[r] == out2[t * rows + r], "%s cols=%d batched != single (token %d row %d)", dtype_name(dt), cols, t, r);
+        }
     for (int r = 0; r < rows; r++) {
         mat_get_row(&m, r, wd);
         const float *xv = mat_wants_q8a(&m) ? xdq : x;

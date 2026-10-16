@@ -79,18 +79,42 @@ static int parse_args(int argc, char **argv, options *o) {
 #undef NEXT
     }
     if (!o->model) { usage(); return -1; }
+    if (o->bench && (o->bench_prompt < 1 || o->bench_gen < 0)) {
+        fprintf(stderr, "--bench needs at least one prompt token\n");
+        return -1;
+    }
     return 0;
 }
 
+/* Read a whole file into a NUL-terminated buffer. Reads until EOF instead of trusting the
+ * file size, so pipes, /dev/stdin and process substitution work. */
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *s = (char *)malloc((size_t)n + 1);
-    if (s && fread(s, 1, (size_t)n, f) != (size_t)n) { free(s); s = NULL; }
-    if (s) s[n] = 0;
+    size_t cap = 4096, len = 0;
+    char *s = (char *)malloc(cap);
+    while (s) {
+        if (len + 1 >= cap) {
+            char *t = (char *)realloc(s, cap * 2);
+            if (!t) {
+                free(s);
+                s = NULL;
+                break;
+            }
+            s = t;
+            cap *= 2;
+        }
+        const size_t k = fread(s + len, 1, cap - 1 - len, f);
+        len += k;
+        if (k == 0) {
+            if (ferror(f)) {
+                free(s);
+                s = NULL;
+            }
+            break;
+        }
+    }
+    if (s) s[len] = 0;
     fclose(f);
     return s;
 }
