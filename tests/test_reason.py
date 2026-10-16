@@ -328,6 +328,12 @@ def test_pal_uses_printed_output():
     assert solve(llm, "q", strategy="pal").answer == "42"
 
 
+def test_pal_result_precedence():
+    # printed output beats a trailing assignment; a bare computation still counts
+    assert solve(FakeLLM(lambda c: "x = 5\nprint(x * 2)\ny = 1\n```"), "q", strategy="pal").answer == "10"
+    assert solve(FakeLLM(lambda c: "a = 400\nb = 60\ntotal = a + b\n```"), "q", strategy="pal").answer == "460"
+
+
 def test_pal_repairs_once_with_error_feedback():
     def responder(c):
         if "The program failed" in c["prompt"]:
@@ -457,13 +463,13 @@ def test_rag_trims_context_to_fit_window():
 
 
 def test_auto_routes():
-    llm = FakeLLM(lambda c: "answer = 18\n```" if is_pal(c) else "Hello! Answer: hi")
+    llm = FakeLLM(lambda c: "So she makes \\boxed{18}." if is_cot(c) else "Hello! Answer: hi")
     a = solve(llm, "What is 12*(3+4)?")
     assert a.strategy == "calc" and a.answer == "84" and a.tokens == 0 and llm.calls == []
     a = solve(llm, GSM_Q, samples=3)
-    assert a.strategy == "pal_vote" and a.answer == "18" and a.route.startswith("math")
+    assert a.strategy == "vote" and a.answer == "18" and a.route.startswith("math")
     a = solve(llm, GSM_Q, samples=1)
-    assert a.strategy == "pal"
+    assert a.strategy == "cot" and a.answer == "18"
     a = solve(llm, "Hi there!")
     assert a.strategy == "direct"
     a = solve(llm, "Why do cats purr?")

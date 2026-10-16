@@ -9,10 +9,16 @@
 
 Strategies (see STRATEGIES): plain answering, chain of thought, self-consistency voting
 (Wang et al. 2022), program-aided reasoning (Gao et al. 2022) with execution in a
-resource-limited subprocess, voting over programs, model self-verification scored with
-log-probabilities, and grounded answering over retrieved text. Sampling strategies stop
-early once the remaining samples cannot change the majority (adaptive consistency), so
-easy questions cost little more than one sample.
+resource-limited subprocess, voting over programs, a mixed vote of programs and written
+solutions, model self-verification scored with log-probabilities, and grounded answering
+over retrieved text.
+
+Cost control: sampled candidates are decoded together in one batched pass when the LLM
+offers sample_n() (on CPUs four sequences cost about as much as one, since each step reads
+the weights once); without it they are drawn one by one and sampling stops as soon as the
+remaining samples cannot change the majority (adaptive consistency). Numeric votes are
+weighted by a plausibility prior (negative or 14.333333-style answers to word problems are
+usually misreadings).
 """
 from __future__ import annotations
 
@@ -28,17 +34,18 @@ from typing import Any, Callable
 from . import tools
 
 __all__ = ["Answer", "solve", "STRATEGIES", "extract_answer", "normalize_number", "normalize_text",
-           "answer_key", "majority_vote", "classify", "answers_match"]
+           "answer_key", "majority_vote", "classify", "answers_match", "plausibility"]
 
 STRATEGIES: dict[str, str] = {
     "auto": "pick a strategy from the question: arithmetic -> exact calculator, math word problem -> "
-            "pal_vote, other reasoning -> cot, short questions -> direct, given context -> rag",
+            "vote (cot with one sample), other reasoning -> cot, short questions -> direct, given context -> rag",
     "direct": "one greedy answer to the question as asked (the model's default behaviour)",
-    "cot": "one greedy step-by-step solution ending in 'Answer: ...'",
+    "cot": "one greedy step-by-step solution; the text ends with 'Answer: ...'",
     "vote": "self-consistency: several sampled step-by-step solutions, majority vote on the final answer",
     "pal": "program-aided: the model writes Python that computes the answer; it runs in a sandboxed "
            "subprocess, with one repair attempt on error",
-    "pal_vote": "several sampled programs are executed and their results majority-voted",
+    "pal_vote": "several programs (greedy + sampled) are executed and their results voted on; a written "
+                "solution breaks ties",
     "mix": "programs and written step-by-step solutions vote together, weighted by answer plausibility; "
            "stops early when the greedy program and the greedy solution agree",
     "verify": "sampled solutions are checked by the model itself (log-prob of 'Yes'), combined with the vote",
@@ -578,8 +585,11 @@ def _vote(s: _Session, q: str, numeric: bool | None, n: int, temperature: float,
 
 
 def _program_value(res: tools.ToolResult) -> str | None:
-    """Numeric answer of an executed program: `answer`/solution() value, else the last printed number."""
-    if res.value is not None:
+    """Numeric answer of an executed program: `answer` / solution() / trailing expression,
+    else the last printed number, else the variable assigned last (small models often
+    compute `total_pay = ...` and stop without printing it)."""
+    kind = res.extra.get("value_kind")
+    if res.value is not None and kind != "last_assignment":
         n = normalize_number(res.value)
         if n is not None:
             return n
@@ -587,6 +597,8 @@ def _program_value(res: tools.ToolResult) -> str | None:
         nums = _NUM_RE.findall(res.stdout)
         if nums:
             return normalize_number(nums[-1])
+    if res.value is not None and kind == "last_assignment":
+        return normalize_number(res.value)
     return None
 
 
@@ -835,7 +847,9 @@ def solve(llm, question: str, strategy: str = "auto", samples: int = 5, max_toke
     kind = None
     if strategy == "auto":
         kind, why = classify(question, context)
-        strategy = {"rag": "rag", "arithmetic": "calc", "math": "pal_vote" if samples > 1 else "pal",
+        # math -> vote: the most accurate strategy on GSM8K with Qwen2.5-0.5B (see eval/gsm8k.py);
+        # bare expressions are computed exactly instead of asking the model
+        strategy = {"rag": "rag", "arithmetic": "calc", "math": "vote" if samples > 1 else "cot",
                     "reasoning": "cot", "simple": "direct"}[kind]
         route = f"{kind}: {why}"
     if numeric is None and kind in ("math", "arithmetic"):

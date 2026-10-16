@@ -32,6 +32,15 @@ def test_trailing_expression_value():
     assert r.ok and r.value == 42
 
 
+def test_last_assignment_fallback():
+    r = run_python("pay = 10 * 40\novertime = 12 * 5\ntotal_pay = pay + overtime\n")
+    assert r.ok and r.value == 460 and r.extra["value_kind"] == "last_assignment"
+    r = run_python("t = 1\nt += 4")
+    assert r.value == 5
+    r = run_python("def f():\n    return 1\ng = f")  # functions are not results
+    assert r.value is None
+
+
 def test_answer_takes_priority_over_solution():
     r = run_python("answer = 1\ndef solution():\n    return 2\n")
     assert r.value == 1

@@ -38,7 +38,7 @@ class ToolResult:
     ok: bool                      # ran to completion without an exception or limit hit
     stdout: str = ""              # printed output (truncated to MAX_OUTPUT chars)
     error: str | None = None      # short error text (last traceback line, "timeout", ...)
-    value: Any = None             # `answer`, solution(), or the last expression's value
+    value: Any = None             # `answer`, trailing expression, solution() or last assignment
     elapsed_s: float = 0.0
     extra: dict = field(default_factory=dict)
 
@@ -119,19 +119,27 @@ def _short(e):
 g = {"__name__": "__main__", "__builtins__": __builtins__}
 try:
     tree = ast.parse(src, "<program>", "exec")
+    last_name = None  # target of the last top-level assignment: the result, if nothing else is
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            last_name = node.targets[0].id
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)) and isinstance(node.target, ast.Name):
+            last_name = node.target.id
     last = None
     if tree.body and isinstance(tree.body[-1], ast.Expr):
         last = ast.Expression(tree.body.pop().value)
     exec(compile(tree, "<program>", "exec"), g)
+    v = eval(compile(last, "<program>", "eval"), g) if last is not None else None
+    if v is not None:
+        print(repr(v))  # notebook-style echo of a trailing expression
     if "answer" in g and not callable(g["answer"]):
         res["value"], res["kind"] = _jsonable(g["answer"]), "answer"
+    elif v is not None:  # e.g. a trailing `solution()` call: do not run it twice
+        res["value"], res["kind"] = _jsonable(v), "expression"
     elif callable(g.get("solution")):
         res["value"], res["kind"] = _jsonable(g["solution"]()), "solution"
-    if last is not None:
-        v = eval(compile(last, "<program>", "eval"), g)
-        if res["kind"] is None and v is not None:
-            res["value"], res["kind"] = _jsonable(v), "expression"
-            print(repr(v))
+    if res["kind"] is None and last_name and last_name in g and not callable(g[last_name]):
+        res["value"], res["kind"] = _jsonable(g[last_name]), "last_assignment"
     res["ok"] = True
 except SystemExit as e:
     res["ok"] = e.code in (None, 0)
@@ -174,8 +182,9 @@ def _kill(proc: subprocess.Popen) -> None:
 def run_python(code: str, timeout: float = 10.0, memory_mb: int = 512, max_output: int = MAX_OUTPUT) -> ToolResult:
     """Run `code` in a fresh, resource-limited Python process and collect its result.
 
-    The value is the variable ``answer`` if the code defines one, else the return value of
-    ``solution()`` if defined, else the value of a trailing expression (notebook style).
+    The value is the variable ``answer`` if the code defines one, else the value of a
+    trailing expression (notebook style), else the return value of ``solution()`` if
+    defined, else the variable assigned last at top level (extra["value_kind"] says which).
     Values come back as JSON-compatible Python objects (or their repr).
     """
     t0 = time.perf_counter()
