@@ -16,9 +16,9 @@ over retrieved text.
 Cost control: sampled candidates are decoded together in one batched pass when the LLM
 offers sample_n() (on CPUs four sequences cost about as much as one, since each step reads
 the weights once); without it they are drawn one by one and sampling stops as soon as the
-remaining samples cannot change the majority (adaptive consistency). Numeric votes are
-weighted by a plausibility prior (negative or 14.333333-style answers to word problems are
-usually misreadings).
+remaining samples cannot change the majority (adaptive consistency). The answer with the
+most votes wins; between equally voted numeric answers a plausibility prior decides
+(negative or 14.333333-style answers to word problems are usually misreadings).
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from typing import Any, Callable
 
@@ -46,7 +46,7 @@ STRATEGIES: dict[str, str] = {
            "subprocess, with one repair attempt on error",
     "pal_vote": "several programs (greedy + sampled) are executed and their results voted on; a written "
                 "solution breaks ties",
-    "mix": "programs and written step-by-step solutions vote together, weighted by answer plausibility; "
+    "mix": "programs and written step-by-step solutions vote together (answer plausibility breaks ties); "
            "stops early when the greedy program and the greedy solution agree",
     "verify": "sampled solutions are checked by the model itself (log-prob of 'Yes'), combined with the vote",
     "rag": "answer grounded in the given context (retrieved text) with [n] citations; prompt-lookup decoding",
@@ -68,10 +68,42 @@ class Answer:
 # =========================================================================================
 # answer extraction and normalization
 
-_NUM_RE = re.compile(r"(?<![\w.])[-+−]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?"
-                     r"(?:/\d+(?:\.\d+)?)?(?![\w])|(?<![\w.\d])[-+−]?\.\d+")
+# A number not glued to a word on its left ('v2', 'violet-otter-42', 'COVID-19' are not numbers).
+# On the right a unit may follow ('2.5kg', '13km'), but the match must not stop inside a
+# longer number ('2.5' is never read as '2') and ordinals ('12th') are not numbers.
+_NUM_RE = re.compile(r"(?<![\w.])(?<!\w[-−])[-+−]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?"
+                     r"(?:/\d+(?:\.\d+)?)?(?!\.?\d)(?!(?:st|nd|rd|th)\b)"
+                     r"|(?<![\w.\d])(?<!\w[-−])[-+−]?\.\d+(?!\d)")
 _ANSWER_RE = re.compile(r"(?:final\s+answer|answer)\s*(?:is)?\s*\**\s*[:：]\s*\**\s*(.+)", re.I)
 _ANSWER_IS_RE = re.compile(r"(?:final answer|the answer|answer)\s+is\s*:?\s*(.+)", re.I)
+# GSM8K's '#### 18' marker: only when a number follows, so Markdown headings such as
+# '#### Step 2: Revenue' or '#### Final Answer' are not taken for the answer
+_HASH_RE = re.compile(r"(?m)^[ \t*>]*####[ \t]*((?:(?:\\?[$€£¥]|[-+−*])[ \t]*)*\.?\d[^\n]*)")
+_NUMBERED_HEADING = re.compile(r"\d+[.):][ \t]+[^\W\d_]")  # '#### 2. Revenue'
+_MAX_DIGITS = 20_000  # longer "numbers" are not answers (and would be slow to format)
+
+# mixed numbers: '2\frac{1}{2}' (before \frac becomes '1/2', which would glue into '21/2') and '2 1/2'
+_MIXED_TEX = re.compile(r"(?<![\w.])(\d+)[ \t]*\\[dt]?frac\s*\{\s*(\d+)\s*\}\s*\{\s*(\d+)\s*\}")
+_MIXED_TXT = re.compile(r"(?<![\w.,/])(\d+)[ \t]+(\d+)/(\d+)(?![\d/]|\.\d)")
+_SIGN_CURRENCY = re.compile(r"([-+−])([$€£¥])(?=[\d.])")
+
+
+def _mixed(m: "re.Match[str]") -> str:
+    """'2 1/2' -> '2.5': a whole number followed by a proper fraction."""
+    num, den = Decimal(m[2]), Decimal(m[3])
+    if den == 0 or num >= den:  # not a mixed number; keep the parts apart (no '23/2')
+        return m[1] + " " + m[0][len(m[1]):].lstrip()
+    with localcontext() as ctx:
+        ctx.prec = len(m[1]) + len(m[3]) + 12
+        return _fmt_decimal(Decimal(m[1]) + num / den)
+
+
+def _sign_after_currency(m: "re.Match[str]") -> str:
+    """'-$5' -> '$-5' so the sign reaches the number, unless it is a binary minus ('$10 -$3')."""
+    pre = m.string[:m.start()].rstrip()
+    if pre and (pre[-1].isdigit() or pre[-1] in ")]}%"):
+        return m.group(0)
+    return m.group(2) + m.group(1)
 
 
 def _latex_to_text(s: str) -> str:
@@ -79,11 +111,14 @@ def _latex_to_text(s: str) -> str:
     s = s.replace("{,}", ",").replace("\\!", "").replace("\\,", "").replace("\\;", " ").replace("\\ ", " ")
     s = s.replace("\\$", "$").replace("\\%", "%").replace("\\left", "").replace("\\right", "")
     s = s.replace("\\cdot", "*").replace("\\times", "*").replace("\\div", "/")
+    s = _SIGN_CURRENCY.sub(_sign_after_currency, s)
+    s = _MIXED_TEX.sub(_mixed, s)
     for _ in range(3):
-        s = re.sub(r"\\[dt]?frac\s*\{\s*(\d+(?:\.\d+)?)\s*\}\s*\{\s*(\d+(?:\.\d+)?)\s*\}", r"\1/\2", s)
+        s = re.sub(r"\\[dt]?frac\s*\{\s*([-+−]?\d+(?:\.\d+)?)\s*\}\s*\{\s*(\d+(?:\.\d+)?)\s*\}", r"\1/\2", s)
         s = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", s)
         s = re.sub(r"\\(?:text|textbf|mathrm|mbox|textit|mathbf|operatorname)\s*\{([^{}]*)\}", r"\1", s)
     s = re.sub(r"\^\s*\{?\\circ\}?", "", s)
+    s = _MIXED_TXT.sub(_mixed, s)
     return s
 
 
@@ -108,21 +143,34 @@ def _boxed(text: str) -> str | None:
 
 
 def _fmt_decimal(d: Decimal) -> str:
-    if d == d.to_integral_value():
-        return str(int(d))
-    q = d.quantize(Decimal("1e-6")).normalize()
-    s = format(q, "f")
+    # enough precision for every digit: the default 28 would round big integers and make
+    # quantize() raise InvalidOperation for decimals with 23+ integer digits. Formatting
+    # through Decimal (not int) also avoids Python's 4300-digit int-to-str limit.
+    with localcontext() as ctx:
+        ctx.prec = max(28, d.adjusted() + 10)
+        if d == d.to_integral_value():
+            s = format(d.quantize(Decimal(1)), "f")
+        else:
+            s = format(d.quantize(Decimal("1e-6")).normalize(), "f")
     return "0" if s in ("-0", "0") else s
 
 
 def normalize_number(s: Any) -> str | None:
     """Canonical string for a numeric answer: '$1,234.50' -> '1234.5', '3/4' -> '0.75',
-    '18.0' -> '18', '25%' -> '25'. Uses the first number in the string; None if there is none."""
+    '18.0' -> '18', '25%' -> '25'. Uses the first number in the string; None if there is none.
+    Integers are exact at any size (up to _MAX_DIGITS digits)."""
     if s is None or isinstance(s, bool):
         return None
     if isinstance(s, (int, Fraction)):
         f = Fraction(s)
-        return _fmt_decimal(Decimal(f.numerator) / Decimal(f.denominator))
+        digits = int(max(f.numerator.bit_length(), f.denominator.bit_length()) * 0.30103) + 2
+        if digits > _MAX_DIGITS:
+            return None
+        if f.denominator == 1:
+            return _fmt_decimal(Decimal(f.numerator))
+        with localcontext() as ctx:
+            ctx.prec = max(28, digits + 10)
+            return _fmt_decimal(Decimal(f.numerator) / Decimal(f.denominator))
     if isinstance(s, float):
         if not math.isfinite(s):
             return None
@@ -137,12 +185,17 @@ def normalize_number(s: Any) -> str | None:
     try:
         if "/" in tok:
             a, b = tok.split("/", 1)
-            if Decimal(b) == 0:
+            da, db = Decimal(a), Decimal(b)
+            if db == 0 or da.adjusted() - db.adjusted() > _MAX_DIGITS:
                 return None
-            d = Decimal(a) / Decimal(b)
+            with localcontext() as ctx:
+                ctx.prec = max(28, len(a) + len(b) + 10)
+                d = da / db
         else:
             d = Decimal(tok)
     except (InvalidOperation, ValueError):
+        return None
+    if d.adjusted() > _MAX_DIGITS:  # '1e999999999' is not an answer
         return None
     return _fmt_decimal(d)
 
@@ -195,8 +248,9 @@ def _number_in_segment(seg: str) -> str | None:
 def extract_answer(text: str, numeric: bool | None = None) -> str | None:
     """The final answer stated in a model's reply.
 
-    Looks, in order, for '\\boxed{..}', '#### ..', 'Answer: ..' (last occurrence),
-    'the answer is ..', and finally (numeric only) the last number in the text.
+    Looks, in order, for '\\boxed{..}', a '#### <number>' line (not a Markdown heading),
+    'Answer: ..' (last occurrence), 'the answer is ..', and finally (numeric only) the last
+    number in the text.
     numeric=True returns a canonical number, False a cleaned phrase, None decides by
     whether the stated answer starts with a number.
     """
@@ -208,7 +262,7 @@ def extract_answer(text: str, numeric: bool | None = None) -> str | None:
     if b is not None and b.strip():
         seg = b
     if seg is None:
-        m = re.findall(r"####\s*(.+)", text)
+        m = [x for x in _HASH_RE.findall(text) if not _NUMBERED_HEADING.match(x)]
         if m:
             seg = m[-1]
     if seg is None:
@@ -239,36 +293,52 @@ def extract_answer(text: str, numeric: bool | None = None) -> str | None:
     return seg or None
 
 
+_NUMBER_ONLY = re.compile(r"[\s*]*[-+−]?[$€£¥]?[-+−]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?"
+                          r"(?:/\d+(?:\.\d+)?)?\s*%?[\s*.]*")
+
+
+def _is_number_only(s: str) -> bool:
+    """True for a bare number ('18', '-$5', '$1,234.50', '25%', '3/4'), not for 'Room 12'."""
+    return bool(_NUMBER_ONLY.fullmatch(_latex_to_text(s)))
+
+
 def answer_key(ans: str | None) -> str | None:
     """Key under which answers are counted as equal when voting."""
     if ans is None:
         return None
-    n = normalize_number(ans) if re.fullmatch(r"\s*[-+]?[\d.,/]+\s*", ans) else None
+    n = normalize_number(ans) if _is_number_only(ans) else None
     return n if n is not None else normalize_text(ans) or None
 
 
 def answers_match(pred: str | None, gold: str | None, tol: float = 1e-6) -> bool:
-    """Numeric comparison with a small relative tolerance; text comparison otherwise."""
+    """Numeric comparison when either side is a bare number: integers must be equal, other
+    values within `tol` (the 6-decimal normalization). Loose text comparison otherwise, so
+    'Room 12' does not match '12 Main St'."""
     if pred is None or gold is None:
         return False
     a, b = normalize_number(pred), normalize_number(gold)
-    if a is not None and b is not None:
-        fa, fb = float(a), float(b)
-        return abs(fa - fb) <= tol * max(1.0, abs(fb))
+    if a is not None and b is not None and (_is_number_only(pred) or _is_number_only(gold)):
+        da, db = Decimal(a), Decimal(b)
+        if da == da.to_integral_value() and db == db.to_integral_value():
+            return da == db  # a relative tolerance would accept 1450001 for 1450000
+        with localcontext() as ctx:
+            ctx.prec = max(28, da.adjusted() + 10, db.adjusted() + 10)
+            return abs(da - db) <= max(Decimal(repr(tol)), abs(db) * Decimal("1e-12"))
     return normalize_text(pred) == normalize_text(gold)
 
 
 _NEG_CUES = re.compile(r"(?<![\w])-\d|\b(?:negative|below zero|minus|loss|lost|lose|debt|owe[sd]?|deficit|"
                        r"temperature|degrees|decrease|difference|change)\b", re.I)
+# questions whose answers may well have cents
+_MONEY_CUES = re.compile(r"[$€£¥¢]|\d\.\d|\b(?:cents?|dollars?|euros?)\b", re.I)
 
 
 def plausibility(answer: str | None, question: str = "") -> float:
-    """Prior weight of a numeric answer to a word problem, used to weigh votes.
+    """Prior weight of a numeric answer to a word problem, used to break vote ties.
 
     Answers to everyday quantity questions are almost always non-negative and whole (or
     money with cents), and a negative or 14.333333 result usually means a misread problem.
-    Such answers are down-weighted, never excluded: they still win when nothing else does.
-    Non-numeric answers weigh 1.
+    Such answers are down-weighted, never excluded. Non-numeric answers weigh 1.
     """
     if answer is None:
         return 0.0
@@ -278,29 +348,42 @@ def plausibility(answer: str | None, question: str = "") -> float:
     if answer.strip().startswith("-") and not _NEG_CUES.search(question):
         w *= 0.25
     if "." in answer:
-        w *= 0.6 if len(answer.split(".", 1)[1].strip()) <= 2 else 0.3
+        if len(answer.split(".", 1)[1].strip()) > 2:
+            w *= 0.3
+        elif not _MONEY_CUES.search(question):  # cents are expected in an answer about money
+            w *= 0.6
     return w
 
 
-def majority_vote(cands: list[dict]) -> tuple[str | None, dict]:
-    """Answer key with the largest total vote weight (candidate "weight", default 1).
-
-    Ties go to the higher mean log-probability when every tied group has one, else to
-    the group whose first member came earliest (sample 0 is the greedy one).
-    Returns (key, info) with info = {"counts": {key: n}, "scores": {key: weight},
-    "tie": bool, "winner_index": i}.
-    """
+def _voters(cands: list[dict]) -> "OrderedDict[str, list[int]]":
+    """Candidate indices per answer key. A weight of 0 means "does not vote" (a tie-breaker)."""
     groups: "OrderedDict[str, list[int]]" = OrderedDict()
     for i, c in enumerate(cands):
         k = c.get("key")
-        if k is not None:
+        if k is not None and float(c.get("weight", 1.0)) > 0:
             groups.setdefault(k, []).append(i)
+    return groups
+
+
+def majority_vote(cands: list[dict]) -> tuple[str | None, dict]:
+    """Answer key with the most votes.
+
+    Vote weights (candidate "weight", default 1: the plausibility prior) only break ties in
+    the vote count; a prior must never let a minority beat a majority. Remaining ties go to
+    the higher mean log-probability when every tied group has one, else to the group whose
+    first member came earliest (sample 0 is the greedy one).
+    Returns (key, info) with info = {"counts": {key: n}, "scores": {key: weight},
+    "tie": bool, "tied": [keys still tied after the weights], "winner_index": i}.
+    """
+    groups = _voters(cands)
     if not groups:
-        return None, {"counts": {}, "scores": {}, "tie": False, "winner_index": None}
+        return None, {"counts": {}, "scores": {}, "tie": False, "tied": [], "winner_index": None}
     counts = {k: len(v) for k, v in groups.items()}
     scores = {k: sum(float(cands[i].get("weight", 1.0)) for i in v) for k, v in groups.items()}
-    top = max(scores.values())
-    tied = [k for k, w in scores.items() if w >= top - 1e-9]
+    most = max(counts.values())
+    leaders = [k for k in groups if counts[k] == most]
+    top = max(scores[k] for k in leaders)
+    tied = [k for k in leaders if scores[k] >= top - 1e-9]
 
     def mean_lp(k):
         lps = [cands[i].get("logprob") for i in groups[k]]
@@ -315,21 +398,17 @@ def majority_vote(cands: list[dict]) -> tuple[str | None, dict]:
         else:
             best = min(tied, key=lambda k: groups[k][0])
     return best, {"counts": counts, "scores": {k: round(v, 4) for k, v in scores.items()},
-                  "tie": len(tied) > 1, "winner_index": groups[best][0]}
+                  "tie": len(tied) > 1, "tied": tied, "winner_index": groups[best][0]}
 
 
 def _decided(cands: list[dict], total: int) -> bool:
-    """True when the leader cannot be overtaken (or tied) by the samples still to come
-    (each can add a weight of at most 1)."""
-    scores: dict[str, float] = {}
-    for c in cands:
-        if c.get("key") is not None:
-            scores[c["key"]] = scores.get(c["key"], 0.0) + float(c.get("weight", 1.0))
-    if not scores:
+    """True when the leader cannot be overtaken (or tied) in votes by the samples still to
+    come (each adds at most one vote)."""
+    ranked = sorted((len(v) for v in _voters(cands).values()), reverse=True)
+    if not ranked:
         return False
-    ranked = sorted(scores.values(), reverse=True)
-    second = ranked[1] if len(ranked) > 1 else 0.0
-    return ranked[0] > second + (total - len(cands)) + 1e-9
+    second = ranked[1] if len(ranked) > 1 else 0
+    return ranked[0] > second + (total - len(cands))
 
 
 # =========================================================================================
@@ -337,11 +416,22 @@ def _decided(cands: list[dict], total: int) -> bool:
 
 _WORD_NUMS = r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|" \
              r"hundred|thousand|million|half|twice|double|triple|dozen|quarter|third)\b"
-_MATH_CUES = re.compile(r"\b(?:how (?:many|much|long|far|old|fast)|what (?:is|was|are) the (?:total|sum|difference|"
-                        r"product|average|number|cost|price|area|perimeter|value|percentage|ratio|amount)|"
-                        r"calculate|compute|percent|average|total|profit|cost|price|per|each|remaining|left|"
-                        r"more than|less than|times|altogether|in all|solve|equation|sum|product|ratio)\b|[$%€£]",
-                        re.I)
+# a question that asks for a quantity: "how many", "what percentage", "what number of",
+# "what is the (house's final) temperature", "what is half the number", ...
+_QTY_Q = (r"how (?:many|much|long|far|old|fast|big|tall|heavy|large|wide|high|deep)|what percent(?:age)?|"
+          r"what number of|what (?:is|was|are|were|will be|would be)(?: \S+){0,4}? (?:total|sum|difference|product|"
+          r"average|mean|number|cost|price|area|perimeter|volume|value|percentage|ratio|amount|weight|depth|height|"
+          r"length|width|distance|temperature|rate|speed|profit|score|balance)")
+_MATH_CUES = re.compile(r"\b(?:" + _QTY_Q + r"|calculate|compute|percent(?:age)?s?|average|mean|total|profit|cost|"
+                        r"price|per|each|remaining|left|more than|less than|times|altogether|in all|solve|equation|"
+                        r"sum|product|ratio)\b|[$%€£]", re.I)
+# word numbers and 'each' also occur in text requests ("two sentences ... one example of each"):
+# a math question also has a numeral, a currency/percent sign or an actual quantity question
+_QTY_RE = re.compile(r"\b(?:" + _QTY_Q + r"|calculate|compute|find)\b|\d|[$%€£]", re.I)
+_ASKS_QTY = re.compile(r"\b(?:" + _QTY_Q + r")\b", re.I)
+# for free-form answers (direct, rag): does the question ask for a number at all?
+_ASKS_NUMBER = re.compile(r"\b(?:" + _QTY_Q + r"|(?:what|which|in what) year|number of|calculate|compute)\b|"
+                          r"[$%€£]|\d\s*[-+*/×÷^]\s*\d", re.I)
 _EXPR_RE = re.compile(r"^[\d\s.,+\-*/×÷^()%]+$|^(?:[\d\s.+\-*/×÷^()]|sqrt|log|ln|exp|sin|cos|tan|pi|factorial)+$",
                       re.I)
 
@@ -350,7 +440,10 @@ def _as_expression(q: str) -> str | None:
     """A bare arithmetic expression in the question ("what is 17*23?"), else None."""
     s = q.strip()
     s = re.sub(r"^(?:please\s+)?(?:what\s+is|what's|calculate|compute|evaluate|solve)\s*:?\s*", "", s, flags=re.I)
-    s = s.rstrip(" ?.!=").replace(",", "")
+    s = s.rstrip(" ?.!=")
+    s = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", s)  # thousands separators: 1,000,000 -> 1000000
+    if "," in s:  # a decimal comma (1,5) or an argument list (log(8,2)): leave it to the model
+        return None
     s = re.sub(r"(\d+(?:\.\d+)?)\s*%\s+of\s+", r"\1/100*", s, flags=re.I)  # "15% of 80"
     if not s or not re.search(r"\d", s) or not re.search(r"[-+*/×÷^%]|sqrt|log|exp|sin|cos|tan|factorial", s):
         return None
@@ -368,7 +461,8 @@ def classify(question: str, context: str | None = None) -> tuple[str, str]:
     q = question.lower()
     n_numbers = len(re.findall(r"\d+(?:\.\d+)?", q)) + len(re.findall(_WORD_NUMS, q))
     cues = len(_MATH_CUES.findall(q))
-    if n_numbers >= 2 and cues >= 1 or n_numbers >= 1 and cues >= 2:
+    if (n_numbers >= 2 and cues >= 1 or n_numbers >= 1 and cues >= 2 or n_numbers >= 1 and _ASKS_QTY.search(q)) \
+            and _QTY_RE.search(q):
         return "math", f"{n_numbers} quantities and {cues} quantitative cues"
     if len(question) > 200 or re.search(r"\b(?:why|explain|prove|puzzle|riddle|if .* then|which of|step|reason|"
                                         r"logic|deduce|compare)\b", q):
@@ -433,7 +527,7 @@ class _Session:
         # decode several samples in lockstep when the LLM supports it (weights are read once per step)
         self.batch = batch and callable(getattr(llm, "sample_n", None))
         self.question = ""
-        self.prior = True  # weigh numeric votes by plausibility()
+        self.prior = True  # break vote ties by plausibility()
 
     def weight(self, answer: str | None) -> float:
         return plausibility(answer, self.question) if self.prior else (0.0 if answer is None else 1.0)
@@ -492,18 +586,55 @@ def _messages(content: str, system: str | None = None) -> list[dict]:
     return ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
 
 
+_CHATML_LIKE = re.compile(r"<\|[^|<>\s]{1,40}\|>")
+
+
+def _escape_control(llm, text: str) -> str:
+    """Untrusted text (retrieved documents, program output) with the model's control-token
+    strings broken by a zero-width space, so tokenizing the prompt with special tokens on
+    cannot turn '<|im_start|>system' inside it into a real role boundary."""
+    esc = getattr(llm, "escape_special", None)
+    if callable(esc):
+        return esc(text)
+    pieces: set[str] = set()
+    model = getattr(llm, "model", None)
+    info = getattr(model, "tokenizer_info", None)
+    if isinstance(info, dict) and callable(getattr(model, "token_bytes", None)):
+        for t in info.get("added_tokens", []) or []:
+            try:
+                p = model.token_bytes(t).decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001 - best effort; the generic pattern below still applies
+                continue
+            if len(p) >= 3 and p[0] in "<[" and p[-1] in ">]" and not any(ch.isspace() for ch in p):
+                pieces.add(p)  # '<|im_end|>', '</s>', '[INST]', '<start_of_turn>' (not plain-word tokens)
+    if pieces:
+        text = re.sub("|".join(map(re.escape, sorted(pieces, key=len, reverse=True))),
+                      lambda m: m[0][0] + "\u200b" + m[0][1:], text)
+    return _CHATML_LIKE.sub(lambda m: "<\u200b" + m[0][1:], text)
+
+
+def _free_answer(text: str, question: str, numeric: bool | None) -> str | None:
+    """extract_answer for a reply that may be plain prose. Without an answer marker, a number
+    in the prose ('Room 12', 'around 1600', 'port 53') is the answer only when the question
+    asks for one."""
+    if numeric is None and extract_answer(text, False) is None and not (
+            _ASKS_NUMBER.search(question) or classify(question)[0] in ("math", "arithmetic")):
+        return None
+    return extract_answer(text, numeric)
+
+
 # =========================================================================================
 # strategies
 
 def _direct(s: _Session, q: str, numeric: bool | None) -> Answer:
     g = s.gen(_messages(q), stream=True)
-    ans = extract_answer(g["text"], numeric)
+    ans = _free_answer(g["text"], q, numeric)
     g.update(kind="direct", answer=ans, key=answer_key(ans))
     return Answer(text=_strip_thinking(g["text"]).strip(), answer=ans, strategy="direct", candidates=[_slim(g)])
 
 
 def _cot_finish(s: _Session, g: dict, numeric: bool | None) -> dict:
-    ans = extract_answer(g["text"], numeric)
+    ans = _free_answer(g["text"], s.question, numeric)
     g.update(kind="cot", answer=ans, key=answer_key(ans), weight=s.weight(ans))
     return g
 
@@ -554,8 +685,7 @@ def _tiebreak_logprobs(s: _Session, cands: list[dict]) -> None:
     _, info = majority_vote(cands)
     if not info["tie"]:
         return
-    top = max(info["counts"].values())
-    tied = {k for k, v in info["counts"].items() if v == top}
+    tied = set(info["tied"])
     if cands and cands[0].get("temperature") == 0.0 and cands[0].get("key") in tied:
         return  # the greedy chain has the highest mean log-prob anyway; earliest-wins picks it for free
     for c in cands:
@@ -680,9 +810,7 @@ def _pal_vote(s: _Session, q: str, numeric: bool | None, n: int, temperature: fl
         g["tiebreaker"] = True
         g["weight"] = 0.0  # it only breaks the tie; it does not vote
         if key is not None and info["tie"]:
-            top = max(info["scores"].values())
-            tied = [k for k, v in info["scores"].items() if v >= top - 1e-9]
-            if g["key"] in tied:
+            if g["key"] in info["tied"]:
                 key = g["key"]
                 info["winner_index"] = next(i for i, c in enumerate(cands) if c.get("key") == key)
         cands.append(g)
@@ -774,7 +902,7 @@ def _verify(s: _Session, q: str, numeric: bool | None, n: int, temperature: floa
 
 
 def _rag(s: _Session, q: str, context: str, numeric: bool | None) -> Answer:
-    ctx = context.strip()
+    ctx = _escape_control(s.llm, context.strip())  # documents must not forge chat turns
     if not re.search(r"^\[\d+\]", ctx, flags=re.M):
         ctx = "[1]\n" + ctx
     msgs = _messages(f"Context:\n{ctx}\n\nQuestion: {q}", system=RAG_SYSTEM)
@@ -792,7 +920,7 @@ def _rag(s: _Session, q: str, context: str, numeric: bool | None) -> Answer:
     g = s.gen(msgs, stream=True, lookup=3)
     text = _strip_thinking(g["text"]).strip()
     plain = re.sub(r"\s*\[\d+(?:\s*[,;]\s*\d+)*\]", "", text)  # citation markers are not answers
-    ans = extract_answer(plain, numeric)
+    ans = _free_answer(plain, q, numeric)
     if ans is None and len(plain) <= 120:
         ans = _clean_short(plain)
     g.update(kind="rag", answer=ans, key=answer_key(ans), citations=sorted(set(re.findall(r"\[(\d+)\]", text))))
@@ -834,7 +962,8 @@ def solve(llm, question: str, strategy: str = "auto", samples: int = 5, max_toke
     numeric: force numeric (True) or text (False) answer extraction; None guesses.
     batch: sample candidates together with llm.sample_n when available (otherwise one at a
     time, stopping early once the majority is decided).
-    prior: weigh numeric votes by plausibility() (negative / long fractional answers count less).
+    prior: break ties between equally voted answers by plausibility() (negative / long
+    fractional answers lose); it never overrides the vote count.
     """
     if strategy not in STRATEGIES:
         raise ValueError(f"unknown strategy {strategy!r}; choose from {', '.join(STRATEGIES)}")

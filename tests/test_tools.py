@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import math
+import os
+import subprocess
 import sys
+import textwrap
+import threading
 import time
 
 import pytest
@@ -188,3 +192,117 @@ def test_calculator_errors():
     for bad in ("1/0", "5 // 0", "5 % 0", "(1+2", "", "sqrt(-1)", "a" * 3000):
         with pytest.raises(CalculatorError):
             calculator(bad)
+
+
+# ---- regressions from the adversarial review -------------------------------------------
+
+@pytest.mark.parametrize("expr", ["0**-1", "0^-1", "(5-5)^-2", "pow(0,-1)", "0.0**-1", "0 ** -0.5",
+                                  "10**400 // 0.5", "10**400 % 0.5", "10^400/3", "2^1100/3", "(2^1100+1)/2",
+                                  "-" * 1990 + "1", "1\x00"])
+def test_calculator_arithmetic_failures_are_calculator_errors(expr):
+    with pytest.raises(CalculatorError):
+        calculator(expr)
+
+
+def test_calculator_still_exact_after_error_handling():
+    assert calculator("2^-1") == 0.5 and calculator("3*(4+5)") == 27 and calculator("0**0") == 1
+    assert calculator("2**100") == 2 ** 100
+
+
+def test_solution_with_parameters_is_left_to_the_program():
+    from superborg.reason import _program_value
+    r = run_python("def solution(eggs, eaten, baked, price):\n    return (eggs - eaten - baked) * price\n\n"
+                   "print(solution(16, 3, 4, 2))\n")
+    assert r.ok and r.error is None and r.stdout == "18\n" and _program_value(r) == "18"
+    r = run_python("def solution(a, b):\n    return a * b\nresult = solution(9, 2)\n")
+    assert r.ok and r.value == 18 and r.extra["value_kind"] == "last_assignment"
+    r = run_python("def solution(x=3, *rest, **kw):\n    return x * 2\n")  # callable without arguments
+    assert r.ok and r.value == 6 and r.extra["value_kind"] == "solution"
+    r = run_python("def solution():\n    return 1 / 0\n")  # a no-argument solution() that fails still fails
+    assert not r.ok and "ZeroDivisionError" in r.error
+
+
+def test_run_python_survives_a_corrupted_result_file():
+    for code in ("import sys, os\nopen(sys.argv[2], 'w').write('[1, 2]')\nos._exit(0)",
+                 "import json\njson.dump = lambda obj, f, **k: f.write('\"hi\"')\nanswer = 3",
+                 "import sys, os\nopen(sys.argv[2], 'w').write('[' * 100000 + ']' * 100000)\nos._exit(0)"):
+        r = run_python(code)
+        assert not r.ok and r.value is None and r.error, code
+    r = run_python("import sys, os\nopen(sys.argv[2], 'w').write('{\"ok\": \"yes\", \"error\": 5, \"kind\": [1]}')\n"
+                   "os._exit(0)")
+    assert r.ok is False and r.error == "malformed result" and r.extra["value_kind"] is None
+
+
+def test_huge_int_answer_is_not_an_error():
+    from superborg.reason import _program_value
+    for code in ("answer = 2**20000", "2**20000", "x = 2**20000"):
+        r = run_python(code)
+        assert r.ok and r.error is None, (code, r.error)
+        assert isinstance(r.value, str) and len(r.value) == 6021 and r.value.startswith("3980276840")
+        assert _program_value(r) == r.value
+    assert run_python("answer = 6 * 7").value == 42
+
+
+linux_proc = pytest.mark.skipif(not os.path.isdir("/proc/self") or sys.platform == "win32",
+                                reason="needs Linux /proc")
+
+
+def _gone(pid: int, wait: float = 3.0) -> bool:
+    """The process no longer runs (it may linger as a zombie until its new parent reaps it)."""
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+                if f.read().rsplit(")", 1)[1].split()[0] in ("Z", "X"):
+                    return True
+        except OSError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@linux_proc
+def test_setsid_descendants_are_killed_and_do_not_stall_the_caller():
+    threads = threading.active_count()
+    escape = ("import os, time\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    time.sleep(30)\n"
+              "    os._exit(0)\nanswer = pid\n")
+    t = time.perf_counter()
+    r = run_python(escape, timeout=5)
+    assert r.ok and isinstance(r.value, int)
+    assert time.perf_counter() - t < 1.5  # no waiting on a pipe the escaped process still holds
+    assert _gone(r.value)
+    # a new session that does not even hold the output pipe
+    r = run_python("import subprocess\np = subprocess.Popen(['sleep', '30'], start_new_session=True, "
+                   "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\nanswer = p.pid\n", timeout=5)
+    assert r.ok and _gone(r.value)
+    # on a timeout too
+    r = run_python(escape.replace("answer = pid\n", "answer = pid\nprint(pid, flush=True)\ntime.sleep(60)\n"),
+                   timeout=1)
+    assert not r.ok and "timeout" in r.error and _gone(int(r.stdout.split()[0]))
+    assert threading.active_count() == threads
+
+
+@linux_proc
+def test_fork_bomb_is_capped_for_a_normal_user():
+    """RLIMIT_NPROC bounds fork() for a non-root user (root is exempt: then a helper drops to nobody)."""
+    prog = ("import os, time\nn = 0\ntry:\n    for _ in range(200):\n        if os.fork() == 0:\n"
+            "            time.sleep(3)\n            os._exit(0)\n        n += 1\nexcept OSError:\n    pass\nanswer = n\n")
+    tools_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "superborg", "tools.py")
+    helper = textwrap.dedent(f"""
+        import importlib.util, os, sys
+        if os.getuid() == 0:
+            os.setgroups([]); os.setgid(65534); os.setuid(65534)
+        spec = importlib.util.spec_from_file_location("borg_tools", {tools_py!r})
+        m = importlib.util.module_from_spec(spec); sys.modules["borg_tools"] = m; spec.loader.exec_module(m)
+        r = m.run_python({prog!r}, timeout=10)
+        print(r.ok, r.value, r.error)
+    """)
+    python = os.path.realpath(sys.executable)
+    if os.getuid() == 0 and not all(os.access(p, os.R_OK) for p in (python, tools_py)):
+        pytest.skip("cannot run as an unprivileged user here")
+    out = subprocess.run([python, "-I", "-c", helper], capture_output=True, text=True, timeout=60, cwd="/",
+                         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TMPDIR": "/tmp"})
+    if out.returncode != 0 and "PermissionError" in out.stderr:
+        pytest.skip(f"cannot run as an unprivileged user: {out.stderr[-200:]}")
+    ok, forks, _ = out.stdout.split(" ", 2)
+    assert ok == "True" and int(forks) <= 40, out.stdout + out.stderr

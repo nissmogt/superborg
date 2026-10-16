@@ -6,13 +6,17 @@
 Prints accuracy, seconds/question and generated tokens/question per strategy and saves
 every per-question record (with each candidate's answer, and its program for PAL).
 Runs are deterministic for a given --seed and resumable: re-running with the same --out
-skips (problem, strategy) pairs that are already recorded.
+skips (problem, strategy) pairs that are already recorded. A results file is only resumed
+when it was written with the same model, data file and settings and its problems match
+the data; otherwise the run refuses to start (use another --out). The summary covers the
+problems of the current run only.
 The data file is the GSM8K test split as JSON lines with "question" and "answer"; the gold
 answer is the number after "####".
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -105,17 +109,66 @@ def _save(path: str, data: dict) -> None:
     os.replace(tmp, path)
 
 
+# config entries that change the answers (besides evaluate()'s own arguments)
+RESUME_CONFIG_KEYS = ("model", "data", "n_ctx")
+
+
+def run_settings(config: dict | None, samples: int, max_tokens: int, seed: int, solve_kw: dict) -> dict:
+    """What a results file must have been produced with to be resumed."""
+    s = {k: (config or {}).get(k) for k in RESUME_CONFIG_KEYS}
+    s.update(samples=samples, max_tokens=max_tokens, seed=seed)
+    for k in sorted(solve_kw):
+        if solve_kw[k] is None or isinstance(solve_kw[k], (bool, int, float, str)):
+            s[k] = solve_kw[k]
+    return s
+
+
+def _qid(question: str) -> str:
+    return hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+
+
+def resumable(out: str | None, settings: dict, problems: list[dict], strategies: list[str]
+              ) -> tuple[list[dict], list[dict]]:
+    """(records of `out` this run reuses, other records kept in the file untouched).
+
+    Raises ValueError when `out` was written with other settings or for other problems:
+    its records would be reported as this run's.
+    """
+    if not out or not os.path.exists(out):
+        return [], []
+    with open(out, encoding="utf-8") as f:
+        prev = json.load(f)
+    old = prev.get("settings") if isinstance(prev, dict) else None
+    if old != settings:
+        if not isinstance(old, dict):
+            why = "no recorded settings"
+        else:
+            why = ", ".join(f"{k}: {old.get(k)!r} -> {settings.get(k)!r}" for k in sorted(set(old) | set(settings))
+                            if old.get(k) != settings.get(k))
+        raise ValueError(f"{out} holds results of another run ({why}); use another --out or delete it")
+    qids = {p["index"]: _qid(p["question"]) for p in problems}
+    reuse: list[dict] = []
+    other: list[dict] = []
+    for r in prev.get("records", []):
+        i = r.get("index")
+        if i in qids and r.get("qid") != qids[i]:
+            raise ValueError(f"{out}: problem #{i} differs from the one in the data file; use another --out")
+        (reuse if i in qids and r.get("strategy") in strategies else other).append(r)
+    return reuse, other
+
+
 def evaluate(llm, problems: list[dict], strategies: list[str], samples: int = 5, max_tokens: int = 512,
              seed: int = 0, out: str | None = None, config: dict | None = None, verbose: bool = True,
              **solve_kw) -> dict:
-    """Run every strategy on every problem (problem-major, so partial runs stay comparable)."""
-    records: list[dict] = []
-    if out and os.path.exists(out):
-        with open(out, encoding="utf-8") as f:
-            prev = json.load(f)
-        records = [r for r in prev.get("records", []) if r["strategy"] in strategies]
-        if verbose and records:
-            print(f"resuming: {len(records)} records already in {out}", file=sys.stderr)
+    """Run every strategy on every problem (problem-major, so partial runs stay comparable).
+
+    With `out`, records are saved after every problem and an existing file is resumed (see
+    resumable(); ValueError if it belongs to another run). The summary covers `problems` only.
+    """
+    settings = run_settings(config, samples, max_tokens, seed, solve_kw)
+    records, other = resumable(out, settings, problems, strategies)
+    if verbose and records:
+        print(f"resuming: {len(records)} records already in {out}", file=sys.stderr)
     done = {(r["index"], r["strategy"]) for r in records}
     t_start = time.time()
     for pi, p in enumerate(problems):
@@ -130,7 +183,8 @@ def evaluate(llm, problems: list[dict], strategies: list[str], samples: int = 5,
             ans = solve(llm, p["question"], strategy=s, samples=samples, max_tokens=max_tokens,
                         seed=seed + p["index"], numeric=True, **solve_kw)
             ok = answers_match(ans.answer, p["gold"])
-            rec = {"index": p["index"], "strategy": s, "gold": p["gold"], "pred": ans.answer, "correct": ok,
+            rec = {"index": p["index"], "qid": _qid(p["question"]), "strategy": s, "gold": p["gold"],
+                   "pred": ans.answer, "correct": ok,
                    "elapsed_s": round(ans.elapsed_s, 3), "tokens": ans.tokens,
                    "n_candidates": len(ans.candidates), "resolved": ans.strategy,
                    "candidates": [_trim_candidate(c) for c in ans.candidates]}
@@ -141,13 +195,14 @@ def evaluate(llm, problems: list[dict], strategies: list[str], samples: int = 5,
                       f"gold={p['gold']:>8s} {ans.elapsed_s:6.1f}s {ans.tokens:5d} tok "
                       f"({len(ans.candidates)} cand)", file=sys.stderr, flush=True)
         if out:
-            _save(out, {"config": config or {}, "summary": summarize(records, strategies), "records": records})
+            _save(out, {"config": config or {}, "settings": settings, "summary": summarize(records, strategies),
+                        "records": other + records})
     summary = summarize(records, strategies)
     if verbose:
         print(f"done in {time.time() - t_start:.0f}s", file=sys.stderr)
-    data = {"config": config or {}, "summary": summary, "records": records}
+    data = {"config": config or {}, "settings": settings, "summary": summary, "records": records}
     if out:
-        _save(out, data)
+        _save(out, dict(data, records=other + records))
     return data
 
 
@@ -177,15 +232,20 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"unknown strategies: {bad}")
     problems = load_problems(a.data, a.offset, a.n)
     import superborg
-    llm = superborg.LLM(a.model, threads=a.threads, n_ctx=a.n_ctx)
     config = {"model": os.path.basename(a.model), "data": os.path.basename(a.data), "offset": a.offset,
               "n": len(problems), "strategies": strategies, "samples": a.samples, "max_tokens": a.max_tokens,
               "seed": a.seed, "temperature": a.temperature, "early_stop": not a.no_early_stop,
-              "threads": a.threads, "simd": superborg.simd()}
+              "thinking": a.thinking, "n_ctx": a.n_ctx, "threads": a.threads, "simd": superborg.simd()}
+    solve_kw = {"temperature": a.temperature, "early_stop": not a.no_early_stop, "enable_thinking": a.thinking}
+    try:  # refuse a results file of another run before spending time on loading the model
+        resumable(a.out, run_settings(config, a.samples, a.max_tokens, a.seed, solve_kw), problems, strategies)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    llm = superborg.LLM(a.model, threads=a.threads, n_ctx=a.n_ctx)
     try:
         data = evaluate(llm, problems, strategies, samples=a.samples, max_tokens=a.max_tokens, seed=a.seed,
-                        out=a.out, config=config, verbose=not a.quiet, temperature=a.temperature,
-                        early_stop=not a.no_early_stop, enable_thinking=a.thinking)
+                        out=a.out, config=config, verbose=not a.quiet, **solve_kw)
     finally:
         llm.close()
     print(f"GSM8K test #{a.offset}..#{a.offset + len(problems) - 1} | {config['model']} | samples={a.samples}")

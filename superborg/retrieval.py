@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import stat
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from typing import Iterable
@@ -82,6 +83,8 @@ def chunk_text(text: str, size: int = 800, overlap: int = 150) -> list[tuple[str
     characters of trailing paragraphs from the previous chunk so facts that straddle a
     boundary stay retrievable.
     """
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        raise ValueError(f"chunk size must be a positive int, got {size!r}")  # size 0 never ends
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     paras: list[tuple[str, int]] = []
     line = 1
@@ -124,6 +127,13 @@ class Index:
     """An in-memory BM25 (Okapi) index over text chunks."""
 
     def __init__(self, k1: float = 1.5, b: float = 0.75, chunk_size: int = 800, overlap: int = 150):
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
+            raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
+        if not isinstance(overlap, int) or isinstance(overlap, bool) or overlap < 0:
+            raise ValueError(f"overlap must be a non-negative int, got {overlap!r}")
+        for name, v in (("k1", k1), ("b", b)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                raise ValueError(f"{name} must be a finite non-negative number, got {v!r}")
         self.k1, self.b = k1, b
         self.chunk_size, self.overlap = chunk_size, overlap
         self.chunks: list[Chunk] = []
@@ -166,12 +176,8 @@ class Index:
                              if n.lower().endswith(exts) and not n.startswith("."))
         added = 0
         for f in files:
-            try:
-                if os.path.getsize(f) > max_bytes:
-                    continue
-                with open(f, "rb") as fh:
-                    raw = fh.read()
-            except OSError:
+            raw = _read_regular(f, max_bytes)
+            if raw is None:
                 continue
             if b"\0" in raw[:4096]:  # binary
                 continue
@@ -216,14 +222,53 @@ class Index:
 
     @classmethod
     def load(cls, path: str) -> "Index":
+        """Read an index written by save(). Anything else raises ValueError."""
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("format") != "superborg-bm25":
+        if not isinstance(data, dict) or data.get("format") != "superborg-bm25":
             raise ValueError(f"{path} is not a superborg BM25 index")
-        idx = cls(k1=data["k1"], b=data["b"], chunk_size=data["chunk_size"], overlap=data["overlap"])
-        for c in data["chunks"]:
-            idx._add_chunk(c["text"], c["source"], c.get("line", 0))
+        try:
+            idx = cls(k1=data["k1"], b=data["b"], chunk_size=data["chunk_size"], overlap=data["overlap"])
+            chunks = data["chunks"]
+            if not isinstance(chunks, list):
+                raise TypeError("chunks is not a list")
+            for c in chunks:
+                if not isinstance(c, dict) or not isinstance(c.get("text"), str) or \
+                        not isinstance(c.get("source"), str):
+                    raise TypeError(f"bad chunk {str(c)[:80]}")
+                line = c.get("line", 0)
+                if isinstance(line, bool) or not isinstance(line, int):
+                    raise TypeError(f"bad line number {line!r}")
+                idx._add_chunk(c["text"], c["source"], line)
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"{path} is not a valid superborg BM25 index: {e}") from e
         return idx
+
+
+def _read_regular(path: str, max_bytes: int) -> bytes | None:
+    """Contents of a regular file of at most max_bytes, else None. FIFOs and devices (a
+    symlink to /dev/zero reports size 0) would block or never end, so they are skipped;
+    the open does not block and the read is bounded even if the file changes meanwhile."""
+    nonblock = getattr(os, "O_NONBLOCK", 0)  # opening a FIFO without a writer would block
+    try:
+        fd = os.open(path, os.O_RDONLY | nonblock | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        if nonblock:
+            os.set_blocking(fd, True)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1  # owned by fh now
+            raw = fh.read(max_bytes + 1)
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return raw if len(raw) <= max_bytes else None
 
 
 def format_context(hits: list[Hit], max_chars: int = 3000) -> str:

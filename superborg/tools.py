@@ -3,12 +3,27 @@
 run_python() executes code in a separate interpreter process (``sys.executable -I``)
 with CPU-time, address-space and file-size limits (where the OS supports them), a
 throw-away working directory, no stdin, a scrubbed environment and a wall-clock timeout.
+When it returns, the child's process group has been killed and, on Linux, so has every
+process still carrying the run's environment marker (descendants that left the group
+with setsid()); the output pipe is read in the calling thread under the same deadline,
+so nothing the program leaves behind can stall the caller.
 
 SECURITY NOTE: this is *isolation-light*. The child process runs as the current user,
 can read the user's files and can open network connections; the limits only stop
 runaway loops, memory blow-ups and output floods. It exists so a local model can
 check its own arithmetic on the user's own machine, by the user's choice. Never feed
 it code from untrusted third parties, and do not expose it as a network service.
+Known limits of the containment (all need code that sets out to evade it):
+  * memory_mb and the CPU limit apply to each process, not to the process tree.
+  * Forking is capped (RLIMIT_NPROC: at most MAX_PROCESSES more processes/threads) only on
+    Linux and only for a non-root user; root, or a process with CAP_SYS_RESOURCE, is exempt,
+    and elsewhere the user's process count is not known. A fork bomb then runs until the
+    wall-clock timeout.
+  * A descendant that both leaves the process group and drops the marker from its
+    environment (e.g. exec with a fresh env) survives the run, as does anything started
+    outside the process tree (cron, systemd-run, ...). There is no PID namespace or cgroup.
+  * The program shares the runner's interpreter, so it can forge its own result (exactly
+    as it could by setting `answer`); malformed results are reported as failures.
 """
 from __future__ import annotations
 
@@ -17,6 +32,7 @@ import json
 import math
 import operator
 import os
+import selectors
 import shutil
 import signal
 import subprocess
@@ -24,6 +40,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any
@@ -31,6 +48,8 @@ from typing import Any
 __all__ = ["ToolResult", "run_python", "calculator", "CalculatorError", "extract_code"]
 
 MAX_OUTPUT = 4096  # characters of stdout kept (the head; a marker notes the cut)
+MAX_PROCESSES = 32  # extra processes/threads a program may start (Linux, non-root: RLIMIT_NPROC)
+_MARKER = "SUPERBORG_SANDBOX_RUN"  # environment variable that tags a run's process tree
 
 
 @dataclass
@@ -58,8 +77,11 @@ class ToolResult:
 # (the parent truncates) and reports the result value through a side file, so code
 # that prints a lot cannot corrupt the protocol.
 _RUNNER = r'''
-import ast, json, math, sys, traceback
+import ast, json, math, os, sys, traceback
 src_path, out_path, mem_mb, cpu_s = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+max_procs = int(sys.argv[5])
+if hasattr(sys, "set_int_max_str_digits"):  # a correct answer of 2**20000 is not an error
+    sys.set_int_max_str_digits(0)
 try:  # limits are set here, not in a preexec_fn, because forking a threaded parent is unsafe
     import resource
     def _setl(name, soft, hard):
@@ -78,6 +100,18 @@ try:  # limits are set here, not in a preexec_fn, because forking a threaded par
     _setl("RLIMIT_CPU", cpu_s, cpu_s + 1)
     _setl("RLIMIT_FSIZE", 16 << 20, 16 << 20)  # no filling the disk
     _setl("RLIMIT_CORE", 0, 0)
+    if max_procs >= 0 and os.getuid() != 0 and os.path.isdir("/proc/self/task"):
+        # RLIMIT_NPROC caps the user's processes (threads, on Linux), so it is set to what
+        # the user runs now plus a margin: a fork bomb fails fast. Root is exempt.
+        uid, n = os.getuid(), 0
+        for p in os.listdir("/proc"):
+            if p.isdigit():
+                try:
+                    if os.stat("/proc/" + p).st_uid == uid:
+                        n += len(os.listdir("/proc/" + p + "/task"))
+                except OSError:
+                    pass
+        _setl("RLIMIT_NPROC", n + max_procs, n + max_procs)
 except ImportError:  # not POSIX: only the parent's wall-clock timeout applies
     pass
 with open(src_path, encoding="utf-8") as f:
@@ -116,6 +150,15 @@ def _short(e):
     lines = [fr.lineno for fr in tb if fr.filename == "<program>"]
     return (f"line {lines[-1]}: " if lines else "") + line
 
+def _no_args(f):
+    """True if f() can be called without arguments (solution(a, b) is called by the program itself)."""
+    try:
+        import inspect
+        ps = inspect.signature(f).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return not any(p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in ps)
+
 g = {"__name__": "__main__", "__builtins__": __builtins__}
 try:
     tree = ast.parse(src, "<program>", "exec")
@@ -131,12 +174,15 @@ try:
     exec(compile(tree, "<program>", "exec"), g)
     v = eval(compile(last, "<program>", "eval"), g) if last is not None else None
     if v is not None:
-        print(repr(v))  # notebook-style echo of a trailing expression
+        try:
+            print(repr(v))  # notebook-style echo of a trailing expression
+        except Exception:  # a failing echo must not turn a finished program into a failure
+            pass
     if "answer" in g and not callable(g["answer"]):
         res["value"], res["kind"] = _jsonable(g["answer"]), "answer"
     elif v is not None:  # e.g. a trailing `solution()` call: do not run it twice
         res["value"], res["kind"] = _jsonable(v), "expression"
-    elif callable(g.get("solution")):
+    elif callable(g.get("solution")) and _no_args(g["solution"]):
         res["value"], res["kind"] = _jsonable(g["solution"]()), "solution"
     if res["kind"] is None and last_name and last_name in g and not callable(g[last_name]):
         res["value"], res["kind"] = _jsonable(g[last_name]), "last_assignment"
@@ -156,11 +202,13 @@ with open(out_path, "w", encoding="utf-8") as f:
 '''
 
 
-def _child_env(workdir: str) -> dict[str, str]:
+def _child_env(workdir: str, marker: str = "") -> dict[str, str]:
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": workdir, "TMPDIR": workdir,
            "LANG": "C.UTF-8", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
            # BLAS libraries reserve big per-thread buffers that trip RLIMIT_AS
            "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    if marker:  # inherited by every descendant, also those that leave the process group
+        env[_MARKER] = marker
     if sys.platform == "win32":  # pragma: no cover
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
     return env
@@ -179,16 +227,108 @@ def _kill(proc: subprocess.Popen) -> None:
             pass
 
 
+def _marked(pid: int, entry: bytes) -> bool:
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return entry in f.read().split(b"\0")
+    except OSError:
+        return False
+
+
+def _sweep(marker: str) -> int:
+    """SIGKILL every process whose environment carries this run's marker (Linux /proc):
+    descendants that escaped killpg() with setsid()/setpgid(). Returns how many."""
+    if not marker or not os.path.isdir("/proc/self"):
+        return 0
+    entry = f"{_MARKER}={marker}".encode()
+    me, killed = os.getpid(), 0
+    for _ in range(10):  # again: a process may fork between the scan and the kill
+        found = [int(p) for p in os.listdir("/proc") if p.isdigit() and int(p) != me and _marked(int(p), entry)]
+        if not found:
+            break
+        for pid in found:
+            try:
+                if hasattr(os, "pidfd_open"):  # pin the process, then re-check: a reused pid is not ours
+                    fd = os.pidfd_open(pid)
+                    try:
+                        if _marked(pid, entry):
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            killed += 1
+                    finally:
+                        os.close(fd)
+                else:  # pragma: no cover - Linux < 5.3
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+            except OSError:
+                pass
+    return killed
+
+
+def _pump(proc: subprocess.Popen, deadline: float, take) -> tuple[bool, bool]:
+    """Pass the child's output to take() until the child exits or the deadline passes.
+    Returns (timed_out, eof). It runs in the calling thread, so a descendant that still
+    holds the pipe cannot keep anything blocked after run_python returns."""
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    eof = False
+    with selectors.DefaultSelector() as sel:
+        sel.register(fd, selectors.EVENT_READ)
+        while proc.poll() is None:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return True, eof
+            if eof:  # the program closed its output but still runs
+                try:
+                    proc.wait(timeout=left)
+                except subprocess.TimeoutExpired:
+                    return True, eof
+                break
+            if sel.select(min(left, 0.05)):
+                eof = _read_some(fd, take)
+    return False, eof
+
+
+def _read_some(fd: int, take) -> bool:
+    """One read of what the pipe holds now; True at end of file."""
+    try:
+        b = os.read(fd, 65536)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+    if not b:
+        return True
+    take(b)
+    return False
+
+
+def _finish_reading(fd: int, take, grace: float = 0.25) -> None:
+    """Collect what the exited runner left in the pipe; stop at end of file, or after `grace`
+    seconds without data (a surviving descendant may hold the write end forever)."""
+    end = time.perf_counter() + grace
+    with selectors.DefaultSelector() as sel:
+        sel.register(fd, selectors.EVENT_READ)
+        while True:
+            left = end - time.perf_counter()
+            if left <= 0 or not sel.select(left):
+                return
+            if _read_some(fd, take):
+                return
+
+
 def run_python(code: str, timeout: float = 10.0, memory_mb: int = 512, max_output: int = MAX_OUTPUT) -> ToolResult:
     """Run `code` in a fresh, resource-limited Python process and collect its result.
 
     The value is the variable ``answer`` if the code defines one, else the value of a
     trailing expression (notebook style), else the return value of ``solution()`` if
-    defined, else the variable assigned last at top level (extra["value_kind"] says which).
-    Values come back as JSON-compatible Python objects (or their repr).
+    defined and callable without arguments, else the variable assigned last at top level
+    (extra["value_kind"] says which). Values come back as JSON-compatible Python objects
+    (or their repr). memory_mb limits each process the program starts, not their sum.
     """
     t0 = time.perf_counter()
     workdir = tempfile.mkdtemp(prefix="borg-py-")
+    proc = None
     try:
         src = os.path.join(workdir, "program.py")
         out = os.path.join(workdir, ".result.json")
@@ -198,47 +338,54 @@ def run_python(code: str, timeout: float = 10.0, memory_mb: int = 512, max_outpu
         with open(runner, "w", encoding="utf-8") as f:
             f.write(_RUNNER)
         posix = sys.platform != "win32"
+        marker = uuid.uuid4().hex
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-I", runner, src, out, str(int(memory_mb or 0)),
-                 str(max(1, int(math.ceil(timeout))))],
-                cwd=workdir, env=_child_env(workdir), stdin=subprocess.DEVNULL,
+                 str(max(1, int(math.ceil(timeout)))), str(MAX_PROCESSES)],
+                cwd=workdir, env=_child_env(workdir, marker), stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=posix)
         except OSError as e:
             return ToolResult(ok=False, error=f"cannot start python: {e}", elapsed_s=time.perf_counter() - t0)
+        deadline = time.perf_counter() + timeout
 
-        # Drain the pipe in a thread, keeping only the head, so a print loop can neither
-        # block the child nor eat the parent's memory.
+        # Keep only the head of the output, so a print loop can neither block the child nor
+        # eat the parent's memory.
         chunks: list[bytes] = []
         state = {"kept": 0, "dropped": 0}
         cap = max_output * 4 + 16  # bytes; utf-8 is at most 4 per char
 
-        def drain():
-            assert proc.stdout is not None
-            while True:
-                b = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(65536)
-                if not b:
-                    break
-                room = cap - state["kept"]
-                if room > 0:
-                    chunks.append(b[:room])
-                    state["kept"] += min(room, len(b))
-                state["dropped"] += max(0, len(b) - max(room, 0))
+        def take(b: bytes) -> None:
+            room = cap - state["kept"]
+            if room > 0:
+                chunks.append(b[:room])
+                state["kept"] += min(room, len(b))
+            state["dropped"] += max(0, len(b) - max(room, 0))
 
-        reader = threading.Thread(target=drain, daemon=True)
-        reader.start()
-        timed_out = False
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill(proc)
-            proc.wait()
         if posix:
-            _kill(proc)  # reap anything the program forked into its session
-        reader.join(timeout=2.0)
-        if not reader.is_alive() and proc.stdout is not None:
-            proc.stdout.close()
+            timed_out, eof = _pump(proc, deadline, take)
+            _kill(proc)  # the group: on timeout the runner, always anything it forked
+            proc.wait()
+            _sweep(marker)  # descendants that left the group
+            if not eof:
+                _finish_reading(proc.stdout.fileno(), take)
+        else:  # pragma: no cover - Windows pipes cannot be select()ed: drain in a thread
+            def drain():
+                while True:
+                    b = proc.stdout.read1(65536)
+                    if not b:
+                        break
+                    take(b)
+            reader = threading.Thread(target=drain, daemon=True)
+            reader.start()
+            timed_out = False
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill(proc)
+                proc.wait()
+            reader.join(timeout=2.0)
         text = b"".join(chunks).decode("utf-8", errors="replace")
         truncated = state["dropped"] > 0 or len(text) > max_output
         if len(text) > max_output:
@@ -246,11 +393,13 @@ def run_python(code: str, timeout: float = 10.0, memory_mb: int = 512, max_outpu
         if truncated:
             text += "\n...[output truncated]"
 
-        res: dict = {}
+        res: Any = {}
         try:
             with open(out, encoding="utf-8") as f:
                 res = json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
+            res = {}
+        if not isinstance(res, dict):  # the program overwrote the side file: no result
             res = {}
         elapsed = time.perf_counter() - t0
         rc = proc.returncode
@@ -268,9 +417,14 @@ def run_python(code: str, timeout: float = 10.0, memory_mb: int = 512, max_outpu
                 reason = "MemoryError (memory limit)"
             return ToolResult(ok=False, stdout=text, error=reason or tail or f"exited with status {rc}",
                               elapsed_s=elapsed, extra={"returncode": rc})
-        return ToolResult(ok=bool(res.get("ok")), stdout=text, error=res.get("error"), value=res.get("value"),
-                          elapsed_s=elapsed, extra={"value_kind": res.get("kind"), "returncode": rc})
+        ok, error, kind = res.get("ok") is True, res.get("error"), res.get("kind")
+        if not isinstance(error, str):
+            error = None if ok else "malformed result"
+        return ToolResult(ok=ok, stdout=text, error=error, value=res.get("value"), elapsed_s=elapsed,
+                          extra={"value_kind": kind if isinstance(kind, str) else None, "returncode": rc})
     finally:
+        if proc is not None and proc.stdout is not None:
+            proc.stdout.close()
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -310,6 +464,8 @@ def _check(v):
 def _pow(a, b):
     if isinstance(b, Fraction) and b.denominator == 1:
         b = b.numerator
+    if a == 0 and b < 0:
+        raise CalculatorError("division by zero")
     if isinstance(a, (int, Fraction)) and isinstance(b, int):
         mag = abs(a) if isinstance(a, int) else max(abs(a.numerator), a.denominator)
         if mag > 1 and abs(b) * math.log2(mag) > _MAX_INT_BITS:
@@ -453,9 +609,18 @@ def calculator(expr: str) -> int | float:
         tree = ast.parse(s, mode="eval")
     except SyntaxError as e:
         raise CalculatorError(f"syntax error: {e.msg}") from e
-    v = _eval(tree)
-    if isinstance(v, Fraction):
-        v = v.numerator if v.denominator == 1 else float(v)
-    if isinstance(v, float) and v.is_integer() and abs(v) < 2 ** 53:
-        v = int(v)
+    except (ValueError, RecursionError, MemoryError) as e:  # null bytes, absurd nesting
+        raise CalculatorError(f"cannot parse: {e}") from e
+    # every failure is a CalculatorError (callers fall back to the model on it), including
+    # 0**-1 (ZeroDivisionError) and a huge exact value that does not fit a float (OverflowError)
+    try:
+        v = _eval(tree)
+        if isinstance(v, Fraction):
+            v = v.numerator if v.denominator == 1 else float(v)
+        if isinstance(v, float) and v.is_integer() and abs(v) < 2 ** 53:
+            v = int(v)
+    except CalculatorError:
+        raise
+    except (ArithmeticError, TypeError, ValueError, RecursionError) as e:
+        raise CalculatorError(f"arithmetic error: {e}") from e
     return v

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import tools
-from .reason import _strip_thinking, extract_answer
+from .reason import _escape_control, _strip_thinking, extract_answer
 
 __all__ = ["AgentResult", "Step", "run_agent", "AGENT_SYSTEM"]
 
@@ -34,6 +34,7 @@ AGENT_SYSTEM = (
 _OBSERVATION = "Output:\n```\n{output}\n```"
 _FINAL_RE = re.compile(r"final answer\s*[:：]\s*(.+)", re.I)
 _OPEN_FENCE = re.compile(r"```[ \t]*(?:python|py|python3)?[ \t]*\n", re.I)
+_MIN_TURN = 64  # context tokens a step needs to be worth starting
 
 
 @dataclass
@@ -51,7 +52,7 @@ class AgentResult:
     steps: list[Step] = field(default_factory=list)
     tokens: int = 0
     elapsed_s: float = 0.0
-    stop_reason: str = ""         # "final", "no_tool_call", "max_steps", "length"
+    stop_reason: str = ""         # "final", "no_tool_call", "max_steps", "length", "context"
 
 
 def _pending_code(text: str) -> str | None:
@@ -77,9 +78,11 @@ def run_agent(llm, question: str, max_steps: int = 5, max_tokens: int = 512, sys
     """Alternate model turns and Python executions until a final answer or max_steps.
 
     max_tokens bounds each model turn; observations are truncated so the conversation
-    stays well inside the context window of small models. code_first (default: when the
-    question involves calculation) starts the first turn inside a python block: small models
-    otherwise often state a guessed result instead of computing it.
+    stays inside the context window of small models, and if it still outgrows the window
+    the loop stops (stop_reason "context") and answers from the last program output.
+    code_first (default: when the question involves calculation) starts the first turn
+    inside a python block: small models otherwise often state a guessed result instead of
+    computing it.
     """
     if code_first is None:
         code_first = _needs_computation(question)
@@ -88,16 +91,27 @@ def run_agent(llm, question: str, max_steps: int = 5, max_tokens: int = 512, sys
     steps: list[Step] = []
     tokens = 0
     stops = ["\n```\n", "Output:\n```"] + list(llm.formatter.stop_strings())
+    n_ctx = int(getattr(llm, "n_ctx", 0) or 0)  # 0: unknown, no budgeting
     reason = "max_steps"
     text = ""
     for i in range(max_steps):
         prompt = llm.render(msgs, enable_thinking=enable_thinking)
         raw = "```python\n" if (i == 0 and code_first) else ""
+        toks = llm.tokenize(prompt + raw, add_bos=False)
+        if n_ctx and n_ctx - len(toks) - 1 < _MIN_TURN:
+            reason, text = "context", ""  # no room left for another step
+            break
         if raw and stream:
             stream(raw)
         budget = max_tokens
-        for _ in range(3):
-            g = llm.generate_tokens(llm.tokenize(prompt + raw, add_bos=False), max_tokens=budget,
+        for attempt in range(3):
+            if attempt:
+                toks = llm.tokenize(prompt + raw, add_bos=False)
+            if n_ctx:
+                budget = min(budget, n_ctx - len(toks) - 1)
+            if attempt and budget <= 0:  # the continuation no longer fits: keep what we have
+                break
+            g = llm.generate_tokens(toks, max_tokens=budget,
                                     temperature=temperature, seed=seed + i, stop=stops, stream=stream)
             tokens += len(g.tokens)
             budget -= len(g.tokens)
@@ -114,7 +128,13 @@ def run_agent(llm, question: str, max_steps: int = 5, max_tokens: int = 512, sys
         text = _strip_thinking(raw)
         code = _pending_code(text)
         final = _FINAL_RE.search(text)
-        if code is None or (final and final.start() > text.rfind("```")):
+        if code is not None:
+            # "Final Answer" inside the pending block (print('Final Answer:', x), a comment) is
+            # code, not the answer: only one after the block's closing fence ends the loop. The
+            # stop string usually removes that fence, which leaves the block open: run it.
+            close = text.find("```", list(_OPEN_FENCE.finditer(text))[-1].end())
+            final = next((m for m in _FINAL_RE.finditer(text) if 0 <= close < m.start()), None)
+        if code is None or final:
             reason = "final" if final else ("length" if g.stop_reason == "length" else "no_tool_call")
             steps.append(Step(thought=text.strip()))
             break
@@ -127,16 +147,22 @@ def run_agent(llm, question: str, max_steps: int = 5, max_tokens: int = 512, sys
         if not body.endswith("```"):
             body += "\n```"
         msgs.append({"role": "assistant", "content": body})
-        msgs.append({"role": "user", "content": _OBSERVATION.format(output=obs)})
+        # program output may echo files or web pages: it must not forge chat turns
+        msgs.append({"role": "user", "content": _OBSERVATION.format(output=_escape_control(llm, obs))})
     else:
         # out of steps: ask once more for the answer without tools
         msgs.append({"role": "user", "content": "Now give the final answer as: Final Answer: <answer>"})
         prompt = llm.render(msgs, enable_thinking=enable_thinking)
-        g = llm.generate_tokens(llm.tokenize(prompt, add_bos=False), max_tokens=min(128, max_tokens),
-                                temperature=0.0, stop=list(llm.formatter.stop_strings()), stream=stream)
-        tokens += len(g.tokens)
-        text = _strip_thinking(g.text)
-        steps.append(Step(thought=text.strip()))
+        toks = llm.tokenize(prompt, add_bos=False)
+        room = n_ctx - len(toks) - 1 if n_ctx else max_tokens
+        if n_ctx and room < 16:
+            reason, text = "context", ""
+        else:
+            g = llm.generate_tokens(toks, max_tokens=min(128, max_tokens, room),
+                                    temperature=0.0, stop=list(llm.formatter.stop_strings()), stream=stream)
+            tokens += len(g.tokens)
+            text = _strip_thinking(g.text)
+            steps.append(Step(thought=text.strip()))
     m = _FINAL_RE.findall(text)
     if m:
         answer = extract_answer("Answer: " + m[-1].strip(), numeric)

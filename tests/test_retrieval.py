@@ -1,8 +1,12 @@
 """Tests for superborg.retrieval: tokenizer, chunking and BM25 ranking."""
 from __future__ import annotations
 
+import json
 import math
 import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -147,6 +151,106 @@ def test_save_load_roundtrip(tmp_path):
     (tmp_path / "bad.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError):
         Index.load(str(tmp_path / "bad.json"))
+
+
+# ---- regressions from the adversarial review -------------------------------------------
+
+_RETRIEVAL_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "superborg", "retrieval.py")
+
+
+def _in_child(body: str, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    """Run `body` with superborg.retrieval loaded as `m`, under a 1 GiB address-space limit and
+    a timeout: the defects these tests guard against hang or eat memory without bound."""
+    script = textwrap.dedent("""
+        import importlib.util, os, sys
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+        except (ImportError, ValueError, OSError):
+            pass
+        spec = importlib.util.spec_from_file_location("borg_retrieval", sys.argv[1])
+        m = importlib.util.module_from_spec(spec); sys.modules["borg_retrieval"] = m; spec.loader.exec_module(m)
+    """) + textwrap.dedent(body)
+    return subprocess.run([sys.executable, "-c", script, _RETRIEVAL_PY, *args], capture_output=True, text=True,
+                          timeout=timeout)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo") or not os.path.exists("/dev/zero"), reason="needs FIFOs, /dev/zero")
+def test_add_path_skips_fifos_and_devices(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha beta", encoding="utf-8")
+    os.mkfifo(tmp_path / "inbox.txt")  # nobody writes: opening it for reading would block forever
+    os.symlink("/dev/zero", tmp_path / "notes.txt")  # reports size 0, never ends
+    os.mkfifo(tmp_path / "zfeed.txt")  # fed with more than max_bytes
+    out = _in_child("""
+        import threading
+        d = sys.argv[2]
+        def feed():
+            try:
+                with open(os.path.join(d, "zfeed.txt"), "w") as f:
+                    f.write("gamma " * 1000)
+            except OSError:
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+        idx = m.Index()
+        n = idx.add_path(d, max_bytes=1000)
+        print(n, sorted({os.path.basename(c.source) for c in idx.chunks}))
+    """, str(tmp_path))
+    assert out.returncode == 0, out.stderr[-500:]
+    assert out.stdout.strip() == "1 ['a.txt']"
+
+
+def test_add_path_reads_at_most_max_bytes(tmp_path):
+    (tmp_path / "big.txt").write_text("word " * 1000, encoding="utf-8")
+    (tmp_path / "small.txt").write_text("word", encoding="utf-8")
+    assert Index().add_path(str(tmp_path), max_bytes=100) == 1
+
+
+def test_invalid_chunk_sizes_are_rejected():
+    for kw in ({"chunk_size": 0}, {"chunk_size": -5}, {"chunk_size": 1.5}, {"overlap": -1}, {"k1": float("nan")},
+               {"b": -1}):
+        with pytest.raises(ValueError):
+            Index(**kw)
+    for size in (0, -3):
+        with pytest.raises(ValueError):
+            chunk_text("hello world", size)
+    assert Index(chunk_size=1).add_text("hi yo") > 0  # the smallest valid size still works
+
+
+def test_chunk_size_zero_cannot_loop_forever(tmp_path):
+    p = tmp_path / "zero.json"
+    p.write_text(json.dumps({"format": "superborg-bm25", "version": 1, "k1": 1.5, "b": 0.75, "chunk_size": 0,
+                             "overlap": 0, "chunks": []}), encoding="utf-8")
+    out = _in_child("""
+        results = []
+        for f in (lambda: m.Index.load(sys.argv[2]).add_text("hello world"),
+                  lambda: m.Index(chunk_size=0).add_text("hello world"),
+                  lambda: m.chunk_text("hello world", 0)):
+            try:
+                f()
+                results.append("ok")
+            except ValueError:
+                results.append("ValueError")
+        print(results)
+    """, str(p), timeout=20)
+    assert out.returncode == 0, out.stderr[-500:]
+    assert out.stdout.strip() == "['ValueError', 'ValueError', 'ValueError']"
+
+
+@pytest.mark.parametrize("content", [
+    "[]", "null", "\"x\"", '{"format": "superborg-bm25"}',
+    '{"format": "superborg-bm25", "k1": 1.5, "b": 0.75, "chunk_size": 800, "overlap": 150, "chunks": [{"text": 5, '
+    '"source": "a"}]}',
+    '{"format": "superborg-bm25", "k1": 1.5, "b": 0.75, "chunk_size": 800, "overlap": 150, "chunks": [7]}',
+    '{"format": "superborg-bm25", "k1": 1.5, "b": 0.75, "chunk_size": 800, "overlap": 150, "chunks": {}}',
+    '{"format": "superborg-bm25", "k1": "x", "b": 0.75, "chunk_size": 800, "overlap": 150, "chunks": []}',
+    '{"format": "superborg-bm25", "k1": 1.5, "b": 0.75, "chunk_size": 800, "overlap": 150, '
+    '"chunks": [{"text": "t", "source": "s", "line": "x"}]}',
+])
+def test_load_rejects_malformed_files_with_value_error(tmp_path, content):
+    p = tmp_path / "bad.json"
+    p.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError):
+        Index.load(str(p))
 
 
 def test_format_context_numbers_and_limits():
