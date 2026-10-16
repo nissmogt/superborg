@@ -242,6 +242,9 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 /* ---- narrow screens: stack chat above the visualization ---- */
 @media (max-width: 900px) {
   .app { height: auto; min-height: 100vh; }
+  .selbar { padding: 8px 0; }
+  .selbar .what { font-size: 12px; gap: 2px 8px; }
+  .selbar .what .tk { font-size: 13px; }
   .split { display: block; }
   .chat { height: 66vh; height: 66svh; min-height: 360px; border-right: 0; border-bottom: 1px solid var(--border); }
   .viz { overflow: visible; padding: 0 16px 28px; }
@@ -922,9 +925,10 @@ function renderSelbar(r) {
   if (!r) { w.replaceChildren(el("span", "", S.toks.length ? "" : "No token selected yet. Send a message, then click any reply token.")); return; }
   const tk = el("span", "tk");
   tk.append(visFrag(r.raw));
-  const parts = [tk, el("span", "", `reply ${r.turn.idx + 1} · token ${r.i + 1} · position ${r.pos + 1}`)];
+  const parts = [tk, el("span", "", `reply ${r.turn.idx + 1} · token ${r.i + 1} · pos ${r.pos + 1}`)];
   const p = el("span"); p.append("p ", el("b", "num", fmtP(r.prob)));
   const em = el("span");
+  em.title = "first layer where the logit lens ranks the chosen token first";
   em.append(r.emerge < 0 ? "never top-1 in the lens" : "top-1 from ", el("b", "", r.emerge < 0 ? "" : r.emerge === 0 ? "the embeddings" : `layer ${r.emerge}`));
   parts.push(p, em);
   w.replaceChildren(...parts);
