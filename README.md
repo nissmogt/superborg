@@ -149,11 +149,39 @@ ans = solve(llm, "If 3 pencils cost $0.75, how much do 20 pencils cost?", strate
 print(ans.answer, ans.strategy)
 ```
 
+## Activation viewer
+
+```sh
+python -m superborg ui qwen2.5-0.5b-q8_0.borg --open     # http://127.0.0.1:8765/
+```
+
+A chat on the left; on the right, for every generated token, what happened inside the
+model while it produced that token (`superborg/interp.py`, from one traced forward pass):
+
+* emergence map: the logit lens (final norm and unembedding applied to the residual stream
+  after each layer) as a layers × tokens heatmap of the probability of the token finally
+  chosen, with the first layer where it becomes the top prediction marked;
+* layer-by-layer readout: the lens's top prediction, and the chosen token's probability
+  and rank, after each layer;
+* the output distribution's top 5 and its entropy;
+* contributions: the norm of each layer's attention output and MLP output and of the
+  residual stream;
+* attention: the context tokens the query attended to most, per layer (mean over heads),
+  and every head's attention entropy;
+* the most strongly activated MLP neurons of the selected layer.
+
+Layer k is the residual stream after block k (0 is the embeddings). Click a token or a map
+cell to pin it; `--lens-stride N` traces the lens on every N-th layer for speed. The server
+binds to localhost, runs one generation at a time and rejects requests from other origins.
+With full tracing, generation ran at about 6 tok/s for Qwen2.5-0.5B and about 15 tok/s for
+SmolLM2-135M on 2 threads here (the lens projection through the full vocabulary costs more
+than the forward pass).
+
 ## In the browser
 
 The same C engine compiles to WebAssembly (`wasm/build.sh`, clang with the wasm32-wasi
 target) and runs in a Web Worker. `wasm/make_artifact.py` packages the chat and activation
-UI with the engine and a model as a static site:
+viewer above with the engine and a model as a static site:
 
 ```sh
 wasm/build.sh                    # build/borg.wasm (SIMD128, single thread)
@@ -234,7 +262,8 @@ command above with `--out` pointing at that file prints the table again without 
 
 ```
 engine/              C engine (borg.h is the public API)
-superborg/           Python package: engine binding, converter, chat, reasoning, server, CLI
+superborg/           Python package: engine binding, converter, chat, reasoning, server, UI, CLI
+superborg/web/       the activation viewer page (one HTML file)
 docs/FORMAT.md       the .borg file format
 docs/ARCHITECTURE.md design notes
 tests/               pytest suites (tokenizer parity, reference, engine, server, reasoning)
