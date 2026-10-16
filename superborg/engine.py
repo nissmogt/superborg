@@ -217,6 +217,7 @@ class Model:
         self.pool = pool or Pool(threads)
         self._nfc = bool(self.tokenizer_info.get("nfc"))
         self._piece_cache: dict[int, bytes] = {}
+        self._added_re = None  # splits text on added tokens (built lazily, for NFC models)
 
     def close(self):
         if getattr(self, "_m", None):
@@ -234,9 +235,24 @@ class Model:
         return self.header.get("source") or os.path.basename(self.path)
 
     # ---- tokenizer -------------------------------------------------------
+    def _normalize(self, text: str, special: bool) -> str:
+        """NFC-normalize like Hugging Face: only the text between added tokens, so a combining
+        mark after "<|im_end|>" cannot merge into the token's last character."""
+        if not special:
+            return unicodedata.normalize("NFC", text)
+        if self._added_re is None:
+            import re
+            pieces = sorted({self.token_bytes(i).decode("utf-8", "replace")
+                             for i in self.tokenizer_info.get("added_tokens", [])} - {""}, key=len, reverse=True)
+            self._added_re = re.compile("(" + "|".join(map(re.escape, pieces)) + ")") if pieces else False
+        if not self._added_re:
+            return unicodedata.normalize("NFC", text)
+        parts = self._added_re.split(text)
+        return "".join(p if i % 2 else unicodedata.normalize("NFC", p) for i, p in enumerate(parts))
+
     def tokenize(self, text: str, add_bos: bool | None = None, special: bool = True) -> list[int]:
         if self._nfc:
-            text = unicodedata.normalize("NFC", text)
+            text = self._normalize(text, special)
         data = text.encode("utf-8")
         cap = len(data) + 16
         bos = -1 if add_bos is None else int(bool(add_bos))

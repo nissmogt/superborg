@@ -194,8 +194,13 @@ static int load_tokenizer(borg_model *m, const json_value *tj, char *err, int er
     borg_tokenizer *t = &m->tok;
     const borg_tensor *off = model_find_tensor(m, "tokenizer.vocab_offsets");
     if (!off) { borg_set_err(err, errlen, "missing tokenizer tables"); return -1; }
-    t->n_vocab = (int)off->shape[0] - 1;
     const borg_tensor *mg = model_find_tensor(m, "tokenizer.merges");
+    if (off->ndim != 1 || off->shape[0] < 2 || off->shape[0] > (1 << 28) ||
+        (mg && (mg->ndim != 2 || mg->shape[1] != 3 || mg->shape[0] > (1 << 28)))) {
+        borg_set_err(err, errlen, "invalid tokenizer table shapes");
+        return -1;
+    }
+    t->n_vocab = (int)off->shape[0] - 1;
     t->n_merges = mg ? (int)mg->shape[0] : 0;
     t->vocab_off = (const uint32_t *)get_table(m, "tokenizer.vocab_offsets", DT_U32, t->n_vocab + 1, err, errlen);
     t->token_type = (const uint8_t *)get_table(m, "tokenizer.token_type", DT_U8, t->n_vocab, err, errlen);
@@ -208,7 +213,7 @@ static int load_tokenizer(borg_model *m, const json_value *tj, char *err, int er
     if (t->n_merges) {
         t->merges = (const uint32_t *)get_table(m, "tokenizer.merges", DT_U32, (int64_t)t->n_merges * 3, err, errlen);
         if (!t->merges) return -1;
-        for (int i = 0; i < t->n_merges * 3; i++)
+        for (int64_t i = 0; i < (int64_t)t->n_merges * 3; i++)
             if (t->merges[i] >= (uint32_t)t->n_vocab) { borg_set_err(err, errlen, "merge references unknown token"); return -1; }
     }
     t->byte_level = json_bool(json_get(tj, "byte_level"), 1);

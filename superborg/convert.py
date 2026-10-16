@@ -298,11 +298,12 @@ def convert_config(cfg: dict) -> tuple[str, dict]:
         raise ValueError(f"unsupported model_type {arch!r}; supported: {sorted(SUPPORTED_ARCHS)}")
     dim = cfg["hidden_size"]
     n_heads = cfg["num_attention_heads"]
-    head_dim = cfg.get("head_dim") or dim // n_heads
     act = cfg.get("hidden_act", "silu")
     if act not in ("silu", "gelu_pytorch_tanh"):
         raise ValueError(f"unsupported activation {act}")
-    rs = cfg.get("rope_scaling")
+    # transformers >= 5 keeps RoPE settings under "rope_parameters"
+    rp = cfg.get("rope_parameters") or {}
+    rs = cfg.get("rope_scaling") or (rp if rp.get("rope_type", "default") != "default" else None)
     rope_scaling = None
     if rs:
         kind = rs.get("rope_type", rs.get("type"))
@@ -319,6 +320,11 @@ def convert_config(cfg: dict) -> tuple[str, dict]:
             raise ValueError(f"unsupported rope_scaling type {kind}")
     if cfg.get("use_sliding_window"):
         raise ValueError("sliding-window attention is not supported")
+    max_seq_len = cfg.get("max_position_embeddings", 4096)
+    if arch == "mistral" and cfg.get("sliding_window"):
+        # full attention equals sliding-window attention while the sequence fits the window
+        max_seq_len = min(max_seq_len, int(cfg["sliding_window"]))
+    head_dim = cfg.get("head_dim") or (128 if arch == "qwen3" else dim // n_heads)
     out = {
         "dim": dim,
         "n_layers": cfg["num_hidden_layers"],
@@ -327,9 +333,9 @@ def convert_config(cfg: dict) -> tuple[str, dict]:
         "head_dim": head_dim,
         "hidden_dim": cfg["intermediate_size"],
         "vocab_size": cfg["vocab_size"],
-        "max_seq_len": cfg.get("max_position_embeddings", 4096),
+        "max_seq_len": max_seq_len,
         "norm_eps": float(cfg.get("rms_norm_eps", 1e-6)),
-        "rope_theta": float(cfg.get("rope_theta", 10000.0)),
+        "rope_theta": float(cfg.get("rope_theta", rp.get("rope_theta", 10000.0))),
         "rope_scaling": rope_scaling,
         "attn_bias": bool(arch == "qwen2" or cfg.get("attention_bias", False)),
         "qk_norm": arch == "qwen3",
@@ -450,19 +456,22 @@ def convert_tokenizer(model_dir: str, cfg: dict) -> tuple[dict, dict[str, tuple[
         if not byte_level and "Replace" not in kinds:
             raise ValueError("SentencePiece tokenizer without space replacement is not supported")
     if pretok == "metaspace":
-        pt = tj["pre_tokenizer"]
-        if pt.get("split", False):
-            raise ValueError("Metaspace with split=true is not supported")
-        scheme = pt.get("prepend_scheme", "always" if pt.get("add_prefix_space", True) else "never")
-        if scheme not in ("always", "first", "never"):
-            raise ValueError(f"unsupported Metaspace prepend_scheme {scheme}")
-        spm_prefix = scheme != "never"
-        pretok = "none"
+        # Metaspace prefixes differently from the Prepend normalizer (no extra "▁" before a
+        # leading space; "first" only at offset 0). Refuse rather than mis-tokenize.
+        raise ValueError("Metaspace pre-tokenizers are not supported yet (Mistral v0.3 / Llama-2 legacy=false style)")
     if not byte_level and pretok != "none":
         raise ValueError("inconsistent tokenizer: SentencePiece vocabulary with a regex pre-tokenizer")
 
     vocab: dict[str, int] = dict(model["vocab"])
     added = tj.get("added_tokens", [])
+    for a in added:
+        # the engine matches added tokens literally; these flags change that matching
+        if a.get("lstrip") or a.get("rstrip") or a.get("single_word"):
+            raise ValueError(f"added token {a['content']!r} uses lstrip/rstrip/single_word, which is not supported")
+        if a.get("normalized") and norm is not None:
+            raise ValueError(f"added token {a['content']!r} is matched after normalization, which is not supported")
+    if not model.get("byte_fallback") and model.get("unk_token") and not model.get("fuse_unk", False) and not byte_level:
+        raise ValueError("SentencePiece tokenizers without byte_fallback must fuse unknown tokens (fuse_unk)")
     for a in added:
         vocab.setdefault(a["content"], a["id"])
     n_vocab = max(max(vocab.values()), max((a["id"] for a in added), default=-1)) + 1

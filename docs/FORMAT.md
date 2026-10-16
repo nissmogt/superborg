@@ -23,6 +23,7 @@ data_start  tensor data; every tensor starts at data_start + offset, offset % 64
   "version": 1,
   "arch": "llama",                // informational: llama | mistral | qwen2 | qwen3
   "source": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "quant": "q8_0",                // quantization recipe, informational ("q4_1+imatrix" when calibrated)
   "config": {
     "dim": 576,                   // hidden size
     "n_layers": 30,
@@ -113,7 +114,9 @@ f16/f32.
   "unk_id": 0,
   "added_tokens": [0, 1, 2],   // ids matched verbatim in text when parse_special is on
   "chat_template": "...",      // raw Jinja template from tokenizer_config.json, or null
-  "chat_format": "chatml"      // chatml | llama3 | zephyr | qwen3 | plain (built-in fallback)
+  "chat_format": "chatml",     // chatml | llama3 | zephyr | qwen3 | plain (built-in fallback)
+  "n_vocab": 49152,            // informational: rows of tokenizer.vocab_offsets minus one
+  "n_merges": 48900            // informational: rows of tokenizer.merges
 }
 ```
 
