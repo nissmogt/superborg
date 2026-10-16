@@ -97,24 +97,41 @@ class TraceSession:
         return int(order[rng.choice(len(order), p=q)]), probs
 
     # ---- per-token payload --------------------------------------------------------
+    def lens_report(self, chosen: int) -> list[dict]:
+        """Logit lens of the traced token: per lens layer, the top tokens, and the probability
+        and rank of `chosen`.
+
+        Only a few entries of each row's softmax are reported, so the full distribution is never
+        materialized: a log-sum-exp per row (float32 exponentials, float64 sums) gives the
+        normalizer, and ranks compare logits. For a 150k vocabulary this is several times faster
+        than a float64 softmax of every row, with the same results to the reported precision."""
+        o = self.opt
+        layers = self.lens_layers()
+        z = self.llm.ctx.lens(layers)[:, : self.llm.model.n_vocab]   # [n_lens, V] float32 logits
+        n_vocab = z.shape[1]
+        k = max(1, min(o.lens_top, n_vocab))
+        zc = z[:, chosen].copy()
+        rank = (z > zc[:, None]).sum(axis=1)
+        top = np.argpartition(z, n_vocab - k, axis=1)[:, n_vocab - k:]
+        zt = np.take_along_axis(z, top, axis=1)
+        order = np.argsort(-zt, axis=1, kind="stable")
+        top = np.take_along_axis(top, order, axis=1)
+        zt = np.take_along_axis(zt, order, axis=1).astype(np.float64)
+        m = zt[:, :1]                                                  # row maxima
+        lse = m[:, 0] + np.log(np.exp(z - m.astype(np.float32)).sum(axis=1, dtype=np.float64))
+        p_top = np.exp(zt - lse[:, None])
+        p_chosen = np.exp(zc.astype(np.float64) - lse)
+        return [{"layer": li,
+                 "top": [[self.token_text(int(t)), round(float(p), 4)] for t, p in zip(top[j], p_top[j])],
+                 "p": round(float(p_chosen[j]), 5),
+                 "rank": int(rank[j])}
+                for j, li in enumerate(layers)]
+
     def token_report(self, chosen: int, probs: np.ndarray) -> dict:
         """Everything the trace says about the step that produced `chosen`."""
         o = self.opt
-        ctx = self.llm.ctx
-        tr = ctx.trace()
-        layers = self.lens_layers()
-        lens_logits = ctx.lens(layers)[:, : self.llm.model.n_vocab]
-        lp = _softmax(lens_logits)
-        lens = []
-        for li, row in zip(layers, lp):
-            top = np.argpartition(-row, o.lens_top)[: o.lens_top]
-            top = top[np.argsort(-row[top])]
-            lens.append({
-                "layer": li,
-                "top": [[self.token_text(int(t)), round(float(row[t]), 4)] for t in top],
-                "p": round(float(row[chosen]), 5),
-                "rank": int((row > row[chosen]).sum()),
-            })
+        tr = self.llm.ctx.trace()
+        lens = self.lens_report(chosen)
         norms = tr["norms"]
         resid_norm = np.linalg.norm(tr["resid"], axis=1)
         attn = tr["attn"]                      # [L, H, n_pos]

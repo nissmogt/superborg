@@ -1,0 +1,1664 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>superborg inside</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='14' height='14' rx='3' fill='%231c5cab'/%3E%3Crect x='4' y='9' width='2' height='3' fill='%23cde2fb'/%3E%3Crect x='7' y='6' width='2' height='6' fill='%2386b6ef'/%3E%3Crect x='10' y='4' width='2' height='8' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+/* ---- tokens: light (default), dark under prefers-color-scheme and [data-theme=dark] ---- */
+:root {
+  color-scheme: light;
+  --mode: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f2f1ed; --surface-3: #e8e7e1;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #65645f;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.10); --border-2: rgba(11,11,11,.18);
+  --accent: #2a78d6; --accent-ink: #1c5cab; --accent-fill: #1c5cab; --on-accent: #ffffff;
+  --accent-wash: rgba(42,120,214,.13);
+  --prob: #2a78d6; --attn: #eb6834; --mlp: #1baf7a; --resid: #52514e;
+  --good: #0ca30c; --critical: #d03b3b;
+  --shadow: 0 6px 24px rgba(11,11,11,.12);
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --mode: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #242422; --surface-3: #2f2f2c;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #9a9890;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10); --border-2: rgba(255,255,255,.18);
+    --accent: #3987e5; --accent-ink: #5598e7; --accent-fill: #3987e5; --on-accent: #0b0b0b;
+    --accent-wash: rgba(57,135,229,.20);
+    --prob: #3987e5; --attn: #d95926; --mlp: #199e70; --resid: #c3c2b7;
+    --good: #0ca30c; --critical: #e66767;
+    --shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --mode: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #242422; --surface-3: #2f2f2c;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #9a9890;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10); --border-2: rgba(255,255,255,.18);
+  --accent: #3987e5; --accent-ink: #5598e7; --accent-fill: #3987e5; --on-accent: #0b0b0b;
+  --accent-wash: rgba(57,135,229,.20);
+  --prob: #3987e5; --attn: #d95926; --mlp: #199e70; --resid: #c3c2b7;
+  --good: #0ca30c; --critical: #e66767;
+  --shadow: 0 6px 24px rgba(0,0,0,.5);
+}
+
+/* ---- base ---- */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 var(--font); overflow-x: hidden; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.tok, .mono { font-family: var(--mono); }
+.ws { color: var(--muted); }
+.special { color: var(--muted); font-style: italic; }
+.num { font-variant-numeric: tabular-nums; }
+
+.btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border-2); background: var(--surface);
+  border-radius: 7px; padding: 4px 10px; font-size: 13px; line-height: 20px; white-space: nowrap; }
+.btn:hover { background: var(--surface-2); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--accent-fill); color: var(--on-accent); border-color: transparent; font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.08); background: var(--accent-fill); }
+.btn.small { font-size: 12px; padding: 2px 8px; line-height: 18px; }
+.btn[aria-pressed="true"] { background: var(--accent-wash); border-color: var(--accent); }
+.seg { display: inline-flex; border: 1px solid var(--border-2); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 1px 8px; font-size: 12px; line-height: 18px; color: var(--ink-2); }
+.seg button + button { border-left: 1px solid var(--border-2); }
+.seg button[aria-pressed="true"] { background: var(--surface-3); color: var(--ink); font-weight: 600; }
+select.sel { border: 1px solid var(--border-2); background: var(--surface); border-radius: 6px; font-size: 12px; padding: 1px 4px; }
+
+/* ---- layout ---- */
+.app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+.topbar { flex: none; display: flex; align-items: center; gap: 14px; padding: 8px 16px; background: var(--surface);
+  border-bottom: 1px solid var(--border); min-width: 0; }
+.brand { font-weight: 650; white-space: nowrap; letter-spacing: -.01em; }
+.brand span { color: var(--muted); font-weight: 500; }
+.model { flex: 1; min-width: 0; font-size: 13px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.model b { color: var(--ink); font-weight: 600; }
+.status { font-size: 13px; color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 6px; }
+.status i { width: 8px; height: 8px; border-radius: 50%; background: var(--axis); display: inline-block; }
+.status.live i { background: var(--good); }
+.status.err { color: var(--critical); }
+.status.err i { background: var(--critical); }
+.status .prog { width: 64px; height: 4px; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
+.status .prog > b { display: block; height: 100%; background: var(--accent); }
+
+.split { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(340px, 5fr) minmax(0, 7fr); }
+.chat { min-height: 0; min-width: 0; display: flex; flex-direction: column; background: var(--surface); border-right: 1px solid var(--border); }
+.chat-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 12px 8px 16px; border-bottom: 1px solid var(--border); }
+.chat-head h1 { font-size: 14px; font-weight: 600; margin: 0; flex: 1; }
+.messages { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; overscroll-behavior: contain; }
+.composer { flex: none; display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px 12px; border-top: 1px solid var(--border); }
+.composer textarea { flex: 1; min-width: 0; resize: none; height: 40px; max-height: 200px; padding: 9px 12px; border-radius: 9px;
+  border: 1px solid var(--border-2); background: var(--page); line-height: 20px; }
+.composer .btn { height: 40px; min-width: 76px; justify-content: center; }
+.viz { min-width: 0; min-height: 0; overflow-y: auto; padding: 0 16px 28px; container-type: inline-size; container-name: viz; }
+
+/* ---- chat ---- */
+.intro { color: var(--ink-2); font-size: 13.5px; max-width: 46ch; margin: auto 0; align-self: center; text-align: center; }
+.intro p { margin: 0 0 12px; }
+.intro .sugg { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.intro .sugg .btn { justify-content: center; white-space: normal; text-align: center; }
+.msg { display: flex; flex-direction: column; min-width: 0; content-visibility: auto; contain-intrinsic-size: auto 60px; }
+.msg.user { align-items: flex-end; }
+.msg.user .bubble { background: var(--surface-2); border: 1px solid var(--border); border-radius: 14px 14px 4px 14px; padding: 8px 12px;
+  max-width: 88%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.asst .body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.62; font-size: 14.5px; min-height: 1.6em; }
+.msg .meta { font-size: 11.5px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.msg .pending { color: var(--muted); }
+.msg .err { color: var(--critical); font-size: 13px; margin-top: 4px; }
+.msg.failed .bubble { opacity: .6; }
+.t { border-radius: 3px; cursor: pointer; }
+.t:hover, .t.hov { background: var(--surface-3); }
+.t.sel { background: var(--accent-wash); box-shadow: 0 0 0 1px var(--accent); }
+.t.eos { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 0 3px; margin-left: 3px; border: 1px solid var(--grid); }
+.caret { display: inline-block; width: 7px; height: 1.05em; vertical-align: -2px; background: var(--axis); margin-left: 1px; }
+
+.pop-wrap { position: relative; }
+.popover { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: min(300px, calc(100vw - 32px)); background: var(--surface);
+  border: 1px solid var(--border-2); border-radius: 10px; box-shadow: var(--shadow); padding: 12px 14px; display: grid; gap: 10px; }
+.popover[hidden] { display: none; }
+.field { display: grid; gap: 4px; font-size: 13px; }
+.field > span { display: flex; justify-content: space-between; color: var(--ink-2); }
+.field output { color: var(--ink); font-variant-numeric: tabular-nums; }
+.field.row { grid-template-columns: 1fr 110px; align-items: center; }
+.field input[type=number] { width: 100%; border: 1px solid var(--border-2); background: var(--page); border-radius: 6px; padding: 3px 6px; }
+.field input[type=range] { width: 100%; accent-color: var(--accent); }
+.hint { margin: 0; font-size: 12px; color: var(--muted); }
+
+/* ---- visualization ---- */
+.selbar { position: sticky; top: 0; z-index: 6; background: var(--page); display: flex; align-items: center; gap: 10px 14px; padding: 10px 0;
+  min-width: 0; flex-wrap: wrap; }
+.selbar .what { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--ink-2); }
+.selbar .what .tk { font-family: var(--mono); font-size: 15px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 5px; padding: 0 6px; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+.selbar .what b { color: var(--ink); font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; }
+.s12 { grid-column: span 12; } .s7 { grid-column: span 7; } .s5 { grid-column: span 5; } .s8 { grid-column: span 8; } .s4 { grid-column: span 4; }
+.stack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+@container viz (max-width: 760px) { .s7, .s5, .s8, .s4 { grid-column: span 12; } }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; min-width: 0; position: relative; }
+.ph { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; min-height: 22px; }
+.ph h2 { font-size: 13px; font-weight: 600; margin: 0; }
+.ph .ctl { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.expl { margin: 2px 0 10px; font-size: 12px; color: var(--muted); }
+.empty { color: var(--muted); font-size: 12.5px; padding: 18px 0; text-align: center; }
+.empty[hidden] { display: none; }
+
+.map-scroll { overflow-x: auto; overflow-y: hidden; border-radius: 4px; scrollbar-width: thin; }
+.map-scroll:focus-visible { outline-offset: 0; }
+.map-spacer { position: relative; }
+.map-spacer canvas { position: sticky; left: 0; display: block; }
+.legend { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+.legend canvas { display: block; }
+.legend .key { display: inline-flex; align-items: center; gap: 5px; }
+.legend .dotkey { width: 9px; height: 9px; border-radius: 50%; background: var(--ink); border: 2px solid var(--surface); box-shadow: 0 0 0 1px var(--axis); }
+.legend .nakey { width: 12px; height: 9px; background: var(--grid); }
+.linekey { display: inline-block; width: 14px; height: 2px; border-radius: 1px; vertical-align: middle; }
+
+.rrow { display: grid; grid-template-columns: 40px minmax(0, 1fr) minmax(104px, 1.15fr) 66px; column-gap: 10px; align-items: center;
+  height: 18px; font-size: 12px; border-radius: 4px; cursor: pointer; }
+.rrow:hover { background: var(--surface-2); }
+.rrow.head { cursor: default; color: var(--muted); font-size: 11px; height: 20px; border-bottom: 1px solid var(--grid); border-radius: 0; margin-bottom: 2px; }
+.rrow.head:hover { background: none; }
+.rrow .ly { text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; position: relative; }
+.rrow.emerge { background: var(--accent-wash); }
+.rrow.emerge .ly::before { content: "\25CF"; position: absolute; left: 2px; color: var(--ink); font-size: 9px; top: 1px; }
+.rrow.lsel { background: var(--surface-3); }
+.rrow.lsel .ly { color: var(--ink); font-weight: 700; }
+.rrow .lt { min-width: 0; white-space: pre; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); color: var(--ink-2); }
+.rrow .lt.match { color: var(--ink); font-weight: 600; }
+.rrow .lt small { font-family: var(--font); color: var(--muted); font-weight: 400; margin-left: 6px; font-size: 11px; }
+.pcell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.bar { flex: 1; min-width: 20px; height: 8px; background: var(--surface-2); border-radius: 0 4px 4px 0; overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--prob); border-radius: 0 4px 4px 0; }
+.pcell .v { width: 50px; text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); font-size: 11.5px; }
+.rrow .rk { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.rrow .rk.first { color: var(--ink); font-weight: 600; }
+
+.orow { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(64px, 1fr) 56px; gap: 10px; align-items: center; height: 22px; font-size: 12.5px; }
+.orow .tc { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.orow .tok { white-space: pre; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.orow.chosen .tok { font-weight: 650; }
+.orow .tag { flex: none; font-size: 10.5px; color: var(--muted); }
+.orow .v { text-align: right; font-variant-numeric: tabular-nums; }
+.stats { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
+.stats b { color: var(--ink); font-weight: 600; }
+
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--ink-2); align-items: center; }
+.cv-box { position: relative; min-width: 0; }
+.cv-box canvas { display: block; }
+
+.attn-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; }
+@container viz (max-width: 560px) { .attn-wrap { grid-template-columns: minmax(0, 1fr); } }
+.chips { position: relative; max-height: 196px; overflow-y: auto; padding: 6px; border: 1px solid var(--grid); border-radius: 6px;
+  background: var(--page); font-family: var(--mono); font-size: 11.5px; line-height: 21px; overscroll-behavior: contain; }
+.chip { display: inline-block; max-width: 100%; padding: 0 3px; margin: 0 1px; border-radius: 3px; line-height: 18px; white-space: pre-wrap;
+  word-break: break-all; vertical-align: top; }
+.chip.q { box-shadow: 0 0 0 1.5px var(--ink); }
+.chip.out { box-shadow: inset 0 -2px 0 var(--accent); }
+.chip.future { opacity: .32; }
+.chip.flash { box-shadow: 0 0 0 2px var(--accent); }
+.toplist { margin-top: 10px; }
+.arow { display: grid; grid-template-columns: 44px minmax(0, 1fr) minmax(70px, 1fr) 50px; gap: 8px; align-items: center; height: 19px;
+  font-size: 12px; cursor: pointer; border-radius: 4px; }
+.arow:hover { background: var(--surface-2); }
+.arow .ps { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.arow .tok { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.arow .bar > i { background: var(--attn); }
+.arow .v { text-align: right; font-variant-numeric: tabular-nums; }
+.ent-side { min-width: 0; }
+.ent-side .ph { margin-bottom: 4px; }
+
+.mrow { display: grid; grid-template-columns: minmax(64px, auto) minmax(60px, 1fr) 54px; gap: 8px; align-items: center; height: 22px; font-size: 12px; }
+.mrow .id { font-family: var(--mono); color: var(--ink-2); white-space: nowrap; }
+.mrow .id b { color: var(--ink); font-weight: 600; }
+.dbar { position: relative; height: 10px; }
+.dbar::before { content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--axis); }
+.dbar > i { position: absolute; top: 0; bottom: 0; background: var(--mlp); }
+.dbar > i.pos { left: calc(50% + 1px); border-radius: 0 4px 4px 0; }
+.dbar > i.neg { right: calc(50% + 1px); border-radius: 4px 0 0 4px; }
+.mrow .v { text-align: right; font-variant-numeric: tabular-nums; }
+
+.tip { position: fixed; z-index: 50; pointer-events: none; max-width: 320px; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border-2); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: var(--shadow); }
+.tip[hidden] { display: none; }
+.tip .h { color: var(--ink-2); margin-bottom: 4px; }
+.tip .v { font-weight: 650; font-variant-numeric: tabular-nums; }
+.tip .r { display: flex; gap: 10px; justify-content: space-between; font-variant-numeric: tabular-nums; }
+.tip .r .tok { white-space: pre; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.tip .s { color: var(--muted); margin-top: 4px; }
+
+/* ---- narrow screens: stack chat above the visualization ---- */
+@media (max-width: 900px) {
+  .app { height: auto; min-height: 100vh; }
+  .split { display: block; }
+  .chat { height: 76vh; height: 76svh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .viz { overflow: visible; padding: 0 16px 28px; }
+  .topbar { gap: 10px; padding: 8px 16px; flex-wrap: wrap; }
+  .model { order: 3; flex-basis: 100%; font-size: 12px; }
+  .status { margin-left: auto; }
+}
+@media (prefers-reduced-motion: no-preference) { .chip, .t { transition: background-color .08s linear; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">superborg <span>inside</span></div>
+    <div class="model" id="modelInfo">connecting…</div>
+    <div class="status" id="status"><i></i><span id="statusText">connecting</span></div>
+    <button class="btn small" id="themeBtn" type="button" title="Colour theme: follows the system, or forced light or dark">Theme: auto</button>
+  </header>
+  <main class="split">
+    <section class="chat" aria-label="Chat">
+      <div class="chat-head">
+        <h1>Chat</h1>
+        <button class="btn" id="newBtn" type="button" title="Start a new conversation">New chat</button>
+        <div class="pop-wrap">
+          <button class="btn" id="setBtn" type="button" aria-expanded="false" aria-controls="settings">Settings</button>
+          <div class="popover" id="settings" role="dialog" aria-label="Generation settings" hidden>
+            <label class="field"><span>Temperature <output id="oTemp"></output></span>
+              <input type="range" id="sTemp" min="0" max="2" step="0.05"></label>
+            <label class="field"><span>Top-p <output id="oTopP"></output></span>
+              <input type="range" id="sTopP" min="0.05" max="1" step="0.01"></label>
+            <label class="field row"><span>Max tokens</span><input type="number" id="sMax" min="1" step="1"></label>
+            <label class="field row"><span>Seed</span><input type="number" id="sSeed" min="0" step="1"></label>
+            <label class="field row"><span>Lens stride</span><input type="number" id="sStride" min="1" step="1"></label>
+            <p class="hint">Temperature 0 is greedy decoding: the chosen token is always the output's top-1. Lens stride N traces the logit lens on every N-th layer only (faster; the last layer is always traced).</p>
+            <div><button class="btn small" id="sReset" type="button">Reset to defaults</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="messages" id="messages"></div>
+      <form class="composer" id="composer" autocomplete="off">
+        <textarea id="input" rows="1" aria-label="Message" placeholder="Message the model (Enter sends, Shift+Enter adds a line)"></textarea>
+        <button type="submit" class="btn primary" id="sendBtn">Send</button>
+      </form>
+    </section>
+
+    <section class="viz" id="viz" aria-label="Inside the model">
+      <div class="selbar">
+        <div class="what" id="selWhat"><span>No token selected yet.</span></div>
+        <button class="btn small" id="followBtn" type="button" aria-pressed="true"
+          title="Follow live: always show the newest token. Click a token or a map column to pin one instead.">Following live</button>
+      </div>
+      <div class="grid">
+        <div class="panel s12" id="pMap">
+          <div class="ph">
+            <h2>Emergence map</h2>
+            <div class="ctl">
+              <div class="seg" role="group" aria-label="Column width">
+                <button type="button" data-mapmode="words" aria-pressed="true" title="Columns as wide as their token text">Words</button>
+                <button type="button" data-mapmode="compact" aria-pressed="false" title="Narrow columns: more tokens at once">Compact</button>
+              </div>
+              <div class="seg" role="group" aria-label="Colour scale">
+                <button type="button" data-mapscale="linear" aria-pressed="true" title="Colour proportional to probability">p</button>
+                <button type="button" data-mapscale="log" aria-pressed="false" title="Colour by log10 probability, 1e-5 to 1: shows weak early signal">log p</button>
+              </div>
+            </div>
+          </div>
+          <p class="expl">Logit lens: what the model would predict if it stopped after each layer. Columns are reply tokens, rows are layers (embeddings at the bottom, output at the top); colour is the probability the lens gives the token the model finally chose.</p>
+          <div class="map-scroll" id="mapScroll" tabindex="0" aria-label="Emergence map. Arrow keys: left and right choose a token, up and down a layer.">
+            <div class="map-spacer" id="mapSpacer"><canvas id="mapCanvas"></canvas></div>
+          </div>
+          <div class="legend">
+            <canvas id="mapLegend" width="200" height="26" aria-label="Colour scale"></canvas>
+            <span class="key"><span class="dotkey"></span>first layer where the chosen token is the top-1 prediction</span>
+            <span class="key"><span class="nakey"></span>layer not traced (lens stride)</span>
+          </div>
+        </div>
+
+        <div class="panel s7" id="pRead">
+          <div class="ph"><h2>Layer-by-layer readout</h2></div>
+          <p class="expl">For the selected token: the lens's top prediction after each layer, and the chosen token's probability and rank there. Click a row to inspect that layer's attention and MLP.</p>
+          <div class="rrow head" aria-hidden="true"><span class="ly">layer</span><span>lens top-1</span><span>p(chosen)</span><span class="rk">rank</span></div>
+          <div id="readRows" role="table" aria-label="Logit lens per layer"></div>
+          <div class="empty" id="readEmpty">Send a message to see each layer's prediction.</div>
+        </div>
+
+        <div class="stack s5">
+          <div class="panel" id="pOut">
+            <div class="ph"><h2>Output distribution</h2></div>
+            <p class="expl">The model's final probabilities for this step: the top 5 tokens.</p>
+            <div id="outRows"></div>
+            <div class="stats" id="outStats"></div>
+            <div class="empty" id="outEmpty">No token yet.</div>
+          </div>
+          <div class="panel" id="pContrib">
+            <div class="ph">
+              <h2>Contributions</h2>
+              <div class="ctl">
+                <div class="seg" role="group" aria-label="Scale">
+                  <button type="button" data-normscale="log" aria-pressed="true">log</button>
+                  <button type="button" data-normscale="linear" aria-pressed="false">linear</button>
+                </div>
+              </div>
+            </div>
+            <p class="expl">How much each layer writes into the residual stream (L2 norm of its attention and MLP outputs), and the size of the stream itself.</p>
+            <div class="chart-legend"><span><span class="linekey" style="background:var(--attn)"></span> attention out</span><span><span class="linekey" style="background:var(--mlp)"></span> MLP out</span><span><span class="linekey" style="background:var(--resid)"></span> residual</span></div>
+            <div class="cv-box" id="contribBox"><canvas id="contribCanvas" aria-label="Per-layer norms"></canvas></div>
+          </div>
+        </div>
+
+        <div class="panel s8" id="pAttn">
+          <div class="ph">
+            <h2>Attention</h2>
+            <div class="ctl"><label class="sr-only" for="layerSel">Layer</label><select class="sel" id="layerSel"><option value="0">All layers (mean)</option></select></div>
+          </div>
+          <p class="expl">Where the selected token's query looked, averaged over heads: shade is the attention weight on each context token (the 8 strongest positions are recorded per layer). Outlined: the query position.</p>
+          <div class="attn-wrap">
+            <div style="min-width:0">
+              <div class="chips" id="chips" aria-label="Context tokens shaded by attention"></div>
+              <div class="legend"><canvas id="attnLegend" width="180" height="26" aria-label="Attention weight scale"></canvas></div>
+              <div class="toplist" id="attnTop"></div>
+            </div>
+            <div class="ent-side">
+              <div class="ph"><h2>Head entropy</h2></div>
+              <p class="expl" style="max-width:24ch">Per layer and head. Dark: sharp (attends to few tokens); light: diffuse. Click a row to pick the layer.</p>
+              <div class="cv-box" id="entBox"><canvas id="entCanvas" aria-label="Attention entropy per layer and head"></canvas></div>
+            </div>
+          </div>
+          <div class="empty" id="attnEmpty" hidden>No token yet.</div>
+        </div>
+
+        <div class="panel s4" id="pMlp">
+          <div class="ph"><h2>MLP neurons</h2><span class="expl" style="margin:0" id="mlpLayer"></span></div>
+          <p class="expl">The most strongly activated hidden units of the selected layer, with their signed activations.</p>
+          <div id="mlpRows"></div>
+          <div class="empty" id="mlpEmpty">No token yet.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="tip" id="tip" hidden></div>
+<div class="sr-only" aria-live="polite" id="announce"></div>
+
+<script>
+"use strict";
+/* ============================================================================================
+   Transport: all I/O with the engine goes through this object, so the same page can run
+   against the HTTP server (python -m superborg ui) or an in-browser engine. A page can set
+   window.BORG_TRANSPORT in an earlier <script> tag; otherwise the HTTP transport is used.
+     info()               -> Promise<object>   model facts (GET /api/info)
+     chat(body, onEvent)  -> Promise<void>     streams "prompt" | "token" | "done" | "error" events,
+                                               resolves after "done" or "error"
+     stop()               -> Promise<void>     cancel the running generation
+     onStatus(cb)         (optional)           cb({text, progress}) while the engine gets ready
+   ============================================================================================ */
+const BORG = window.BORG_TRANSPORT || (function httpTransport() {
+  let ctrl = null;
+  async function errorOf(res) {
+    let message = `HTTP ${res.status}`, code = null;
+    try { const j = await res.json(); if (j && j.error) { message = j.error.message || message; code = j.error.code || j.error.type || null; } }
+    catch (e) { /* not JSON */ }
+    return { type: "error", message, status: res.status, code };
+  }
+  return {
+    name: "http",
+    async info() {
+      const res = await fetch("api/info", { cache: "no-store" });
+      if (!res.ok) throw new Error((await errorOf(res)).message);
+      return res.json();
+    },
+    async chat(body, onEvent) {
+      ctrl = new AbortController();
+      let res;
+      try {
+        res = await fetch("api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+                                        body: JSON.stringify(body), signal: ctrl.signal });
+      } catch (e) {
+        onEvent({ type: "error", message: e.name === "AbortError" ? "cancelled" : `cannot reach the server (${e.message})`, aborted: e.name === "AbortError" });
+        return;
+      }
+      if (!res.ok) { onEvent(await errorOf(res)); return; }
+      const reader = res.body.getReader(), dec = new TextDecoder();
+      let buf = "", ended = false;
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let cut;
+          while ((cut = buf.indexOf("\n\n")) >= 0) {
+            const block = buf.slice(0, cut);
+            buf = buf.slice(cut + 2);
+            for (const line of block.split("\n")) {
+              if (!line.startsWith("data: ")) continue;
+              const ev = JSON.parse(line.slice(6));
+              if (ev.type === "done" || ev.type === "error") ended = true;
+              onEvent(ev);
+            }
+          }
+        }
+        if (!ended) onEvent({ type: "error", message: "the stream ended without a result" });
+      } catch (e) {
+        if (!ended) onEvent({ type: "error", message: e.name === "AbortError" ? "cancelled" : `the stream broke off (${e.message})`, aborted: e.name === "AbortError" });
+      } finally {
+        ctrl = null;
+      }
+    },
+    async stop() {
+      try {
+        const res = await fetch("api/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch (e) {
+        if (ctrl) ctrl.abort();  // closing the stream cancels the generation too
+      }
+    },
+  };
+})();
+
+(() => {
+/* ---------------------------------------------------------------- helpers */
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const MONO = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+const MONO_B = '600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+const SANS = '10.5px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+const DPR = () => clamp(window.devicePixelRatio || 1, 1, 3);
+const WS = { " ": "·", "\n": "↵", "\t": "→", "\r": "␍" };
+const vis = (s) => (s === "" ? "∅" : s.replace(/[ \n\t\r]/g, (c) => WS[c]));
+const isSpecial = (s) => /^<\|[^|]{1,40}\|>$/.test(s) || /^<\/?s>$/.test(s);
+function visFrag(s) {
+  const f = document.createDocumentFragment();
+  if (s === "") { f.append(el("span", "ws", "∅")); return f; }
+  if (isSpecial(s)) { f.append(el("span", "special", s)); return f; }
+  let run = "";
+  for (const ch of s) {
+    const g = WS[ch];
+    if (g) { if (run) { f.append(run); run = ""; } f.append(el("span", "ws", g)); }
+    else run += ch;
+  }
+  if (run) f.append(run);
+  return f;
+}
+function setTok(node, s) { if (node._s !== s) { node._s = s; node.replaceChildren(visFrag(s)); } }
+function setText(node, s) { if (node.textContent !== s) node.textContent = s; }
+function fmtP(p, floor = 1e-5) {
+  if (!(p > 0)) return "<" + (floor >= 1e-4 ? "1e-4" : "1e-5");
+  if (p >= 0.01) return p.toFixed(3);
+  if (p >= 0.001) return p.toFixed(4);
+  return p.toExponential(1).replace("e-", "e−");
+}
+const fmtN = (v) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2));
+const fmtInt = (n) => n.toLocaleString("en-US");
+
+/* ---------------------------------------------------------------- colour (OKLab ramps) */
+const hexRgb = (h) => { h = h.trim().replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255); };
+const lin = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+const delin = (c) => (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055);
+function toLab(rgb) {
+  const [r, g, b] = rgb.map(lin);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+          1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+          0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s];
+}
+function fromLab([L, a, b]) {
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+  return [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+          -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+          -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s].map((c) => clamp(delin(c), 0, 1));
+}
+const lch = (L, C, h) => [L, C * Math.cos(h * Math.PI / 180), C * Math.sin(h * Math.PI / 180)];
+const hueOf = (hex) => { const [, a, b] = toLab(hexRgb(hex)); return Math.atan2(b, a) * 180 / Math.PI; };
+const relLum = (rgb) => { const [r, g, b] = rgb.map(lin); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+/* A 256-step lookup table along the OKLab polyline through `stops`, parameterized by arc length so that
+   equal value steps are equal perceptual steps. `on` holds a readable text colour for each step. */
+function ramp(stops) {
+  const labs = stops.map((s) => (typeof s === "string" ? toLab(hexRgb(s)) : s));
+  const seg = [];
+  let total = 0;
+  for (let i = 1; i < labs.length; i++) { const d = Math.hypot(...labs[i].map((v, j) => v - labs[i - 1][j])); seg.push(d); total += d; }
+  const css = [], on = [], lum = [];
+  for (let k = 0; k < 256; k++) {
+    let t = total * k / 255, i = 0;
+    while (i < seg.length - 1 && t > seg[i]) { t -= seg[i]; i++; }
+    const f = seg[i] > 0 ? clamp(t / seg[i], 0, 1) : 0;
+    const lab = labs[i].map((v, j) => v + (labs[i + 1][j] - v) * f);
+    const rgb = fromLab(lab);
+    css.push(`rgb(${rgb.map((c) => Math.round(c * 255)).join(",")})`);
+    const Y = relLum(rgb);
+    lum.push(Y);
+    on.push((1.05) / (Y + 0.05) >= (Y + 0.05) / 0.0535 ? "#ffffff" : "#0b0b0b");
+  }
+  return { css, on, lum, at: (t) => (Number.isFinite(t) ? Math.round(clamp(t, 0, 1) * 255) : 0) };
+}
+
+let C = {};            // resolved colour tokens
+let LENS, ATT, ENT;    // ramps
+function readColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (n) => cs.getPropertyValue(n).trim();
+  C = { mode: v("--mode"), page: v("--page"), surface: v("--surface"), surface2: v("--surface-2"), surface3: v("--surface-3"),
+        ink: v("--ink"), ink2: v("--ink-2"), muted: v("--muted"), grid: v("--grid"), axis: v("--axis"), accent: v("--accent"),
+        wash: v("--accent-wash"), prob: v("--prob"), attn: v("--attn"), mlp: v("--mlp"), resid: v("--resid") };
+  const dark = C.mode === "dark";
+  const h = hueOf(C.attn);
+  if (!dark) {
+    // documented blue sequential steps 100..700, from a near-surface neutral
+    LENS = ramp(["#f0efec", "#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]);
+    ATT = ramp([lch(0.965, 0.012, h), lch(0.86, 0.075, h), toLab(hexRgb(C.attn)), lch(0.47, 0.13, h)]);
+    ENT = ramp(["#f0efec", "#c3c2b7", "#898781", "#52514e", "#2a2a28"]);
+  } else {
+    // flipped anchor: low values recede into the dark surface, high values are bright
+    LENS = ramp(["#232322", "#0d366b", "#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4", "#cde2fb"]);
+    ATT = ramp([lch(0.255, 0.012, h), lch(0.40, 0.10, h), toLab(hexRgb(C.attn)), lch(0.86, 0.08, h)]);
+    ENT = ramp(["#262624", "#383835", "#62615c", "#898781", "#c3c2b7", "#f0efec"]);
+  }
+}
+const lensT = (p) => (S.prefs.mapScale === "log" ? (Math.log10(Math.max(p, 1e-5)) + 5) / 5 : p);
+const attT = (w) => Math.sqrt(Math.max(0, w));
+
+/* ---------------------------------------------------------------- state */
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? Object.assign({}, d, JSON.parse(v)) : Object.assign({}, d); } catch (e) { return Object.assign({}, d); } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } },
+};
+const SETTINGS0 = { temperature: 0, top_p: 1, max_tokens: 512, seed: 0, lens_stride: 0 };  // lens_stride 0: server default
+const PREFS0 = { mapMode: "words", mapScale: "linear", normScale: "log", theme: "auto" };
+const S = {
+  info: null, nL: 0, nH: 0, ready: false,
+  history: [], turns: [], toks: [],
+  sel: -1, follow: true, layer: 0,
+  generating: false, session: 0, rate: [], lastDone: null,
+  hoverK: -1, hoverL: -1, contribHover: -1, entHover: null,
+  mapW: 0, mapStick: true, chatStick: true, revealMap: false, revealText: false,
+  mapX: 0, mapApplied: 0, mapTotal: 0, mapViewW: 0, contribW: 0, chipsStick: true, pendChips: null, pendText: null,
+  chipsTurn: null, chipEls: [], chipShaded: [], qEl: null, outEl: null, futureFrom: 0,
+  readKey: "", readRows: [],
+  settings: store.get("superborg.ui.settings", SETTINGS0),
+  prefs: store.get("superborg.ui.prefs", PREFS0),
+};
+window.__superborg = S;  // for debugging from the console
+
+/* ---------------------------------------------------------------- frame scheduling */
+let dirty = {}, rafId = 0;
+function invalidate(...parts) { for (const p of parts) dirty[p] = true; if (!rafId) rafId = requestAnimationFrame(frame); }
+function frame() {
+  rafId = 0;
+  const d = dirty; dirty = {};
+  const r = S.sel >= 0 ? S.toks[S.sel] : null;
+  const all = d.sel || d.layer || d.theme;
+  const prof = S.profile;  // set window.__superborg.profile = {} to collect per-phase times (ms)
+  const run = prof ? (name, fn) => { const t = performance.now(); fn(); prof[name] = (prof[name] || 0) + performance.now() - t; } : (name, fn) => fn();
+  // canvases first: setting a canvas font resolves style, which is cheap only before this frame's DOM changes
+  if (d.map || all) run("map", drawMap);
+  if (all || d.contrib) run("contrib", () => drawContrib(r));
+  if (all || d.ent) run("entropy", () => drawEnt(r));
+  if (d.theme || d.legend) drawLegends();
+  if (all) {
+    run("selbar", () => renderSelbar(r)); run("readout", () => renderReadout(r)); run("output", () => renderOutput(r));
+    run("attention", () => renderAttention(r)); run("mlp", () => renderMlp(r)); run("transcript", markTranscript);
+  }
+  if (d.status) run("status", renderStatus);
+  // Scroll writes last, after every DOM change of this frame: they need layout, and done here the
+  // browser lays out once per frame instead of once per panel. Scroll offsets are never read back
+  // (that would force layout too); user scrolls are tracked by trackUserScroll.
+  run("scroll", () => applyScrolls(d.chat || d.sel));
+}
+function applyScrolls(chatChanged) {
+  if (S.mapX !== S.mapApplied) { mapScroll.scrollLeft = S.mapX; S.mapApplied = S.mapX; }
+  const chips = $("chips");
+  if (S.pendChips === "bottom") chips.scrollTop = 1e9;
+  else if (S.pendChips) chips.scrollTop = Math.max(0, S.pendChips.offsetTop - chips.clientHeight / 2);
+  S.pendChips = null;
+  if (S.pendText) {
+    const top = S.pendText.offsetTop - msgs.offsetTop;
+    if (top < msgs.scrollTop + 8 || top > msgs.scrollTop + msgs.clientHeight - 40) msgs.scrollTop = Math.max(0, top - msgs.clientHeight / 2);
+    S.pendText = null;
+  } else if (chatChanged && S.chatStick) msgs.scrollTop = 1e9;
+}
+/* Scroll positions changed by the user (wheel, touch, scrollbar, keys) are read in the scroll event;
+   the page's own scrolling is not, so following live never forces an extra layout. */
+function trackUserScroll(elm, onUser) {
+  let t = -1e9;
+  const mark = () => { t = performance.now(); };
+  for (const ev of ["wheel", "touchstart", "touchmove", "pointerdown", "keydown"]) elm.addEventListener(ev, mark, { passive: true });
+  elm.addEventListener("scroll", () => { if (performance.now() - t < 1500) onUser(); }, { passive: true });
+}
+
+/* ---------------------------------------------------------------- tooltip */
+const tip = $("tip");
+function showTip(x, y, build) {
+  tip.replaceChildren();
+  build(tip);
+  tip.hidden = false;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let left = x + 14, top = y + 16;
+  if (left + w > window.innerWidth - 8) left = Math.max(8, x - w - 14);
+  if (top + h > window.innerHeight - 8) top = Math.max(8, y - h - 12);
+  tip.style.left = left + "px"; tip.style.top = top + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+function tipRow(parent, left, right, tokLeft = false) {
+  const r = el("div", "r");
+  const a = el("span", tokLeft ? "tok" : "");
+  if (tokLeft) a.append(visFrag(left)); else a.textContent = left;
+  r.append(a, el("span", "v", right));
+  parent.append(r);
+}
+
+/* ---------------------------------------------------------------- canvas helper */
+function sizeCanvas(cv, w, h) {
+  const d = DPR();
+  const W = Math.round(w * d), H = Math.round(h * d);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; cv.style.width = w + "px"; cv.style.height = h + "px"; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  return ctx;
+}
+const measureCtx = document.createElement("canvas").getContext("2d");
+
+/* ---------------------------------------------------------------- ingest */
+function addToken(turn, ev) {
+  const nL = S.nL, nH = S.nH;
+  const P = new Float32Array(nL + 1).fill(NaN), R = new Int32Array(nL + 1).fill(-1), top = new Array(nL + 1).fill(null);
+  for (const e of ev.lens || []) {
+    if (e.layer < 0 || e.layer > nL) continue;
+    P[e.layer] = e.p; R[e.layer] = e.rank; top[e.layer] = e.top;
+  }
+  let emerge = -1;
+  for (let l = 0; l <= nL; l++) if (R[l] === 0) { emerge = l; break; }
+  const at = ev.attn_top || [];
+  const aK = at.length ? at[0].length : 0;
+  const aPos = new Int32Array(nL * aK), aW = new Float32Array(nL * aK);
+  at.forEach((row, l) => row.forEach(([p, w], j) => { if (j < aK) { aPos[l * aK + j] = p; aW[l * aK + j] = w; } }));
+  const ent = new Float32Array(nL * nH);
+  (ev.attn_entropy || []).forEach((row, l) => row.forEach((v, h) => { if (h < nH) ent[l * nH + h] = v; }));
+  const mt = ev.mlp_top || [];
+  const mK = mt.length ? mt[0].length : 0;
+  const mId = new Int32Array(nL * mK), mV = new Float32Array(nL * mK);
+  mt.forEach((row, l) => row.forEach(([n, v], j) => { if (j < mK) { mId[l * mK + j] = n; mV[l * mK + j] = v; } }));
+  const norms = ev.norms || { attn: [], mlp: [], resid: [] };
+  const raw = ev.raw != null ? ev.raw : ev.text;
+  const rec = {
+    k: S.toks.length, turn, i: ev.i, id: ev.id, text: ev.text || "", raw, eos: !!ev.eos, pos: ev.pos,
+    prob: ev.prob, entropy: ev.entropy, alts: ev.alternatives || [], P, R, top, emerge,
+    aK, aPos, aW, ent, mK, mId, mV,
+    nA: Float32Array.from(norms.attn), nM: Float32Array.from(norms.mlp), nR: Float32Array.from(norms.resid),
+    decode_ms: ev.decode_ms, trace_ms: ev.trace_ms, label: vis(raw), x: 0, w: 0, lab: "", span: null,
+  };
+  measureCtx.font = MONO;
+  rec.lw = measureCtx.measureText(rec.label).width;
+  S.toks.push(rec);
+  turn.toks.push(rec.k);
+  layoutCols(rec.k);
+  // transcript span
+  const span = el("span", rec.eos ? "t eos" : "t");
+  span.dataset.k = rec.k;
+  span.textContent = rec.eos ? raw : rec.text;
+  if (rec.eos) span.title = "end-of-sequence token";
+  turn.bodyEl.insertBefore(span, turn.caretEl);
+  rec.span = span;
+  // live rate
+  const now = performance.now();
+  S.rate.push(now);
+  if (S.rate.length > 16) S.rate.shift();
+  if (S.follow) S.sel = rec.k;
+  invalidate("map", "status", "chat");
+  if (S.follow) invalidate("sel");
+  else if (S.sel >= 0 && S.toks[S.sel].turn === turn) invalidate("sel");  // the pinned token's context grew
+}
+
+/* ---------------------------------------------------------------- emergence map */
+const GUT = 34, LABEL_H = 18, TURN_GAP = 12;
+function colWidth(r) { return S.prefs.mapMode === "compact" ? 8 : clamp(Math.ceil(r.lw) + 8, 16, 104); }
+function fitLabel(r) {
+  if (S.prefs.mapMode === "compact") return "";
+  let s = r.label;
+  measureCtx.font = MONO;
+  if (measureCtx.measureText(s).width <= r.w - 6) return s;
+  while (s.length > 1 && measureCtx.measureText(s + "…").width > r.w - 6) s = s.slice(0, -1);
+  return s + "…";
+}
+function layoutCols(from = 0) {
+  let x = 0;
+  if (from > 0) { const p = S.toks[from - 1]; x = p.x + p.w; }
+  for (let k = from; k < S.toks.length; k++) {
+    const r = S.toks[k];
+    if (k > 0 && r.turn !== S.toks[k - 1].turn) x += TURN_GAP;
+    r.x = x; r.w = colWidth(r); r.lab = fitLabel(r);
+    x += r.w;
+  }
+  S.mapW = x;
+}
+function mapGeom() {
+  const rows = S.nL + 1;
+  const rowH = clamp(Math.floor(252 / Math.max(1, rows)), 6, 14);
+  return { rows, rowH, H: LABEL_H + rows * rowH + 4 };
+}
+function firstVisible(x0) {
+  let lo = 0, hi = S.toks.length - 1, ans = S.toks.length;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (S.toks[m].x + S.toks[m].w > x0) { ans = m; hi = m - 1; } else lo = m + 1; }
+  return ans;
+}
+function layerTicks(nL) {
+  const step = nL <= 12 ? 2 : nL <= 32 ? 4 : 8;
+  const t = [0];
+  for (let l = step; l < nL; l += step) if (nL - l >= step / 2) t.push(l);
+  t.push(nL);
+  return t;
+}
+function drawMap() {
+  const cv = $("mapCanvas"), sp = $("mapSpacer");
+  const g = mapGeom();
+  const W = S.mapViewW;
+  if (!W) return;
+  const total = Math.max(GUT + S.mapW + 8, W);
+  if (S.mapTotal !== total) { sp.style.width = total + "px"; S.mapTotal = total; }
+  if (sp._h !== g.H) { sp.style.height = g.H + "px"; sp._h = g.H; }
+  const maxX = total - W;
+  if (S.revealMap && S.sel >= 0) {
+    const r = S.toks[S.sel], view = W - GUT;
+    if (r.x < S.mapX || r.x + r.w > S.mapX + view) S.mapX = r.x - view / 2;
+    S.mapStick = false;
+  } else if (S.mapStick) S.mapX = maxX;
+  S.mapX = Math.round(clamp(S.mapX, 0, maxX));
+  S.revealMap = false;
+  const ctx = sizeCanvas(cv, W, g.H);
+  ctx.fillStyle = C.surface;
+  ctx.fillRect(0, 0, W, g.H);
+  const nL = S.nL;
+  const x0 = S.mapX;
+  // gutter: layer labels
+  ctx.font = SANS; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const l of layerTicks(nL)) {
+    const y = LABEL_H + (nL - l) * g.rowH + (g.rowH - 1) / 2;
+    ctx.fillStyle = l === S.layer ? C.ink : C.muted;
+    ctx.fillText(l === 0 ? "emb" : String(l), GUT - 6, y);
+  }
+  if (S.layer > 0) {  // selected layer marker
+    const y = LABEL_H + (nL - S.layer) * g.rowH + (g.rowH - 1) / 2;
+    ctx.fillStyle = C.ink;
+    ctx.beginPath(); ctx.moveTo(GUT - 1, y); ctx.lineTo(GUT - 5, y - 3); ctx.lineTo(GUT - 5, y + 3); ctx.closePath(); ctx.fill();
+  }
+  if (!S.toks.length) {
+    ctx.textAlign = "left"; ctx.fillStyle = C.muted; ctx.font = '12px system-ui, sans-serif';
+    ctx.fillText("Columns appear here as the reply is generated.", GUT + 8, LABEL_H + g.rows * g.rowH / 2);
+    for (let l = 0; l <= nL; l++) { ctx.fillStyle = C.grid; ctx.fillRect(GUT, LABEL_H + (nL - l) * g.rowH, 2, g.rowH - 1); }
+    return;
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.rect(GUT, 0, W - GUT, g.H); ctx.clip();
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  const cellH = g.rowH - 1;
+  let selBox = null, hovBox = null;
+  for (let k = firstVisible(x0); k < S.toks.length; k++) {
+    const r = S.toks[k];
+    const cx = GUT + r.x - x0;
+    if (cx > W) break;
+    if (k > 0 && r.turn !== S.toks[k - 1].turn) {  // reply boundary
+      ctx.fillStyle = C.axis;
+      ctx.fillRect(Math.round(cx - TURN_GAP / 2), 2, 1, g.H - 4);
+    }
+    const cw = r.w - 1;
+    for (let l = 0; l <= nL; l++) {
+      const p = r.P[l];
+      ctx.fillStyle = Number.isNaN(p) ? C.grid : LENS.css[LENS.at(lensT(p))];
+      ctx.fillRect(cx, LABEL_H + (nL - l) * g.rowH, cw, cellH);
+    }
+    if (r.emerge >= 0) {
+      const p = r.P[r.emerge];
+      const rad = Math.max(1.2, Math.min(2.6, cellH / 2 - 0.8, cw / 2 - 0.8));
+      ctx.fillStyle = LENS.on[LENS.at(lensT(p))];
+      ctx.beginPath();
+      ctx.arc(cx + cw / 2, LABEL_H + (nL - r.emerge) * g.rowH + cellH / 2, rad, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (r.lab) {
+      const sel = k === S.sel;
+      ctx.font = sel ? MONO_B : MONO;
+      ctx.fillStyle = sel ? C.ink : (k === S.hoverK ? C.ink : C.ink2);
+      ctx.fillText(r.lab, cx + 3, LABEL_H - 5);
+    }
+    if (k === S.sel) selBox = [cx, r.w];
+    if (k === S.hoverK) hovBox = [cx, r.w];
+  }
+  const bottom = LABEL_H + g.rows * g.rowH - 1;
+  if (hovBox && S.hoverK !== S.sel) {
+    ctx.strokeStyle = C.ink2; ctx.lineWidth = 1;
+    ctx.strokeRect(hovBox[0] - 0.5, 0.5, hovBox[1], bottom);
+    if (S.hoverL >= 0) {
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5;
+      ctx.strokeRect(hovBox[0] - 0.25, LABEL_H + (nL - S.hoverL) * g.rowH - 0.25, hovBox[1] - 0.5, cellH + 0.5);
+    }
+  }
+  if (selBox) {
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5;
+    ctx.strokeRect(selBox[0] - 0.75, 0.75, selBox[1] + 0.5, bottom);
+    if (S.prefs.mapMode === "compact") {  // compact columns have no labels: name the selected one
+      const r = S.toks[S.sel];
+      ctx.font = MONO_B;
+      const tw = ctx.measureText(r.label.slice(0, 24)).width;
+      const lx = clamp(selBox[0] + selBox[1] / 2 - tw / 2, GUT + 2, W - tw - 4);
+      ctx.fillStyle = C.surface; ctx.fillRect(lx - 3, 1, tw + 6, LABEL_H - 3);
+      ctx.fillStyle = C.ink; ctx.fillText(r.label.slice(0, 24), lx, LABEL_H - 5);
+    }
+    if (hovBox && S.hoverK === S.sel && S.hoverL >= 0) {
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5;
+      ctx.strokeRect(selBox[0] - 0.25, LABEL_H + (nL - S.hoverL) * g.rowH - 0.25, selBox[1] - 0.5, cellH + 0.5);
+    }
+  }
+  ctx.restore();
+}
+function mapHit(e) {
+  const g = mapGeom();
+  const x = e.offsetX - GUT + S.mapX;
+  if (e.offsetX < GUT) return null;
+  const k = firstVisible(x);
+  if (k >= S.toks.length || S.toks[k].x > x) return null;
+  const row = Math.floor((e.offsetY - LABEL_H) / g.rowH);
+  const l = row < 0 || row >= g.rows ? -1 : S.nL - row;
+  return { k, l };
+}
+function mapTip(e, hit) {
+  const r = S.toks[hit.k];
+  showTip(e.clientX, e.clientY, (t) => {
+    const h = el("div", "h");
+    h.append("token ", el("span", "tok"), ` · reply ${r.turn.idx + 1}, #${r.i + 1}`);
+    h.children[0].append(visFrag(r.raw));
+    t.append(h);
+    if (hit.l < 0) { tipRow(t, "p(chosen) at the output", fmtP(r.prob)); tipRow(t, "first top-1 layer", r.emerge < 0 ? "never" : r.emerge === 0 ? "emb" : String(r.emerge)); return; }
+    const l = hit.l;
+    t.append(el("div", "h", l === 0 ? "embeddings (layer 0)" : `after layer ${l} of ${S.nL}` + (l === S.nL ? " (model output)" : "")));
+    if (Number.isNaN(r.P[l])) { t.append(el("div", "s", "not traced at this lens stride")); return; }
+    tipRow(t, "p(chosen)", fmtP(r.P[l]));
+    tipRow(t, "rank", `${fmtInt(r.R[l] + 1)}${r.R[l] === 0 ? " (top-1)" : ""}`);
+    t.append(el("div", "s", "lens top-3"));
+    for (const [s, p] of r.top[l] || []) tipRow(t, s, fmtP(p, 1e-4), true);
+  });
+}
+
+/* ---------------------------------------------------------------- legends */
+function drawRampLegend(cv, rmp, ticks, title) {
+  const w = 200, h = 26, x0 = 4, bw = w - 8 - (title ? 0 : 0);
+  const ctx = sizeCanvas(cv, w, h);
+  ctx.clearRect(0, 0, w, h);
+  for (let i = 0; i < bw; i++) { ctx.fillStyle = rmp.css[Math.round(i / (bw - 1) * 255)]; ctx.fillRect(x0 + i, 2, 1.5, 8); }
+  ctx.font = SANS; ctx.fillStyle = C.muted; ctx.textBaseline = "top";
+  ticks.forEach(([t, s], i) => {
+    ctx.textAlign = i === 0 ? "left" : i === ticks.length - 1 ? "right" : "center";
+    ctx.fillText(s, x0 + t * (bw - 1), 13);
+  });
+}
+function drawLegends() {
+  const lin = [[0, "p 0"], [0.25, ".25"], [0.5, ".5"], [0.75, ".75"], [1, "1"]];
+  const lg = [[0, "≤1e−5"], [0.2, "1e−4"], [0.4, "1e−3"], [0.6, ".01"], [0.8, ".1"], [1, "1"]];
+  drawRampLegend($("mapLegend"), LENS, S.prefs.mapScale === "log" ? lg : lin);
+  drawRampLegend($("attnLegend"), ATT, [[0, "0"], [attT(0.05), ".05"], [attT(0.25), ".25"], [attT(0.5), ".5"], [1, "1"]]);
+}
+
+/* ---------------------------------------------------------------- selection bar */
+function renderSelbar(r) {
+  const w = $("selWhat");
+  const fb = $("followBtn");
+  fb.setAttribute("aria-pressed", String(S.follow));
+  fb.textContent = S.follow ? "Following live" : "Follow live";
+  if (!r) { w.replaceChildren(el("span", "", S.toks.length ? "" : "No token selected yet. Send a message, then click any reply token.")); return; }
+  const tk = el("span", "tk");
+  tk.append(visFrag(r.raw));
+  const parts = [tk, el("span", "", `reply ${r.turn.idx + 1} · token ${r.i + 1} · position ${r.pos + 1}`)];
+  const p = el("span"); p.append("p ", el("b", "num", fmtP(r.prob)));
+  const em = el("span");
+  em.append(r.emerge < 0 ? "never top-1 in the lens" : "top-1 from ", el("b", "", r.emerge < 0 ? "" : r.emerge === 0 ? "the embeddings" : `layer ${r.emerge}`));
+  parts.push(p, em);
+  w.replaceChildren(...parts);
+}
+
+/* ---------------------------------------------------------------- readout */
+function renderReadout(r) {
+  const box = $("readRows");
+  $("readEmpty").hidden = !!r;
+  if (!r) { box.replaceChildren(); S.readKey = ""; return; }
+  const layers = [];
+  for (let l = S.nL; l >= 0; l--) if (!Number.isNaN(r.P[l])) layers.push(l);
+  const key = layers.join(",");
+  if (key !== S.readKey) {
+    S.readKey = key;
+    S.readRows = [];
+    const frag = document.createDocumentFragment();
+    for (const l of layers) {
+      const row = el("div", "rrow");
+      row.setAttribute("role", "row");
+      row.dataset.l = l;
+      const ly = el("span", "ly", l === 0 ? "emb" : String(l));
+      const lt = el("span", "lt"); const ltTok = el("span"); const ltP = el("small"); lt.append(ltTok, ltP);
+      const pc = el("span", "pcell"); const bar = el("span", "bar"); const fill = el("i"); bar.append(fill); const v = el("span", "v"); pc.append(bar, v);
+      const rk = el("span", "rk");
+      row.append(ly, lt, pc, rk);
+      frag.append(row);
+      S.readRows[l] = { row, lt, ltTok, ltP, fill, v, rk };
+    }
+    box.replaceChildren(frag);
+  }
+  for (const l of layers) {
+    const o = S.readRows[l];
+    const top1 = (r.top[l] && r.top[l][0]) || ["", 0];
+    o.row.classList.toggle("emerge", l === r.emerge);
+    o.row.classList.toggle("lsel", l === S.layer);
+    setTok(o.ltTok, top1[0]);
+    setText(o.ltP, fmtP(top1[1], 1e-4));
+    o.lt.classList.toggle("match", r.R[l] === 0);
+    o.fill.style.width = (clamp(r.P[l], 0, 1) * 100).toFixed(1) + "%";
+    setText(o.v, fmtP(r.P[l]));
+    setText(o.rk, "#" + fmtInt(r.R[l] + 1));
+    o.rk.classList.toggle("first", r.R[l] === 0);
+    const tops = (r.top[l] || []).map(([s, p]) => `${vis(s)} ${fmtP(p, 1e-4)}`).join("   ");
+    o.row.title = `${l === 0 ? "embeddings" : "after layer " + l}${l === r.emerge ? " (first top-1)" : ""}\nlens top-3: ${tops}\np(chosen) ${fmtP(r.P[l])}, rank ${fmtInt(r.R[l] + 1)}`;
+  }
+}
+
+/* ---------------------------------------------------------------- output distribution */
+function renderOutput(r) {
+  const box = $("outRows"), st = $("outStats");
+  $("outEmpty").hidden = !!r;
+  if (!r) { box.replaceChildren(); st.replaceChildren(); return; }
+  const rows = [];
+  let found = false;
+  const maxP = Math.max(r.prob, ...r.alts.map((a) => a[1]), 1e-9);
+  const mk = (s, p, chosen) => {
+    const row = el("div", "orow" + (chosen ? " chosen" : ""));
+    const tc = el("span", "tc"); const t = el("span", "tok"); t.append(visFrag(s)); tc.append(t); if (chosen) tc.append(el("span", "tag", "chosen"));
+    const bar = el("span", "bar"); const f = el("i"); f.style.width = (p / Math.max(maxP, 0.05) * 100).toFixed(1) + "%"; bar.append(f);
+    row.append(tc, bar, el("span", "v", fmtP(p, 1e-4)));
+    return row;
+  };
+  for (const [s, p] of r.alts) { const c = !found && s === r.raw; if (c) found = true; rows.push(mk(s, p, c)); }
+  if (!found) rows.push(mk(r.raw, r.prob, true));
+  box.replaceChildren(...rows);
+  const stat = (k, v) => { const s = el("span"); s.append(k + " ", el("b", "", v)); return s; };
+  const items = [stat("p(chosen)", fmtP(r.prob)), stat("entropy", (r.entropy ?? 0).toFixed(3) + " nats")];
+  if (r.decode_ms != null) items.push(stat("decode", r.decode_ms + " ms"));
+  if (r.trace_ms != null) items.push(stat("trace", r.trace_ms + " ms"));
+  st.replaceChildren(...items);
+}
+
+/* ---------------------------------------------------------------- contributions chart */
+function drawContrib(r) {
+  const cv = $("contribCanvas");
+  const W = S.contribW;
+  if (!W) return;
+  const H = 214;
+  const ctx = sizeCanvas(cv, W, H);
+  ctx.clearRect(0, 0, W, H);
+  const nL = S.nL;
+  const padL = 40, padR = 44, t1 = 18, h1 = 92, t2 = t1 + h1 + 30, h2 = 54;
+  const pw = W - padL - padR;
+  const X = (l) => padL + (nL ? l / nL : 0) * pw;
+  ctx.font = SANS;
+  if (!r) {
+    ctx.fillStyle = C.muted; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("No token yet.", W / 2, H / 2);
+    return;
+  }
+  const log = S.prefs.normScale === "log";
+  function scale(vals, top, h) {
+    const pos = vals.filter((v) => v > 0);
+    let lo, hi;
+    if (log) {
+      lo = 10 ** Math.floor(Math.log10(Math.min(...pos, 1)));
+      hi = 10 ** Math.ceil(Math.log10(Math.max(...pos, lo * 10)));
+      if (hi / lo < 10) hi = lo * 10;
+      const f = (v) => top + h - (Math.log10(Math.max(v, lo)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo)) * h;
+      const ticks = [];
+      for (let e = Math.log10(lo); e <= Math.log10(hi) + 1e-9; e++) ticks.push(10 ** e);
+      return { f, ticks };
+    }
+    const mx = Math.max(...vals, 1e-6);
+    const mag = 10 ** Math.floor(Math.log10(mx));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => mx / s <= 4) || mag * 10;
+    hi = Math.ceil(mx / step) * step;
+    const f = (v) => top + h - v / hi * h;
+    const ticks = [];
+    for (let v = 0; v <= hi + 1e-9; v += step) ticks.push(v);
+    return { f, ticks };
+  }
+  const tickLabel = (v) => (v >= 1000 ? (v / 1000) + "K" : v >= 1 ? String(+v.toFixed(1)) : String(+v.toPrecision(2)));
+  function axes(sc, top, h, title) {
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const v of sc.ticks) {
+      const y = Math.round(sc.f(v)) + 0.5;
+      ctx.fillStyle = C.grid; ctx.fillRect(padL, y - 0.5, pw, 1);
+      ctx.fillStyle = C.muted; ctx.fillText(tickLabel(v), padL - 6, y);
+    }
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic"; ctx.fillStyle = C.ink2;
+    ctx.fillText(title, padL, top - 6);
+  }
+  // selected layer band
+  if (S.layer > 0) { ctx.fillStyle = C.wash; ctx.fillRect(X(S.layer) - Math.max(3, pw / nL / 2), t1, Math.max(6, pw / nL), t2 + h2 - t1); }
+  const s1 = scale([...r.nA, ...r.nM], t1, h1);
+  axes(s1, t1, h1, "block outputs ‖·‖");
+  const s2 = scale([...r.nR], t2, h2);
+  axes(s2, t2, h2, "residual stream ‖x‖");
+  function line(vals, off, f, color) {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    vals.forEach((v, i) => { const x = X(i + off), y = f(v); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke();
+  }
+  line(r.nA, 1, s1.f, C.attn);
+  line(r.nM, 1, s1.f, C.mlp);
+  line(r.nR, 0, s2.f, C.resid);
+  // direct labels at the line ends (skipped when they would collide; the legend above names the series)
+  const ya = s1.f(r.nA[nL - 1]), ym = s1.f(r.nM[nL - 1]);
+  ctx.font = SANS; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillStyle = C.ink2;
+  if (Math.abs(ya - ym) >= 11) { ctx.fillText("attn", X(nL) + 6, ya); ctx.fillText("MLP", X(nL) + 6, ym); }
+  ctx.fillText("resid", X(nL) + 6, s2.f(r.nR[nL]));
+  // x axis
+  ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = C.muted;
+  for (const l of layerTicks(nL)) ctx.fillText(l === 0 ? "emb" : String(l), X(l), t2 + h2 + 6);
+  ctx.fillStyle = C.axis; ctx.fillRect(padL, t2 + h2, pw, 1); ctx.fillRect(padL, t1 + h1, pw, 1);
+  // hover crosshair
+  const hl = S.contribHover;
+  if (hl >= 0) {
+    ctx.fillStyle = C.ink2; ctx.fillRect(Math.round(X(hl)), t1, 1, t2 + h2 - t1);
+    const dot = (x, y, c) => { ctx.fillStyle = C.surface; ctx.beginPath(); ctx.arc(x, y, 5, 0, 7); ctx.fill(); ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 7); ctx.fill(); };
+    if (hl >= 1) { dot(X(hl), s1.f(r.nA[hl - 1]), C.attn); dot(X(hl), s1.f(r.nM[hl - 1]), C.mlp); }
+    dot(X(hl), s2.f(r.nR[hl]), C.resid);
+  }
+  cv._geom = { padL, pw, nL };
+}
+function contribLayer(e) {
+  const g = $("contribCanvas")._geom;
+  if (!g || !g.nL) return -1;
+  return clamp(Math.round((e.offsetX - g.padL) / g.pw * g.nL), 0, g.nL);
+}
+
+/* ---------------------------------------------------------------- attention */
+function attnWeights(r, layer) {
+  const m = new Map();
+  if (!r.aK) return m;
+  if (layer >= 1) {
+    const l = layer - 1;
+    for (let j = 0; j < r.aK; j++) m.set(r.aPos[l * r.aK + j], r.aW[l * r.aK + j]);
+  } else {  // all layers: mean of the per-layer top lists (positions outside a layer's list count as 0 there)
+    for (let l = 0; l < S.nL; l++)
+      for (let j = 0; j < r.aK; j++) { const p = r.aPos[l * r.aK + j]; m.set(p, (m.get(p) || 0) + r.aW[l * r.aK + j] / S.nL); }
+  }
+  return m;
+}
+function chipText(turn, p) {
+  const np = turn.prompt.n_prompt;
+  if (p < np) return turn.prompt.tokens[p];
+  const k = turn.toks[p - np];
+  return k == null ? "" : S.toks[k].raw;
+}
+function appendChip(box, turn, p) {
+  const s = chipText(turn, p);
+  const c = el("span", "chip");
+  c.dataset.p = p;
+  c.append(visFrag(s));
+  if (p >= S.futureFrom) c.classList.add("future");
+  S.chipEls.push(c);
+  box.append(c);
+  if (s.includes("\n")) box.append(document.createElement("br"));
+}
+function setFuture(from) {
+  const a = Math.min(from, S.futureFrom), b = Math.min(Math.max(from, S.futureFrom), S.chipEls.length);
+  for (let p = a; p < b; p++) S.chipEls[p].classList.toggle("future", p >= from);
+  S.futureFrom = from;
+}
+function renderAttention(r) {
+  const box = $("chips");
+  if (!r || !r.turn.prompt) {
+    box.replaceChildren(); S.chipsTurn = null; S.chipEls = []; S.chipShaded = []; S.qEl = S.outEl = null;
+    $("attnTop").replaceChildren(el("div", "empty", "No token yet."));
+    return;
+  }
+  const turn = r.turn;
+  if (S.chipsTurn !== turn) {
+    box.replaceChildren(); S.chipEls = []; S.chipShaded = []; S.qEl = S.outEl = null; S.chipsTurn = turn;
+    S.futureFrom = 1 << 30;
+  }
+  const want = turn.prompt.n_prompt + turn.toks.length;
+  for (let p = S.chipEls.length; p < want; p++) appendChip(box, turn, p);
+  // shading
+  for (const c of S.chipShaded) { c.style.background = ""; c.style.color = ""; c.title = ""; }
+  S.chipShaded = [];
+  const m = attnWeights(r, S.layer);
+  for (const [p, w] of m) {
+    const c = S.chipEls[p];
+    if (!c) continue;
+    const i = ATT.at(attT(w));
+    c.style.background = ATT.css[i];
+    c.style.color = ATT.on[i];
+    c.title = `position ${p + 1} · attention ${fmtP(w, 1e-4)}`;
+    S.chipShaded.push(c);
+  }
+  if (S.qEl) S.qEl.classList.remove("q");
+  if (S.outEl) S.outEl.classList.remove("out");
+  S.qEl = S.chipEls[r.pos] || null;
+  S.outEl = S.chipEls[r.pos + 1] || null;
+  if (S.qEl) S.qEl.classList.add("q");
+  if (S.outEl) S.outEl.classList.add("out");
+  setFuture(r.pos + 2);
+  if (S.revealText && S.qEl) { S.pendChips = S.qEl; S.chipsStick = false; }
+  else if (S.follow && S.chipsStick) S.pendChips = "bottom";
+  // top positions
+  const list = [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+  const mx = Math.max(...list.map((x) => x[1]), 1e-9);
+  const rows = list.map(([p, w]) => {
+    const row = el("div", "arow");
+    row.dataset.p = p;
+    const t = el("span", "tok"); t.append(visFrag(chipText(turn, p)));
+    const bar = el("span", "bar"); const f = el("i"); f.style.width = (w / mx * 100).toFixed(1) + "%"; bar.append(f);
+    row.append(el("span", "ps", "@" + (p + 1)), t, bar, el("span", "v", fmtP(w, 1e-4)));
+    row.title = `position ${p + 1}${p === r.pos ? " (the query token itself)" : ""}: click to find it in the context`;
+    return row;
+  });
+  const head = el("div", "expl", S.layer > 0 ? `Most attended positions at layer ${S.layer}` : "Most attended positions, mean over layers");
+  head.style.margin = "0 0 4px";
+  $("attnTop").replaceChildren(head, ...rows);
+}
+
+function entGeom() {
+  const nL = S.nL, nH = Math.max(1, S.nH);
+  const cw = clamp(Math.floor(176 / nH), 7, 16), rh = clamp(Math.floor(230 / Math.max(1, nL)), 5, 12);
+  const gut = 28, top = 16;
+  return { cw, rh, gut, top, W: gut + nH * cw + 2, H: top + nL * rh + 4 };
+}
+function drawEnt(r) {
+  const cv = $("entCanvas");
+  const g = entGeom();
+  const ctx = sizeCanvas(cv, g.W, g.H);
+  ctx.clearRect(0, 0, g.W, g.H);
+  const nL = S.nL, nH = S.nH;
+  ctx.font = SANS; ctx.fillStyle = C.muted; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  const hstep = nH > 16 ? 8 : 4;
+  for (let h = 0; h < nH; h += hstep) ctx.fillText(String(h), g.gut + h * g.cw + g.cw / 2, g.top - 5);
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const l of layerTicks(nL)) if (l >= 1) { ctx.fillStyle = l === S.layer ? C.ink : C.muted; ctx.fillText(String(l), g.gut - 5, g.top + (nL - l) * g.rh + g.rh / 2); }
+  if (!r) return;
+  const maxH = Math.log(Math.max(2, r.pos + 1));
+  for (let l = 1; l <= nL; l++) {
+    const y = g.top + (nL - l) * g.rh;
+    for (let h = 0; h < nH; h++) {
+      const e = r.ent[(l - 1) * nH + h];
+      ctx.fillStyle = ENT.css[ENT.at(1 - e / maxH)];
+      ctx.fillRect(g.gut + h * g.cw, y, g.cw - 1, g.rh - 1);
+    }
+  }
+  if (S.layer > 0) {
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5;
+    ctx.strokeRect(g.gut - 1.5, g.top + (nL - S.layer) * g.rh - 1, nH * g.cw + 2, g.rh + 1);
+  }
+  const hv = S.entHover;
+  if (hv) {
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 1.5;
+    ctx.strokeRect(g.gut + hv.h * g.cw - 0.75, g.top + (nL - hv.l) * g.rh - 0.75, g.cw + 0.5, g.rh + 0.5);
+  }
+}
+function entHit(e) {
+  const g = entGeom();
+  const h = Math.floor((e.offsetX - g.gut) / g.cw), row = Math.floor((e.offsetY - g.top) / g.rh);
+  const l = S.nL - row;
+  if (row < 0 || l < 1) return null;
+  return { l, h: h >= 0 && h < S.nH ? h : -1 };
+}
+
+/* ---------------------------------------------------------------- MLP */
+function renderMlp(r) {
+  const box = $("mlpRows");
+  $("mlpEmpty").hidden = !!r;
+  setText($("mlpLayer"), S.layer > 0 ? `layer ${S.layer}` : "all layers");
+  if (!r || !r.mK) { box.replaceChildren(); return; }
+  let items = [];
+  if (S.layer > 0) {
+    const l = S.layer - 1;
+    for (let j = 0; j < r.mK; j++) items.push([S.layer, r.mId[l * r.mK + j], r.mV[l * r.mK + j]]);
+  } else {
+    for (let l = 0; l < S.nL; l++) for (let j = 0; j < r.mK; j++) items.push([l + 1, r.mId[l * r.mK + j], r.mV[l * r.mK + j]]);
+    items.sort((a, b) => Math.abs(b[2]) - Math.abs(a[2]));
+    items = items.slice(0, 8);
+  }
+  const mx = Math.max(...items.map((x) => Math.abs(x[2])), 1e-9);
+  box.replaceChildren(...items.map(([l, n, v]) => {
+    const row = el("div", "mrow");
+    const id = el("span", "id");
+    if (S.layer > 0) id.append("#", el("b", "", String(n)));
+    else id.append(`L${l} #`, el("b", "", String(n)));
+    const bar = el("span", "dbar"); const f = el("i", v >= 0 ? "pos" : "neg"); f.style.width = `calc(${(Math.abs(v) / mx * 50).toFixed(2)}% - 1px)`; bar.append(f);
+    row.append(id, bar, el("span", "v", (v >= 0 ? "+" : "−") + fmtN(Math.abs(v))));
+    row.title = `layer ${l}, neuron ${n}: activation ${v}`;
+    if (S.layer === 0) { row.style.cursor = "pointer"; row.dataset.l = l; }
+    return row;
+  }));
+}
+
+/* ---------------------------------------------------------------- transcript */
+let markedSpan = null;
+function markTranscript() {
+  const r = S.sel >= 0 ? S.toks[S.sel] : null;
+  const span = r ? r.span : null;
+  if (markedSpan !== span) {
+    if (markedSpan) markedSpan.classList.remove("sel");
+    if (span) span.classList.add("sel");
+    markedSpan = span;
+  }
+  if (S.revealText && span) S.pendText = span;
+  S.revealText = false;
+}
+let hovSpan = null;
+function hoverTranscript(k) {
+  const span = k >= 0 && S.toks[k] ? S.toks[k].span : null;
+  if (hovSpan === span) return;
+  if (hovSpan) hovSpan.classList.remove("hov");
+  if (span) span.classList.add("hov");
+  hovSpan = span;
+}
+
+/* ---------------------------------------------------------------- selection */
+function selectToken(k, { pin = true, revealMap = false, revealText = false } = {}) {
+  if (k < 0 || k >= S.toks.length) return;
+  S.sel = k;
+  if (pin) S.follow = false;
+  S.revealMap = revealMap; S.revealText = revealText;
+  invalidate("sel");
+}
+function setLayer(l) {
+  S.layer = clamp(l | 0, 0, S.nL);
+  $("layerSel").value = String(S.layer);
+  invalidate("layer");
+}
+function setFollow(on) {
+  S.follow = on;
+  if (on && S.toks.length) { S.sel = S.toks.length - 1; S.mapStick = true; S.chipsStick = true; S.chatStick = true; }
+  invalidate("sel");
+}
+
+/* ---------------------------------------------------------------- status & header */
+function renderStatus() {
+  const st = $("status"), tx = $("statusText");
+  st.classList.toggle("live", S.generating);
+  st.classList.remove("err");
+  if (S.statusErr) { st.classList.add("err"); setText(tx, S.statusErr); return; }
+  if (!S.ready) return;
+  const old = st.querySelector(".prog"); if (old) old.remove();
+  if (S.generating) {
+    const cur = S.turns[S.turns.length - 1];
+    if (!cur || !cur.prompt) { setText(tx, "reading the prompt…"); return; }
+    const n = cur.toks.length, t = S.rate;
+    const rate = t.length > 1 ? (t.length - 1) * 1000 / (t[t.length - 1] - t[0]) : 0;
+    setText(tx, `generating · ${rate ? rate.toFixed(1) : "–"} tok/s · ${n} tokens`);
+    return;
+  }
+  setText(tx, S.lastDone ? `ready · last reply ${S.lastDone.tok_per_s} tok/s` : "ready");
+}
+function showEngineStatus(m) {
+  if (S.ready || !m) return;
+  const st = $("status");
+  setText($("statusText"), m.text || "");
+  let pg = st.querySelector(".prog");
+  if (m.progress == null) { if (pg) pg.remove(); return; }
+  if (!pg) { pg = el("span", "prog"); pg.append(el("b")); st.append(pg); }
+  pg.firstChild.style.width = (clamp(m.progress, 0, 1) * 100).toFixed(1) + "%";
+}
+function renderHeader() {
+  const i = S.info, m = $("modelInfo");
+  const parts = [el("b", "", i.model || "model")];
+  const add = (s) => parts.push(document.createTextNode(" · " + s));
+  if (i.quant) add(i.quant);
+  add(`${i.n_layers} layers × ${i.n_heads} heads`);
+  add(`d ${i.dim}`);
+  add(`ctx ${fmtInt(i.n_ctx)}`);
+  if (i.backend) add(i.backend);
+  m.replaceChildren(...parts);
+  m.title = `${i.model} (${i.arch}, ${i.quant}): ${i.n_layers} layers, ${i.n_heads} heads (${i.n_kv_heads} KV), dim ${i.dim}, MLP ${i.hidden_dim}, vocabulary ${fmtInt(i.vocab)}, context ${fmtInt(i.n_ctx)}, ${i.threads} thread${i.threads === 1 ? "" : "s"}` + (i.backend ? `, ${i.backend}` : "");
+}
+
+/* ---------------------------------------------------------------- chat flow */
+const msgs = $("messages");
+function intro() {
+  const d = el("div", "intro");
+  d.id = "intro";
+  d.append(el("p", "", "Ask something. Every reply token is traced as it is generated: the panels on the right show how it formed, layer by layer. Click any reply token to inspect it."));
+  const sg = el("div", "sugg");
+  for (const q of ["What is the capital of France?", "Translate “good morning” into German.", "If I have 3 apples and buy 4 more, how many do I have?"]) {
+    const b = el("button", "btn", q); b.type = "button"; b.dataset.q = q; sg.append(b);
+  }
+  d.append(sg);
+  return d;
+}
+function addUserMsg(text) {
+  const m = el("div", "msg user");
+  m.append(el("div", "bubble", text));
+  msgs.append(m);
+  return m;
+}
+function addAsstMsg(turn) {
+  const m = el("div", "msg asst");
+  const body = el("div", "body");
+  const pend = el("span", "pending", "reading the prompt…");
+  const caret = el("span", "caret");
+  body.append(pend, caret);
+  const meta = el("div", "meta");
+  m.append(body, meta);
+  msgs.append(m);
+  Object.assign(turn, { msgEl: m, bodyEl: body, caretEl: caret, pendEl: pend, metaEl: meta });
+}
+function settingsBody() {
+  const s = S.settings;
+  const body = { messages: S.history.slice(), max_tokens: s.max_tokens, temperature: s.temperature, top_p: s.top_p, seed: s.seed };
+  if (s.lens_stride > 0) body.lens_stride = Math.min(s.lens_stride, S.nL);
+  return body;
+}
+async function send(text) {
+  text = text.replace(/\s+$/, "");
+  if (!text.trim() || S.generating || !S.ready) return false;
+  const introEl = $("intro"); if (introEl) introEl.remove();
+  const session = S.session;
+  const turn = { idx: S.turns.length, prompt: null, toks: [], done: null, failed: false };
+  S.turns.push(turn);
+  S.history.push({ role: "user", content: text });
+  turn.userEl = addUserMsg(text);
+  addAsstMsg(turn);
+  S.generating = true; S.rate = []; S.chatStick = true; S.statusErr = null;
+  setSendMode(true);
+  invalidate("status", "chat");
+  const body = settingsBody();
+  let err = null;
+  for (let attempt = 0; ; attempt++) {
+    err = null;
+    let started = false;
+    await BORG.chat(body, (ev) => {
+      if (session !== S.session) return;  // the conversation was reset meanwhile
+      if (ev.type === "prompt") { started = true; onPrompt(turn, ev); }
+      else if (ev.type === "token") addToken(turn, ev);
+      else if (ev.type === "done") turn.done = ev;
+      else if (ev.type === "error") err = ev;
+    }).catch((e) => { err = { type: "error", message: String(e && e.message || e) }; });
+    // busy (e.g. the previous generation is still winding down after New chat): retry briefly
+    if (err && !started && (err.status === 409 || err.code === "busy") && attempt < 12 && session === S.session) {
+      await new Promise((res) => setTimeout(res, 250));
+      continue;
+    }
+    break;
+  }
+  if (session !== S.session) return true;
+  finish(turn, err);
+  return true;
+}
+function onPrompt(turn, ev) {
+  turn.prompt = ev;
+  if (turn.pendEl) { turn.pendEl.remove(); turn.pendEl = null; }
+  setText(turn.metaEl, `prompt ${fmtInt(ev.n_prompt)} tokens (${fmtInt(ev.n_reused)} cached) · ${ev.prompt_ms} ms`);
+  invalidate("status");
+}
+function finish(turn, err) {
+  S.generating = false;
+  setSendMode(false);
+  if (turn.caretEl) turn.caretEl.remove();
+  if (turn.pendEl) { turn.pendEl.remove(); turn.pendEl = null; }
+  const failedEarly = err && !turn.prompt;
+  if (failedEarly) {
+    // nothing was generated: forget the turn, hand the text back
+    turn.failed = true;
+    S.turns.pop();
+    const u = S.history.pop();
+    turn.msgEl.remove();
+    turn.userEl.classList.add("failed");
+    const e = el("div", "err", "Error: " + err.message);
+    turn.userEl.append(e);
+    const input = $("input");
+    if (!input.value && u) { input.value = u.content; autoGrow(); }
+  } else {
+    const text = turn.done ? turn.done.text : turn.toks.map((k) => S.toks[k].text).join("");
+    S.history.push({ role: "assistant", content: text });
+    const d = turn.done;
+    const meta = [];
+    if (turn.prompt) meta.push(`prompt ${fmtInt(turn.prompt.n_prompt)} tokens (${fmtInt(turn.prompt.n_reused)} cached)`);
+    if (d) meta.push(`${d.n_gen} tokens`, `${d.tok_per_s} tok/s`, { eos: "stopped at end of turn", stop: "stopped at a stop string", length: "max tokens reached", cancelled: "stopped" }[d.stop_reason] || d.stop_reason);
+    setText(turn.metaEl, meta.join(" · "));
+    if (err && !err.aborted) turn.msgEl.append(el("div", "err", "Error: " + err.message));
+    if (d) S.lastDone = d;
+    $("announce").textContent = d ? `Reply finished: ${d.n_gen} tokens.` : "Reply ended.";
+  }
+  invalidate("status", "sel", "chat");
+}
+function setSendMode(gen) {
+  const b = $("sendBtn");
+  b.textContent = gen ? "Stop" : "Send";
+  b.classList.toggle("primary", !gen);
+  b.title = gen ? "Stop generating" : "Send (Enter)";
+}
+function newChat() {
+  if (S.generating) BORG.stop();
+  S.session++;
+  S.generating = false;
+  Object.assign(S, { history: [], turns: [], toks: [], sel: -1, follow: true, rate: [], mapW: 0, mapStick: true, chatStick: true, chipsStick: true, mapX: 0,
+                     chipsTurn: null, chipEls: [], chipShaded: [], qEl: null, outEl: null, readKey: "" });
+  markedSpan = hovSpan = null;
+  $("chips").replaceChildren();
+  msgs.replaceChildren(intro());
+  setSendMode(false);
+  invalidate("sel", "map", "status");
+  $("input").focus();
+}
+
+/* ---------------------------------------------------------------- settings */
+function syncSettingsUI() {
+  const s = S.settings;
+  $("sTemp").value = s.temperature; setText($("oTemp"), (+s.temperature).toFixed(2));
+  $("sTopP").value = s.top_p; setText($("oTopP"), (+s.top_p).toFixed(2));
+  $("sMax").value = s.max_tokens;
+  $("sSeed").value = s.seed;
+  $("sStride").value = s.lens_stride > 0 ? s.lens_stride : (S.info ? S.info.lens_stride || 1 : 1);
+}
+function readSettingsUI() {
+  const s = S.settings, num = (id, d) => { const v = Number($(id).value); return Number.isFinite(v) ? v : d; };
+  s.temperature = clamp(num("sTemp", 0), 0, 2);
+  s.top_p = clamp(num("sTopP", 1), 0.01, 1);
+  s.max_tokens = clamp(Math.round(num("sMax", 512)), 1, S.info ? S.info.n_ctx : 32768);
+  s.seed = clamp(Math.round(num("sSeed", 0)), 0, Number.MAX_SAFE_INTEGER);
+  s.lens_stride = clamp(Math.round(num("sStride", 1)), 1, Math.max(1, S.nL));
+  store.set("superborg.ui.settings", s);
+  setText($("oTemp"), s.temperature.toFixed(2));
+  setText($("oTopP"), s.top_p.toFixed(2));
+}
+
+/* ---------------------------------------------------------------- theme & prefs */
+function applyTheme() {
+  const t = S.prefs.theme;
+  if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  setText($("themeBtn"), "Theme: " + t);
+  readColors();
+  invalidate("theme", "map");
+}
+function syncSegs() {
+  for (const b of document.querySelectorAll("[data-mapmode]")) b.setAttribute("aria-pressed", String(b.dataset.mapmode === S.prefs.mapMode));
+  for (const b of document.querySelectorAll("[data-mapscale]")) b.setAttribute("aria-pressed", String(b.dataset.mapscale === S.prefs.mapScale));
+  for (const b of document.querySelectorAll("[data-normscale]")) b.setAttribute("aria-pressed", String(b.dataset.normscale === S.prefs.normScale));
+}
+const savePrefs = () => store.set("superborg.ui.prefs", S.prefs);
+
+/* ---------------------------------------------------------------- events */
+const input = $("input");
+function autoGrow() { input.style.height = "40px"; input.style.height = Math.min(200, input.scrollHeight + 2) + "px"; }
+input.addEventListener("input", autoGrow);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    if (!S.generating) submit();
+  }
+});
+function submit() {
+  const v = input.value;
+  if (!v.trim()) return;
+  send(v).then((ok) => { if (ok === false) return; });
+  if (S.ready) { input.value = ""; autoGrow(); }
+}
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); if (S.generating) BORG.stop(); else submit(); });
+$("newBtn").addEventListener("click", newChat);
+msgs.addEventListener("click", (e) => {
+  const q = e.target.closest("[data-q]");
+  if (q && !S.generating) { input.value = q.dataset.q; submit(); return; }
+  const t = e.target.closest(".t");
+  if (t) selectToken(+t.dataset.k, { pin: true, revealMap: true });
+});
+trackUserScroll(msgs, () => { S.chatStick = msgs.scrollTop + msgs.clientHeight >= msgs.scrollHeight - 30; });
+trackUserScroll($("chips"), () => { const c = $("chips"); S.chipsStick = c.scrollTop + c.clientHeight >= c.scrollHeight - 24; });
+$("followBtn").addEventListener("click", () => setFollow(!S.follow));
+
+const setBtn = $("setBtn"), pop = $("settings");
+function togglePop(open) { pop.hidden = !open; setBtn.setAttribute("aria-expanded", String(open)); if (open) syncSettingsUI(); }
+setBtn.addEventListener("click", (e) => { e.stopPropagation(); togglePop(pop.hidden); });
+document.addEventListener("click", (e) => { if (!pop.hidden && !pop.contains(e.target) && e.target !== setBtn) togglePop(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !pop.hidden) { togglePop(false); setBtn.focus(); } });
+for (const id of ["sTemp", "sTopP", "sMax", "sSeed", "sStride"]) $(id).addEventListener("input", readSettingsUI);
+$("sReset").addEventListener("click", () => { S.settings = Object.assign({}, SETTINGS0); store.set("superborg.ui.settings", S.settings); syncSettingsUI(); });
+
+$("themeBtn").addEventListener("click", () => {
+  const order = ["auto", "light", "dark"];
+  S.prefs.theme = order[(order.indexOf(S.prefs.theme) + 1) % 3];
+  savePrefs(); applyTheme();
+});
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); invalidate("theme", "map"); });
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-mapmode],[data-mapscale],[data-normscale]");
+  if (!b) return;
+  if (b.dataset.mapmode) { S.prefs.mapMode = b.dataset.mapmode; layoutCols(0); S.revealMap = S.sel >= 0 && !S.follow; }
+  if (b.dataset.mapscale) S.prefs.mapScale = b.dataset.mapscale;
+  if (b.dataset.normscale) S.prefs.normScale = b.dataset.normscale;
+  savePrefs(); syncSegs();
+  invalidate("map", "sel", "legend");
+});
+$("layerSel").addEventListener("change", (e) => setLayer(+e.target.value));
+
+// map
+const mapScroll = $("mapScroll"), mapCanvas = $("mapCanvas");
+trackUserScroll(mapScroll, () => {
+  S.mapX = S.mapApplied = mapScroll.scrollLeft;
+  S.mapStick = S.mapX >= S.mapTotal - S.mapViewW - 4;
+  invalidate("map");
+});
+mapCanvas.addEventListener("pointermove", (e) => {
+  const hit = mapHit(e);
+  const k = hit ? hit.k : -1, l = hit ? hit.l : -1;
+  if (k !== S.hoverK || l !== S.hoverL) { S.hoverK = k; S.hoverL = l; invalidate("map"); hoverTranscript(k); }
+  if (hit) mapTip(e, hit); else hideTip();
+});
+mapCanvas.addEventListener("pointerleave", () => { S.hoverK = S.hoverL = -1; hoverTranscript(-1); hideTip(); invalidate("map"); });
+mapCanvas.addEventListener("click", (e) => {
+  const hit = mapHit(e);
+  if (!hit) return;
+  selectToken(hit.k, { pin: true, revealText: true });
+  if (hit.l >= 1) setLayer(hit.l);
+});
+mapScroll.addEventListener("keydown", (e) => {
+  if (!S.toks.length) return;
+  let k = S.sel < 0 ? S.toks.length - 1 : S.sel;
+  if (e.key === "ArrowLeft") k--;
+  else if (e.key === "ArrowRight") k++;
+  else if (e.key === "Home") k = 0;
+  else if (e.key === "End") k = S.toks.length - 1;
+  else if (e.key === "ArrowUp") { e.preventDefault(); setLayer(Math.min(S.nL, (S.layer || 0) + 1)); return; }
+  else if (e.key === "ArrowDown") { e.preventDefault(); setLayer(Math.max(1, (S.layer || 2) - 1)); return; }
+  else return;
+  e.preventDefault();
+  selectToken(clamp(k, 0, S.toks.length - 1), { pin: true, revealMap: true, revealText: true });
+});
+
+// readout, attention, MLP, contributions, entropy
+$("readRows").addEventListener("click", (e) => { const row = e.target.closest(".rrow"); if (row && +row.dataset.l >= 1) setLayer(+row.dataset.l); });
+$("attnTop").addEventListener("click", (e) => {
+  const row = e.target.closest(".arow");
+  if (!row) return;
+  const c = S.chipEls[+row.dataset.p];
+  if (!c) return;
+  S.pendChips = c; S.chipsStick = false;
+  invalidate("scroll");
+  c.classList.add("flash");
+  setTimeout(() => c.classList.remove("flash"), 900);
+});
+$("mlpRows").addEventListener("click", (e) => { const row = e.target.closest(".mrow[data-l]"); if (row) setLayer(+row.dataset.l); });
+const contribCanvas = $("contribCanvas");
+contribCanvas.addEventListener("pointermove", (e) => {
+  const r = S.sel >= 0 ? S.toks[S.sel] : null;
+  if (!r) return;
+  const l = contribLayer(e);
+  if (l !== S.contribHover) { S.contribHover = l; invalidate("contrib"); }
+  showTip(e.clientX, e.clientY, (t) => {
+    t.append(el("div", "h", l === 0 ? "embeddings" : `layer ${l} of ${S.nL}`));
+    if (l >= 1) { tipRow(t, "attention output", fmtN(r.nA[l - 1])); tipRow(t, "MLP output", fmtN(r.nM[l - 1])); }
+    tipRow(t, l === 0 ? "residual (embedding)" : "residual after", fmtN(r.nR[l]));
+    if (l >= 1) t.append(el("div", "s", "click to inspect this layer"));
+  });
+});
+contribCanvas.addEventListener("pointerleave", () => { S.contribHover = -1; hideTip(); invalidate("contrib"); });
+contribCanvas.addEventListener("click", (e) => { const l = contribLayer(e); if (l >= 1) setLayer(l); });
+const entCanvas = $("entCanvas");
+entCanvas.addEventListener("pointermove", (e) => {
+  const r = S.sel >= 0 ? S.toks[S.sel] : null;
+  const hit = r ? entHit(e) : null;
+  const key = hit ? hit.l + ":" + hit.h : "";
+  if (key !== (S.entHover ? S.entHover.l + ":" + S.entHover.h : "")) { S.entHover = hit && hit.h >= 0 ? hit : null; invalidate("ent"); }
+  if (!hit || hit.h < 0) { hideTip(); return; }
+  const v = r.ent[(hit.l - 1) * S.nH + hit.h];
+  showTip(e.clientX, e.clientY, (t) => {
+    t.append(el("div", "h", `layer ${hit.l} · head ${hit.h}`));
+    tipRow(t, "entropy", v.toFixed(3) + " nats");
+    tipRow(t, "uniform over context", Math.log(r.pos + 1).toFixed(2) + " nats");
+    t.append(el("div", "s", "click to inspect this layer"));
+  });
+});
+entCanvas.addEventListener("pointerleave", () => { S.entHover = null; hideTip(); invalidate("ent"); });
+entCanvas.addEventListener("click", (e) => { const hit = entHit(e); if (hit) setLayer(S.layer === hit.l ? 0 : hit.l); });
+
+const ro = new ResizeObserver((entries) => {
+  for (const e of entries) {
+    if (e.target === mapScroll) S.mapViewW = Math.floor(e.contentRect.width);
+    else S.contribW = Math.floor(e.contentRect.width);
+  }
+  invalidate("map", "contrib", "ent");
+});
+ro.observe(mapScroll); ro.observe($("contribBox"));
+window.addEventListener("beforeunload", () => { if (S.generating) BORG.stop(); });
+
+/* ---------------------------------------------------------------- start */
+async function start() {
+  syncSegs();
+  applyTheme();
+  msgs.replaceChildren(intro());
+  setSendMode(false);
+  if (typeof BORG.onStatus === "function") BORG.onStatus(showEngineStatus);
+  try {
+    S.info = await BORG.info();
+  } catch (e) {
+    S.statusErr = "engine unavailable: " + (e && e.message || e);
+    $("modelInfo").textContent = "not connected";
+    renderStatus();
+    return;
+  }
+  const i = S.info;
+  S.nL = i.n_layers; S.nH = i.n_heads; S.ready = true;
+  const st = $("status").querySelector(".prog"); if (st) st.remove();
+  renderHeader();
+  const ls = $("layerSel");
+  for (let l = 1; l <= S.nL; l++) { const o = el("option", "", `Layer ${l}`); o.value = String(l); ls.append(o); }
+  $("sMax").max = i.n_ctx; $("sStride").max = S.nL;
+  syncSettingsUI();
+  invalidate("sel", "map", "status", "legend");
+  input.focus();
+}
+start();
+})();
+</script>
+</body>
+</html>
