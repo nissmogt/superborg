@@ -49,6 +49,10 @@ BORG_API int borg_pool_size(const borg_pool *pool);
 /* ---- model ---------------------------------------------------------------- */
 /* Returns NULL on failure and writes a message into err (if err != NULL). */
 BORG_API borg_model *borg_model_load(const char *path, char *err, int errlen);
+/* Load from a buffer holding a whole .borg file (for environments without files, e.g.
+ * WebAssembly in a browser). The buffer must stay valid, unchanged and 64-byte aligned
+ * until borg_model_free; the model does not take ownership. */
+BORG_API borg_model *borg_model_load_memory(const void *data, size_t size, char *err, int errlen);
 BORG_API void borg_model_free(borg_model *model);
 BORG_API void borg_model_config(const borg_model *model, borg_config *out);
 BORG_API const char *borg_model_header(const borg_model *model); /* raw JSON header, NUL-terminated */
@@ -78,6 +82,7 @@ typedef struct {
 } borg_ctx_params;
 
 BORG_API borg_ctx_params borg_ctx_default_params(void);
+/* NULL when out of memory, or when a buffer's size does not fit size_t (32-bit targets: wasm32). */
 BORG_API borg_ctx *borg_ctx_new(borg_model *model, borg_pool *pool, const borg_ctx_params *params);
 BORG_API void borg_ctx_free(borg_ctx *ctx);
 BORG_API int borg_ctx_n_ctx(const borg_ctx *ctx);
@@ -105,6 +110,26 @@ BORG_API int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src);
  * fits the context. Return 0 on success. */
 BORG_API int borg_ctx_save(const borg_ctx *ctx, const char *path);
 BORG_API int borg_ctx_load(borg_ctx *ctx, const char *path);
+
+/* Activation tracing for interpretability. When enabled, every borg_decode (and every target
+ * pass of borg_generate) records the internals of the LAST token it processed: the residual
+ * stream after each layer, each head's attention weights, the MLP hidden activations and
+ * the sizes of each layer's contributions. Speculative batches trace their last row only. */
+BORG_API int borg_ctx_enable_trace(borg_ctx *ctx, int enable);
+/* Position of the traced token, or -1 if nothing has been traced yet. */
+BORG_API int borg_ctx_trace_pos(const borg_ctx *ctx);
+/* Residual stream: layer 0 = token embedding, layer l = output of layer l (1..n_layers). dim floats. */
+BORG_API const float *borg_ctx_trace_resid(const borg_ctx *ctx, int layer);
+/* Softmax attention weights of a query head over positions 0..pos (pos + 1 floats via *n_pos). */
+BORG_API const float *borg_ctx_trace_attn(const borg_ctx *ctx, int layer, int head, int *n_pos);
+/* MLP hidden activations act(gate) * up of a layer (hidden_dim floats). */
+BORG_API const float *borg_ctx_trace_mlp(const borg_ctx *ctx, int layer);
+/* n_layers x 3 floats: norm of the attention output, of the MLP output, of the residual after. */
+BORG_API const float *borg_ctx_trace_norms(const borg_ctx *ctx);
+/* Logit lens: apply the final norm and output projection to the traced residual of each
+ * listed layer (0..n_layers) and write n * vocab_size logits. Layer n_layers gives the model's
+ * own logits. Uses the context's scratch memory and pool; call between decodes. */
+BORG_API int borg_ctx_lens(borg_ctx *ctx, const int *layers, int n, float *logits);
 
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);

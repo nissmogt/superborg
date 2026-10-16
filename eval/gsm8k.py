@@ -53,6 +53,16 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return max(0.0, c - h), min(1.0, c + h)
 
 
+def mcnemar(wins: int, losses: int) -> float:
+    """Exact two-sided McNemar test: p value of `wins` against `losses` discordant pairs
+    (problems only one of two strategies solved) under the null of equal accuracy."""
+    n = wins + losses
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, i) for i in range(min(wins, losses) + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
 def summarize(records: list[dict], strategies: list[str]) -> dict:
     out = {}
     by = {s: {r["index"]: r for r in records if r["strategy"] == s} for s in strategies}
@@ -71,21 +81,24 @@ def summarize(records: list[dict], strategies: list[str]) -> dict:
             common = [i for i in by[s] if i in by[base]]
             row["wins_vs_" + base] = sum(by[s][i]["correct"] and not by[base][i]["correct"] for i in common)
             row["losses_vs_" + base] = sum(by[base][i]["correct"] and not by[s][i]["correct"] for i in common)
+            row["p_vs_" + base] = mcnemar(row["wins_vs_" + base], row["losses_vs_" + base])
         out[s] = row
     return out
 
 
 def format_table(summary: dict, base: str | None = None) -> str:
     lines = [f"{'strategy':10s} {'acc':>6s} {'correct':>8s} {'95% CI':>13s} {'s/q':>7s} {'tok/q':>7s} "
-             f"{'samples':>7s} {'vs ' + base if base else '':>9s}",
-             "-" * 74]
+             f"{'samples':>7s} {'vs ' + base if base else '':>9s} {'p' if base else '':>6s}",
+             "-" * 81]
     for s, r in summary.items():
-        vs = ""
+        vs = p = ""
         if base and s != base:
             vs = f"+{r['wins_vs_' + base]}/-{r['losses_vs_' + base]}"
+            if "p_vs_" + base in r:
+                p = f"{r['p_vs_' + base]:.3f}"
         lines.append(f"{s:10s} {100 * r['accuracy']:5.1f}% {r['correct']:>4d}/{r['n']:<3d} "
                      f"{100 * r['ci95'][0]:5.1f}-{100 * r['ci95'][1]:4.1f}% {r['sec_per_q']:7.1f} "
-                     f"{r['tokens_per_q']:7.0f} {r['samples_per_q']:7.1f} {vs:>9s}")
+                     f"{r['tokens_per_q']:7.0f} {r['samples_per_q']:7.1f} {vs:>9s} {p:>6s}")
     return "\n".join(lines)
 
 

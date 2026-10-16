@@ -220,3 +220,39 @@ def test_generate_multi_rejects_small_batches(f32):
     ctxs = [f32.context(n_ctx=64, n_batch=8)] + [f32.context(n_ctx=64, n_batch=2) for _ in range(3)]
     with pytest.raises(RuntimeError):
         generate_multi(ctxs, ids, max_tokens=4)
+
+
+# ---- activation tracing ------------------------------------------------------------
+
+def test_trace_matches_reference_and_own_logits(f32):
+    from superborg.reference import ReferenceModel
+    toks = f32.tokenize("The quick brown fox jumps over the lazy")
+    c = f32.context(n_ctx=64)
+    c.enable_trace()
+    logits = c.decode(toks, "last")
+    tr = c.trace()
+    cfg = f32.config
+    nl = cfg["n_layers"]
+    assert tr["pos"] == len(toks) - 1
+    assert tr["resid"].shape == (nl + 1, cfg["dim"]) and tr["mlp"].shape == (nl, cfg["hidden_dim"])
+    assert tr["attn"].shape == (nl, cfg["n_heads"], len(toks))
+    assert np.allclose(tr["attn"].sum(axis=-1), 1.0, atol=1e-5)
+    assert np.allclose(tr["norms"][:, 2], np.linalg.norm(tr["resid"][1:], axis=1), rtol=1e-4)
+    lens = c.lens(list(range(nl + 1)))
+    assert np.array_equal(lens[nl], logits)  # the last layer's lens is the model's output
+    # lens(l) equals the output of the model cut after l layers (NumPy reference)
+    ref = ReferenceModel(F32)
+    full = list(ref.layers)
+    for l in (0, 1, nl // 2, nl):
+        ref.layers = full[:l]
+        out = ref.forward(toks)[-1]
+        assert np.abs(out - lens[l]).max() <= 1e-4 * max(1.0, float(np.abs(out).max())), l
+    ref.layers = full
+    # incremental decoding traces the newest token
+    nxt = int(logits[: f32.n_vocab].argmax())
+    c.decode([nxt], "last")
+    assert c.trace()["pos"] == len(toks)
+    with pytest.raises(ValueError):
+        c.lens([nl + 1])
+    fresh = f32.context(n_ctx=16)
+    assert fresh.trace() is None

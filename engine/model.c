@@ -95,6 +95,7 @@ static int map_file(const char *path, borg_model *m, char *err, int errlen) {
 
 static void unmap_file(borg_model *m) {
     if (!m->map) return;
+    if (m->map_is_malloc == 2) return; /* caller's buffer (borg_model_load_memory) */
     if (m->map_is_malloc) { free(m->map); return; }
 #if defined(_WIN32)
     UnmapViewOfFile(m->map);
@@ -132,16 +133,21 @@ const borg_tensor *model_find_tensor(const borg_model *m, const char *name) {
     return NULL;
 }
 
-static size_t tensor_expected_bytes(const borg_tensor *t) {
-    int64_t n = 1;
-    for (int i = 0; i < t->ndim; i++) n *= t->shape[i];
+/* In 64 bits, so a size that does not fit a 32-bit size_t (wasm32) cannot wrap to a small one;
+   UINT64_MAX (matches no tensor) when the shape's element count passes 2^60. */
+static uint64_t tensor_expected_bytes(const borg_tensor *t) {
+    uint64_t n = 1;
+    for (int i = 0; i < t->ndim; i++) {
+        if (t->shape[i] && n > ((uint64_t)1 << 60) / (uint64_t)t->shape[i]) return UINT64_MAX;
+        n *= (uint64_t)t->shape[i];
+    }
     switch (t->dtype) {
-    case DT_F32: case DT_U32: case DT_I32: return (size_t)n * 4;
-    case DT_F16: case DT_BF16: return (size_t)n * 2;
-    case DT_U8: return (size_t)n;
-    case DT_Q8_0: return (size_t)(n / QK) * sizeof(block_q8_0);
-    case DT_Q4_0: return (size_t)(n / QK) * sizeof(block_q4_0);
-    case DT_Q4_1: return (size_t)(n / QK) * sizeof(block_q4_1);
+    case DT_F32: case DT_U32: case DT_I32: return n * 4;
+    case DT_F16: case DT_BF16: return n * 2;
+    case DT_U8: return n;
+    case DT_Q8_0: return n / QK * sizeof(block_q8_0);
+    case DT_Q4_0: return n / QK * sizeof(block_q4_0);
+    case DT_Q4_1: return n / QK * sizeof(block_q4_1);
     default: return 0;
     }
 }
@@ -271,12 +277,9 @@ void borg_model_free(borg_model *m) {
     free(m);
 }
 
-borg_model *borg_model_load(const char *path, char *err, int errlen) {
-    if (err && errlen > 0) err[0] = 0;
-    borg_model *m = (borg_model *)calloc(1, sizeof(borg_model));
-    if (!m) { borg_set_err(err, errlen, "out of memory"); return NULL; }
+/* Parse and validate a model whose bytes are already at m->map; frees m on failure. */
+static borg_model *load_mapped(borg_model *m, const char *path, char *err, int errlen) {
     json_value *root = NULL;
-    if (map_file(path, m, err, errlen)) goto fail;
     const uint8_t *base = (const uint8_t *)m->map;
     if (m->map_size < 16 || memcmp(base, "BORG", 4) != 0) { borg_set_err(err, errlen, "%s is not a .borg file", path); goto fail; }
     uint32_t version;
@@ -291,7 +294,7 @@ borg_model *borg_model_load(const char *path, char *err, int errlen) {
     m->header_json[hlen] = 0;
     root = json_parse(m->header_json, hlen, err, errlen);
     if (!root) goto fail;
-    size_t data_start = (16 + hlen + 63) / 64 * 64;
+    const uint64_t data_start = (16 + hlen + 63) / 64 * 64;
 
     /* tensors */
     const json_value *tens = json_get(root, "tensors");
@@ -310,14 +313,14 @@ borg_model *borg_model_load(const char *path, char *err, int errlen) {
             borg_set_err(err, errlen, "tensor %s: bad shape", t->name); goto fail;
         }
         t->ndim = shape->len;
-        for (int d = 0; d < t->ndim; d++) /* 2^31 per dimension and ndim <= 4 keep products in int64 */
+        for (int d = 0; d < t->ndim; d++) /* element counts are checked by tensor_expected_bytes */
             if (json_int(&shape->items[d], -1, 0, (double)INT_MAX, &t->shape[d])) {
                 borg_set_err(err, errlen, "tensor %s: bad shape", t->name); goto fail;
             }
-        int64_t off64, nb64;
+        int64_t off64, nb64; /* each at most map_size: the 64-bit sum cannot wrap */
         if (json_int(json_get(tv, "offset"), -1, 0, (double)m->map_size, &off64) ||
             json_int(json_get(tv, "nbytes"), -1, 0, (double)m->map_size, &nb64) ||
-            data_start + (size_t)off64 + (size_t)nb64 > m->map_size) {
+            data_start + (uint64_t)off64 + (uint64_t)nb64 > (uint64_t)m->map_size) {
             borg_set_err(err, errlen, "tensor %s lies outside the file", t->name); goto fail;
         }
         const size_t off = (size_t)off64, nb = (size_t)nb64;
@@ -325,10 +328,10 @@ borg_model *borg_model_load(const char *path, char *err, int errlen) {
             borg_set_err(err, errlen, "tensor %s is not 64-byte aligned", t->name); goto fail;
         }
         t->nbytes = nb;
-        if (tensor_expected_bytes(t) != t->nbytes) {
+        if (tensor_expected_bytes(t) != (uint64_t)nb64) {
             borg_set_err(err, errlen, "tensor %s: size %zu does not match its shape", t->name, t->nbytes); goto fail;
         }
-        t->data = base + data_start + off;
+        t->data = base + (size_t)data_start + off;
     }
 
     /* config */
@@ -434,6 +437,27 @@ fail:
     json_free(root);
     borg_model_free(m);
     return NULL;
+}
+
+borg_model *borg_model_load(const char *path, char *err, int errlen) {
+    if (err && errlen > 0) err[0] = 0;
+    borg_model *m = (borg_model *)calloc(1, sizeof(borg_model));
+    if (!m) { borg_set_err(err, errlen, "out of memory"); return NULL; }
+    if (map_file(path, m, err, errlen)) {
+        borg_model_free(m);
+        return NULL;
+    }
+    return load_mapped(m, path, err, errlen);
+}
+
+borg_model *borg_model_load_memory(const void *data, size_t size, char *err, int errlen) {
+    if (err && errlen > 0) err[0] = 0;
+    borg_model *m = (borg_model *)calloc(1, sizeof(borg_model));
+    if (!m) { borg_set_err(err, errlen, "out of memory"); return NULL; }
+    m->map = (void *)data;
+    m->map_size = size;
+    m->map_is_malloc = 2;
+    return load_mapped(m, "<memory>", err, errlen);
 }
 
 void borg_model_config(const borg_model *m, borg_config *out) { *out = m->cfg; }

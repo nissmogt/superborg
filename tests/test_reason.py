@@ -577,6 +577,11 @@ def test_gsm8k_harness_with_fake_model(tmp_path):
     assert "cot" in table and "50.0%" in table
     lo, hi = gsm8k.wilson(20, 40)
     assert 0.34 < lo < 0.36 and 0.64 < hi < 0.66
+    assert s["pal"]["p_vs_cot"] == 1.0
+    # exact McNemar: 16 against 4 discordant problems, and the symmetric and empty cases
+    assert abs(gsm8k.mcnemar(16, 4) - 0.011818) < 1e-6
+    assert gsm8k.mcnemar(4, 16) == gsm8k.mcnemar(16, 4)
+    assert gsm8k.mcnemar(0, 0) == 1.0 and gsm8k.mcnemar(3, 3) == 1.0
 
 
 # =========================================================================================

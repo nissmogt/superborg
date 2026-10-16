@@ -7,6 +7,7 @@
     chat MODEL                interactive chat with history
     ask MODEL QUESTION        answer with test-time reasoning (voting, programs, verification, retrieval)
     serve MODEL               OpenAI-compatible HTTP server
+    ui MODEL                  local web UI: chat, and watch each reply token form inside the model
     bench MODEL               prefill/decode speed and speculative decoding statistics
 
 MODEL is a path to a .borg file, or a name looked up in $SUPERBORG_MODELS (default
@@ -436,6 +437,14 @@ def cmd_serve(a) -> int:
     return 0
 
 
+def cmd_ui(a) -> int:
+    from .ui import serve_ui
+
+    serve_ui(resolve_model(a.model), host=a.host, port=a.port, threads=a.threads, n_ctx=a.ctx,
+             lens_stride=a.lens_stride, open_browser=a.open, quiet=not a.verbose, allow_hosts=a.allow_host)
+    return 0
+
+
 _BENCH_TEXT = (
     "The history of computing is a story of abstraction. Early machines were programmed by rewiring "
     "panels; later, stored programs let the same hardware run many tasks. Compilers translated readable "
@@ -639,6 +648,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "local-origin requests; off by default because prompts can steer that code")
     p.add_argument("-v", "--verbose", action="store_true", help="log requests")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("ui", help="local web UI: chat and watch each reply token form inside the model")
+    p.add_argument("model", help="path to a .borg file (or a name in $SUPERBORG_MODELS)")
+    p.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1: this machine only)")
+    p.add_argument("--port", type=int, default=8765, help="port (default 8765; 0 picks a free one)")
+    p.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                   help="also answer requests addressed to this host name (repeatable; local names and IP "
+                        "addresses always work, other names are refused as a guard against DNS rebinding)")
+    p.add_argument("-t", "--threads", type=int, default=0, help="worker threads (default: all cores)")
+    p.add_argument("-c", "--ctx", type=int, default=4096, help="context length in tokens (default 4096)")
+    p.add_argument("--lens-stride", type=_positive, default=1, metavar="N",
+                   help="logit lens on every N-th layer (default 1: all; larger is faster per token)")
+    p.add_argument("--open", action="store_true", help="open the UI in a web browser")
+    p.add_argument("-v", "--verbose", action="store_true", help="log requests")
+    p.set_defaults(func=cmd_ui)
 
     p = sub.add_parser("bench", help="measure prefill and decode speed")
     _add_model_opts(p, ctx=0)

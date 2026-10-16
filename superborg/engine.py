@@ -107,6 +107,13 @@ def lib():
         "borg_ctx_embedding": (fp, [vp]),
         "borg_decode_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, fp]),
         "borg_ctx_copy": (ctypes.c_int, [vp, vp]),
+        "borg_ctx_enable_trace": (ctypes.c_int, [vp, ctypes.c_int]),
+        "borg_ctx_trace_pos": (ctypes.c_int, [vp]),
+        "borg_ctx_trace_resid": (fp, [vp, ctypes.c_int]),
+        "borg_ctx_trace_attn": (fp, [vp, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]),
+        "borg_ctx_trace_mlp": (fp, [vp, ctypes.c_int]),
+        "borg_ctx_trace_norms": (fp, [vp]),
+        "borg_ctx_lens": (ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.c_int, fp]),
         "borg_ctx_save": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_ctx_load": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_generate_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, ctypes.c_int,
@@ -391,6 +398,50 @@ class Context:
         if rc != 0:
             raise ValueError(f"cannot load KV cache {path}: " + {-1: "cannot open", -2: "incompatible model or "
                              "context too small", -3: "truncated or corrupt file"}.get(rc, str(rc)))
+
+    # ---- interpretability ----------------------------------------------------
+    def enable_trace(self, enable: bool = True) -> None:
+        """Record the internals of the last token of every forward pass (see trace())."""
+        if lib().borg_ctx_enable_trace(self._c, int(enable)) != 0:
+            raise MemoryError("cannot allocate trace buffers")
+
+    def trace(self, attention: bool = True, mlp: bool = True) -> dict | None:
+        """Internals of the last traced token as NumPy arrays (copies), or None.
+
+        pos: its position; resid [n_layers + 1, dim]: embeddings then each layer's output;
+        norms [n_layers, 3]: |attention output|, |MLP output|, |residual after|;
+        attn [n_layers, n_heads, pos + 1]: attention weights; mlp [n_layers, hidden_dim]."""
+        L = lib()
+        pos = L.borg_ctx_trace_pos(self._c)
+        if pos < 0:
+            return None
+        cfg = self.model.config
+        nl, d, nh, f = cfg["n_layers"], cfg["dim"], cfg["n_heads"], cfg["hidden_dim"]
+        resid = np.ctypeslib.as_array(L.borg_ctx_trace_resid(self._c, 0), shape=((nl + 1) * d,))
+        out = {"pos": pos, "resid": resid.reshape(nl + 1, d).copy(),
+               "norms": np.ctypeslib.as_array(L.borg_ctx_trace_norms(self._c), shape=(nl * 3,)).reshape(nl, 3).copy()}
+        if attention:
+            n = ctypes.c_int(0)
+            base = L.borg_ctx_trace_attn(self._c, 0, 0, ctypes.byref(n))
+            full = np.ctypeslib.as_array(base, shape=(nl * nh * self.n_ctx,)).reshape(nl, nh, self.n_ctx)
+            out["attn"] = full[:, :, : n.value].copy()
+        if mlp:
+            out["mlp"] = np.ctypeslib.as_array(L.borg_ctx_trace_mlp(self._c, 0), shape=(nl * f,)).reshape(nl, f).copy()
+        return out
+
+    def lens(self, layers: Sequence[int]) -> np.ndarray:
+        """Logit lens of the traced token: final norm + output projection applied to the
+        residual after each listed layer (0 = embeddings, n_layers = the model's own output)."""
+        layers = list(layers)
+        if not layers:
+            return np.zeros((0, self.model.vocab_size), dtype=np.float32)
+        arr = (ctypes.c_int * len(layers))(*layers)
+        out = np.empty((len(layers), self.model.vocab_size), dtype=np.float32)
+        rc = lib().borg_ctx_lens(self._c, arr, len(layers), out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        if rc != 0:
+            raise ValueError({-1: "nothing traced yet (enable_trace, then decode)",
+                              -3: "layer out of range"}.get(rc, f"lens failed ({rc})"))
+        return out
 
     def embedding(self) -> np.ndarray:
         p = lib().borg_ctx_embedding(self._c)

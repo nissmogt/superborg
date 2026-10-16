@@ -104,7 +104,9 @@ a calibration text, and keeps `attn_v` and `ffn_down` at 8 bits.
 
 ### Reasoning strategies on GSM8K
 
-See [Reasoning results](#reasoning-results) below.
+Qwen2.5-1.5B-Instruct at 4 bits on 100 held-out problems: 68% when asked the question as
+is, 76% with a step-by-step prompt, 80% with a majority vote over 5 step-by-step solutions.
+Details in [Reasoning results](#reasoning-results) below.
 
 ## Quick start
 
@@ -147,6 +149,55 @@ ans = solve(llm, "If 3 pencils cost $0.75, how much do 20 pencils cost?", strate
 print(ans.answer, ans.strategy)
 ```
 
+## Activation viewer
+
+```sh
+python -m superborg ui qwen2.5-0.5b-q8_0.borg --open     # http://127.0.0.1:8765/
+```
+
+A chat on the left; on the right, for every generated token, what happened inside the
+model while it produced that token (`superborg/interp.py`, from one traced forward pass):
+
+* emergence map: the logit lens (final norm and unembedding applied to the residual stream
+  after each layer) as a layers × tokens heatmap of the probability of the token finally
+  chosen, with the first layer where it becomes the top prediction marked;
+* layer-by-layer readout: the lens's top prediction, and the chosen token's probability
+  and rank, after each layer;
+* the output distribution's top 5 and its entropy;
+* contributions: the norm of each layer's attention output and MLP output and of the
+  residual stream;
+* attention: the context tokens the query attended to most, per layer (mean over heads),
+  and every head's attention entropy;
+* the most strongly activated MLP neurons of the selected layer.
+
+Layer k is the residual stream after block k (0 is the embeddings). Click a token or a map
+cell to pin it; `--lens-stride N` traces the lens on every N-th layer for speed. The server
+binds to localhost, runs one generation at a time and rejects requests from other origins.
+With full tracing, generation ran at about 6 tok/s for Qwen2.5-0.5B and about 15 tok/s for
+SmolLM2-135M on 2 threads here (the lens projection through the full vocabulary costs more
+than the forward pass).
+
+## In the browser
+
+The same C engine compiles to WebAssembly (`wasm/build.sh`, clang with the wasm32-wasi
+target) and runs in a Web Worker. `wasm/make_artifact.py` packages the chat and activation
+viewer above with the engine and a model as a static site:
+
+```sh
+wasm/build.sh                    # build/borg.wasm (SIMD128, single thread)
+wasm/build-js.sh                 # optional build/borg-asm.js for pages that block WebAssembly
+python wasm/make_artifact.py smollm2-135m-q4.borg site/
+cd site && python -m http.server # open http://localhost:8000/
+```
+
+Measured on this machine in headless Chromium with SmolLM2-135M q4 (110.8 MB, downloaded
+in 8 parts and cached in IndexedDB): about 32 ms per decoded token, and 6.6–9.4 tok/s for
+chat with the full trace (logit lens on every third layer, attention, MLP, norms) recorded
+for every token. The lens costs more than the decode step itself (11 rows through the
+49,152 × 576 output matrix, about 43 ms). The wasm2js fallback runs the same chat at
+1.6 tok/s. `tests/test_wasm.py` checks the WebAssembly build against the native engine:
+identical tokenization, logits within 4e-4 of the native f32 result, the same trace events.
+
 ## Supported models
 
 Decoder-only models with these Hugging Face `model_type` values: `llama` (Llama 2/3,
@@ -158,12 +209,49 @@ tokenizers, added tokens with strip rules) instead of converting them approximat
 
 ## Reasoning results
 
-<!-- filled in from eval/gsm8k.py runs -->
+GSM8K test problems 200–299, Qwen2.5-1.5B-Instruct with the `q4` recipe, 2048-token
+context, at most 512 generated tokens per candidate, sampled candidates at temperature 0.7
+and top-p 0.95, seed 0. The prompts and answer extraction were developed on problems 0–39
+and 100–128 with Qwen2.5-0.5B; one problem of this range (#281) also appears in a test of
+the question router, which these runs do not use.
+
+```sh
+python -m eval.gsm8k --model qwen2.5-1.5b-q4.borg --data gsm8k_test.jsonl --offset 200 --n 100 \
+    --strategies direct,cot,vote,pal_vote --samples 5 --threads 4 --out results.json
+```
+
+| strategy | what it does | accuracy | 95% CI | solved where direct failed / failed where direct solved | p vs direct | tokens per problem |
+|---|---|---|---|---|---|---|
+| `direct` | one greedy answer to the question as asked (the instruct model still writes out its working) | 68% | 58–76% | – | – | 288 |
+| `cot` | one greedy solution to "reason step by step, and put your final answer within \boxed{}" | 76% | 67–83% | 14 / 6 | 0.12 | 298 |
+| `vote` | the `cot` solution plus 4 sampled ones, majority vote on the final answer | 80% | 71–87% | 16 / 4 | 0.012 | 1,463 |
+| `pal_vote` | 5 Python programs (greedy with one repair attempt, plus 4 sampled) executed and their results voted; a greedy step-by-step solution decides ties | 73% | 64–81% | 18 / 13 | 0.47 | 475 |
+
+The p values are exact two-sided McNemar tests on the paired per-problem results and the
+intervals are Wilson intervals, both computed by `eval/gsm8k.py`. Per-problem records with
+every candidate are in `eval/results/gsm8k_qwen2.5-1.5b-q4_200-299.json`; running the
+command above with `--out` pointing at that file prints the table again without generating.
+
+* Most of the gain comes from the step-by-step prompt: 68% to 76% (p = 0.12). Voting adds
+  4 points over the same greedy solution (6 problems gained, 2 lost against `cot`,
+  p = 0.29). Only the combined gain over `direct` is unlikely to be chance (p = 0.012, or
+  0.035 after a Bonferroni correction for the three comparisons). Voting generates 5.1
+  times as many tokens.
+* Programs solve a different subset: `pal_vote` fixes 18 problems the direct answer gets
+  wrong and breaks 13 it gets right. 13 of its 500 programs produced no answer (syntax and
+  name errors, timeouts, one cut off at the token limit). The written tiebreaker ran on 14
+  problems and changed the outcome on 5 (4 to correct, 1 to wrong).
+* 90 problems are solved by at least one of the four strategies and 10 by none, so choosing
+  the best of these four runs for each problem would reach at most 90%. On 3 of the 10, a
+  correct candidate lost the vote or the tie-break.
+* The run shared a 4-core machine with other jobs (tests, builds) for much of the time, so
+  its wall-clock times (21–60 s per problem on average, depending on the strategy) are not
+  a speed measurement; see [Speed](#speed) for those.
 
 ## Limitations
 
-* The quality ceiling is the base model. A 1.5B model with voting and code execution
-  solves more grade-school math problems than it does alone, but it is still a 1.5B model.
+* The quality ceiling is the base model. Step-by-step prompting with voting lifts a 1.5B
+  model from 68% to 80% on grade-school math above, but it is still a 1.5B model.
 * Prompt evaluation is slower than llama.cpp's on an idle machine (see above).
 * CPU only. MSVC builds are single-threaded (MinGW and clang builds use threads).
 * `pal`, `pal_vote` and the agent run model-written Python in a subprocess with resource
@@ -174,13 +262,15 @@ tokenizers, added tokens with strip rules) instead of converting them approximat
 
 ```
 engine/              C engine (borg.h is the public API)
-superborg/           Python package: engine binding, converter, chat, reasoning, server, CLI
+superborg/           Python package: engine binding, converter, chat, reasoning, server, UI, CLI
+superborg/web/       the activation viewer page (one HTML file)
 docs/FORMAT.md       the .borg file format
 docs/ARCHITECTURE.md design notes
 tests/               pytest suites (tokenizer parity, reference, engine, server, reasoning)
 tests/c/             C kernel and JSON-mode tests (make test-c)
 bench/               benchmarks and their logs
 eval/gsm8k.py        GSM8K evaluation of the reasoning strategies
+wasm/                WebAssembly build, browser runtime, Web Worker and static-site packager
 tools/               Unicode table generator, Hugging Face oracle, fixture builder
 ```
 

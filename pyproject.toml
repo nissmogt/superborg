@@ -31,5 +31,6 @@ include-package-data = false
 
 [tool.setuptools.package-data]
 # the engine library is compiled into superborg/_lib/ by setup.py at build time;
-# data/ holds files the modules read at run time (e.g. the converter's calibration text)
-superborg = ["_lib/*", "data/*"]
+# data/ holds files the modules read at run time (e.g. the converter's calibration text);
+# web/ holds the UI page served by `superborg ui`
+superborg = ["_lib/*", "data/*", "web/*.html"]

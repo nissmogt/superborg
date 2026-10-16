@@ -145,7 +145,9 @@ def _number(body: dict, name: str, default, kind: type, lo=None, hi=None, aliase
     else:
         value = float(value)
     if (lo is not None and value < lo) or (hi is not None and value > hi):
-        raise APIError(400, f"'{name}' must be in [{lo}, {hi}]", param=name)
+        bounds = f"in [{lo}, {hi}]" if lo is not None and hi is not None else \
+            f"at least {lo}" if lo is not None else f"at most {hi}"
+        raise APIError(400, f"'{name}' must be {bounds}", param=name)
     return value
 
 
@@ -191,14 +193,18 @@ def _content_text(content: Any, where: str) -> str:
         return _text(content, f"{where}.content", "messages")
     if isinstance(content, list):
         out = []
-        for part in content:
+        for j, part in enumerate(content):
             if isinstance(part, str):
                 out.append(part)
             elif isinstance(part, dict) and part.get("type") in ("text", "input_text"):
-                out.append(str(part.get("text", "")))
+                if not isinstance(part.get("text"), str):  # never str(None) or a repr into the prompt
+                    raise APIError(400, f"{where}.content[{j}]: 'text' must be a string", param="messages")
+                out.append(part["text"])
             elif isinstance(part, dict):
                 raise APIError(400, f"{where}: content part type '{part.get('type')}' is not supported",
                                param="messages")
+            else:
+                raise APIError(400, f"{where}.content[{j}] must be a string or an object", param="messages")
         return _text("".join(out), f"{where}.content", "messages")
     raise APIError(400, f"{where}: 'content' must be a string or a list of parts", param="messages")
 

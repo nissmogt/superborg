@@ -20,6 +20,10 @@
 #define BORG_NEON 1
 #include <arm_neon.h>
 #endif
+#if defined(__wasm_simd128__)
+#define BORG_WASM 1
+#include <wasm_simd128.h>
+#endif
 
 const char *borg_simd(void) {
 #if defined(BORG_VNNI)
@@ -30,6 +34,8 @@ const char *borg_simd(void) {
     return "neon-dotprod";
 #elif defined(BORG_NEON)
     return "neon";
+#elif defined(BORG_WASM)
+    return "wasm-simd128";
 #else
     return "scalar";
 #endif
@@ -184,6 +190,15 @@ float vec_dot_f32(const float *a, const float *b, int n) {
         acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
     }
     sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+#elif defined(BORG_WASM)
+    v128_t acc0 = wasm_f32x4_splat(0.0f), acc1 = wasm_f32x4_splat(0.0f);
+    for (; i + 8 <= n; i += 8) {
+        acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_v128_load(a + i), wasm_v128_load(b + i)));
+        acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_v128_load(a + i + 4), wasm_v128_load(b + i + 4)));
+    }
+    acc0 = wasm_f32x4_add(acc0, acc1);
+    sum = wasm_f32x4_extract_lane(acc0, 0) + wasm_f32x4_extract_lane(acc0, 1) + wasm_f32x4_extract_lane(acc0, 2) +
+          wasm_f32x4_extract_lane(acc0, 3);
 #endif
     for (; i < n; i++) sum += a[i] * b[i];
     return sum;
@@ -197,6 +212,10 @@ void vec_axpy_f32(float *y, float a, const float *x, int n) {
 #elif defined(BORG_NEON)
     float32x4_t va = vdupq_n_f32(a);
     for (; i + 4 <= n; i += 4) vst1q_f32(y + i, vfmaq_f32(vld1q_f32(y + i), va, vld1q_f32(x + i)));
+#elif defined(BORG_WASM)
+    v128_t va = wasm_f32x4_splat(a);
+    for (; i + 4 <= n; i += 4)
+        wasm_v128_store(y + i, wasm_f32x4_add(wasm_v128_load(y + i), wasm_f32x4_mul(va, wasm_v128_load(x + i))));
 #endif
     for (; i < n; i++) y[i] += a * x[i];
 }
@@ -276,6 +295,18 @@ static inline __m256i dot_u8_i8(__m256i u, __m256i s) {
 }
 #endif
 
+#if defined(BORG_WASM)
+/* sum of 16 int8 products as 4 int32 lanes */
+static inline v128_t wasm_dot_i8x16(v128_t a, v128_t b) {
+    return wasm_i32x4_add(wasm_i32x4_dot_i16x8(wasm_i16x8_extend_low_i8x16(a), wasm_i16x8_extend_low_i8x16(b)),
+                          wasm_i32x4_dot_i16x8(wasm_i16x8_extend_high_i8x16(a), wasm_i16x8_extend_high_i8x16(b)));
+}
+static inline float wasm_hsum_f32(v128_t v) {
+    return wasm_f32x4_extract_lane(v, 0) + wasm_f32x4_extract_lane(v, 1) + wasm_f32x4_extract_lane(v, 2) +
+           wasm_f32x4_extract_lane(v, 3);
+}
+#endif
+
 static float vec_dot_q8_0_q8a(const block_q8_0 *w, const block_q8a *x, int nb) {
     int i = 0;
     float sum = 0.0f;
@@ -316,6 +347,14 @@ static float vec_dot_q8_0_q8a(const block_q8_0 *w, const block_q8a *x, int nb) {
         else acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p), d);
     }
     sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+#elif defined(BORG_WASM)
+    v128_t acc = wasm_f32x4_splat(0.0f);
+    for (; i < nb; i++) {
+        const v128_t p = wasm_i32x4_add(wasm_dot_i8x16(wasm_v128_load(w[i].qs), wasm_v128_load(x[i].qs)),
+                                        wasm_dot_i8x16(wasm_v128_load(w[i].qs + 16), wasm_v128_load(x[i].qs + 16)));
+        acc = wasm_f32x4_add(acc, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(p), wasm_f32x4_splat(fp16_to_fp32(w[i].d) * x[i].d)));
+    }
+    sum = wasm_hsum_f32(acc);
 #endif
     for (; i < nb; i++) {
         int s = 0;
@@ -363,6 +402,18 @@ static float vec_dot_q4_0_q8a(const block_q4_0 *w, const block_q8a *x, int nb) {
         acc = vmlaq_n_f32(acc, vcvtq_f32_s32(p), fp16_to_fp32(w[i].d) * x[i].d);
     }
     sum = vaddvq_f32(acc);
+#elif defined(BORG_WASM)
+    const v128_t m4 = wasm_i8x16_splat(0x0F), s8 = wasm_i8x16_splat(8);
+    v128_t acc = wasm_f32x4_splat(0.0f);
+    for (; i < nb; i++) {
+        const v128_t raw = wasm_v128_load(w[i].qs);
+        const v128_t lo = wasm_i8x16_sub(wasm_v128_and(raw, m4), s8);
+        const v128_t hi = wasm_i8x16_sub(wasm_u8x16_shr(raw, 4), s8);
+        const v128_t p = wasm_i32x4_add(wasm_dot_i8x16(lo, wasm_v128_load(x[i].qs)),
+                                        wasm_dot_i8x16(hi, wasm_v128_load(x[i].qs + 16)));
+        acc = wasm_f32x4_add(acc, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(p), wasm_f32x4_splat(fp16_to_fp32(w[i].d) * x[i].d)));
+    }
+    sum = wasm_hsum_f32(acc);
 #endif
     for (; i < nb; i++) {
         int s = 0;
@@ -413,6 +464,18 @@ static float vec_dot_q4_1_q8a(const block_q4_1 *w, const block_q8a *x, int nb) {
         corr += fp16_to_fp32(w[i].m) * x[i].s;
     }
     sum = vaddvq_f32(acc) + corr;
+#elif defined(BORG_WASM)
+    const v128_t m4 = wasm_i8x16_splat(0x0F);
+    v128_t acc = wasm_f32x4_splat(0.0f);
+    float corr = 0.0f;
+    for (; i < nb; i++) {
+        const v128_t raw = wasm_v128_load(w[i].qs);
+        const v128_t p = wasm_i32x4_add(wasm_dot_i8x16(wasm_v128_and(raw, m4), wasm_v128_load(x[i].qs)),
+                                        wasm_dot_i8x16(wasm_u8x16_shr(raw, 4), wasm_v128_load(x[i].qs + 16)));
+        acc = wasm_f32x4_add(acc, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(p), wasm_f32x4_splat(fp16_to_fp32(w[i].d) * x[i].d)));
+        corr += fp16_to_fp32(w[i].m) * x[i].s;
+    }
+    sum = wasm_hsum_f32(acc) + corr;
 #endif
     for (; i < nb; i++) {
         int s = 0;
@@ -556,9 +619,72 @@ static void dot_q4_1_q8a_x4(const block_q4_1 *w, const block_q8a *const x[4], in
 }
 #endif
 
+#if defined(BORG_WASM)
+/* WebAssembly versions: the weight block is widened to int16 once and reused for 4 tokens.
+ * Each token's sum is formed exactly as in the 1-token kernels (one accumulator, block order). */
+typedef struct { v128_t l0, h0, l1, h1; } wasm_w16;
+
+static inline wasm_w16 wasm_widen(v128_t a, v128_t b) {
+    wasm_w16 r = {wasm_i16x8_extend_low_i8x16(a), wasm_i16x8_extend_high_i8x16(a), wasm_i16x8_extend_low_i8x16(b),
+                  wasm_i16x8_extend_high_i8x16(b)};
+    return r;
+}
+static inline v128_t wasm_dot_w16(const wasm_w16 *w, const int8_t *qs) {
+    const v128_t x0 = wasm_v128_load(qs), x1 = wasm_v128_load(qs + 16);
+    const v128_t d0 = wasm_i32x4_add(wasm_i32x4_dot_i16x8(w->l0, wasm_i16x8_extend_low_i8x16(x0)),
+                                     wasm_i32x4_dot_i16x8(w->h0, wasm_i16x8_extend_high_i8x16(x0)));
+    const v128_t d1 = wasm_i32x4_add(wasm_i32x4_dot_i16x8(w->l1, wasm_i16x8_extend_low_i8x16(x1)),
+                                     wasm_i32x4_dot_i16x8(w->h1, wasm_i16x8_extend_high_i8x16(x1)));
+    return wasm_i32x4_add(d0, d1);
+}
+
+static void dot_q8_0_q8a_x4(const block_q8_0 *w, const block_q8a *const x[4], int nb, float out[4]) {
+    v128_t acc[4] = {wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f)};
+    for (int i = 0; i < nb; i++) {
+        const wasm_w16 q = wasm_widen(wasm_v128_load(w[i].qs), wasm_v128_load(w[i].qs + 16));
+        const float dw = fp16_to_fp32(w[i].d);
+        for (int c = 0; c < 4; c++)
+            acc[c] = wasm_f32x4_add(acc[c], wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_dot_w16(&q, x[c][i].qs)),
+                                                           wasm_f32x4_splat(dw * x[c][i].d)));
+    }
+    for (int c = 0; c < 4; c++) out[c] = wasm_hsum_f32(acc[c]);
+}
+
+static void dot_q4_0_q8a_x4(const block_q4_0 *w, const block_q8a *const x[4], int nb, float out[4]) {
+    const v128_t m4 = wasm_i8x16_splat(0x0F), s8 = wasm_i8x16_splat(8);
+    v128_t acc[4] = {wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f)};
+    for (int i = 0; i < nb; i++) {
+        const v128_t raw = wasm_v128_load(w[i].qs);
+        const wasm_w16 q = wasm_widen(wasm_i8x16_sub(wasm_v128_and(raw, m4), s8), wasm_i8x16_sub(wasm_u8x16_shr(raw, 4), s8));
+        const float dw = fp16_to_fp32(w[i].d);
+        for (int c = 0; c < 4; c++)
+            acc[c] = wasm_f32x4_add(acc[c], wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_dot_w16(&q, x[c][i].qs)),
+                                                           wasm_f32x4_splat(dw * x[c][i].d)));
+    }
+    for (int c = 0; c < 4; c++) out[c] = wasm_hsum_f32(acc[c]);
+}
+
+static void dot_q4_1_q8a_x4(const block_q4_1 *w, const block_q8a *const x[4], int nb, float out[4]) {
+    const v128_t m4 = wasm_i8x16_splat(0x0F);
+    v128_t acc[4] = {wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f), wasm_f32x4_splat(0.0f)};
+    float corr[4] = {0, 0, 0, 0};
+    for (int i = 0; i < nb; i++) {
+        const v128_t raw = wasm_v128_load(w[i].qs);
+        const wasm_w16 q = wasm_widen(wasm_v128_and(raw, m4), wasm_u8x16_shr(raw, 4));
+        const float dw = fp16_to_fp32(w[i].d), mw = fp16_to_fp32(w[i].m);
+        for (int c = 0; c < 4; c++) {
+            acc[c] = wasm_f32x4_add(acc[c], wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_dot_w16(&q, x[c][i].qs)),
+                                                           wasm_f32x4_splat(dw * x[c][i].d)));
+            corr[c] += mw * x[c][i].s;
+        }
+    }
+    for (int c = 0; c < 4; c++) out[c] = wasm_hsum_f32(acc[c]) + corr[c];
+}
+#endif
+
 void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
                   int ldxq, float *out, int ldo) {
-#if defined(BORG_AVX2)
+#if defined(BORG_AVX2) || defined(BORG_WASM)
     if ((m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0 || m->dtype == DT_Q4_1) && T >= 4) {
         /* Tile 16 weight rows x 4 tokens: the rows stay in L1 while every group of 4 activation
          * rows is read once per tile instead of once per weight row (which made prefill
