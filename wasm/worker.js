@@ -126,8 +126,8 @@ async function fetchBytes(url, onProgress) {
 async function init(base) {
   const url = (p) => new URL(p, base || self.location.href).href;
   status("Loading the engine");
-  const res = await fetch(url("model.json"));
-  if (!res.ok) throw new Error(`cannot download model.json: HTTP ${res.status}`);
+  const res = await fetch(url("model.json")).catch((e) => { throw new Error(`cannot fetch ${url("model.json")}: ${e.message}`); });
+  if (!res.ok) throw new Error(`cannot download ${url("model.json")}: HTTP ${res.status}`);
   const manifest = await res.json().catch(() => { throw new Error("model.json is not valid JSON"); });
   nCtx = manifest.n_ctx || 2048;
   const log = (s) => console.warn("[borg]", s);

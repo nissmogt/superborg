@@ -38,17 +38,51 @@
     else if (m.end) { pending.delete(m.id); p.resolve(); }
   }
 
+  // The worker's script comes from (in order of preference) a <script type="text/plain"
+  // id="borg-worker-src"> block in the page, the worker.js file next to the page, or that file
+  // fetched and started as a blob: (for hosts that serve the page's files but do not let a Worker
+  // load them). Relative names resolve against the document's base URL, as the page's own
+  // fetches do (a host may set <base>).
+  const base = (typeof document !== "undefined" && document.baseURI) || location.href;
+  const blobWorker = (src) => new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  let alive = false, how = "";
+
+  function attach(w) {
+    worker = w;
+    w.onmessage = (e) => { alive = true; onMessage(e); };
+    w.onerror = (e) => {
+      if (!alive && how === "file") {    // its script did not load: try the same file as a blob
+        w.terminate();
+        startFetched().catch((err) => onMessage({ data: { fatal: String(err.message || err) } }));
+        return;
+      }
+      const what = e && e.message ? e.message : "its script did not load";
+      onMessage({ data: { fatal: `the engine's worker (${how}) failed: ${what}` } });
+    };
+    w.postMessage({ op: "init", base });
+  }
+
+  async function startFetched() {
+    how = "fetched";
+    setStatus({ text: "Loading the engine script", progress: null });
+    const res = await fetch(new URL(WORKER, base).href);
+    if (!res.ok) throw new Error(`cannot load ${WORKER}: HTTP ${res.status}`);
+    attach(blobWorker(await res.text()));
+  }
+
   async function start() {
-    try {
-      worker = new Worker(WORKER);
-    } catch (e) {
-      // a page that may not start workers from its own files may still start them from a blob
-      const src = await (await fetch(WORKER)).text();
-      worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+    const inline = typeof document !== "undefined" && document.getElementById("borg-worker-src");
+    if (inline && inline.textContent.trim()) {
+      how = "inline";
+      attach(blobWorker(inline.textContent));
+      return;
     }
-    worker.onmessage = onMessage;
-    worker.onerror = (e) => onMessage({ data: { fatal: "the engine stopped: " + (e.message || "worker error") } });
-    worker.postMessage({ op: "init", base: location.href });
+    try {
+      how = "file";
+      attach(new Worker(new URL(WORKER, base).href));
+    } catch (e) {
+      await startFetched();
+    }
   }
   start().catch((e) => onMessage({ data: { fatal: String(e.message || e) } }));
 

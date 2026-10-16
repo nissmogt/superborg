@@ -4,7 +4,8 @@
 
 Writes to out_dir:
   index.html      the UI page with the WebAssembly transport inlined (no server needed); with
-                  --fragment, without <!doctype>/<html>/<head>/<body>, for hosts that wrap pages
+                  --fragment, without <!doctype>/<html>/<head>/<body>, for hosts that wrap pages,
+                  and (also with --inline-worker) with worker.js embedded, started from a blob: URL
   worker.js       borg-runtime.js + trace-session.js + worker.js in one file, plus the
                   JavaScript build (build/borg-asm.js from wasm/build-js.sh) when it exists
   borg.wasm       the engine (built with wasm/build.sh if missing)
@@ -65,9 +66,11 @@ def bundle_worker(asm: Path | None) -> str:
     return "\n".join(parts)
 
 
-def page_for_static(page: str, transport: str, fragment: bool) -> str:
+def page_for_static(page: str, transport: str, fragment: bool, worker_src: str | None = None) -> str:
     """Inline the WebAssembly transport ahead of the page's own scripts. With fragment=True, also
-    drop the document skeleton (the host supplies doctype, charset and viewport)."""
+    drop the document skeleton (the host supplies doctype, charset and viewport). With worker_src,
+    the worker's source goes into the page as an unexecuted script block, so the transport can
+    start it from a blob: URL without the host serving (or allowing) a separate script file."""
     if fragment:
         page = re.sub(r"<!doctype[^>]*>", "", page, flags=re.I)
         page = re.sub(r"</?(html|head|body)\b[^>]*>", "", page, flags=re.I)
@@ -77,7 +80,12 @@ def page_for_static(page: str, transport: str, fragment: bool) -> str:
     m = re.search(r"<script\b", page, flags=re.I)
     if not m:
         raise SystemExit("the page has no <script>")
-    inline = "<script>\n" + transport + "\n</script>\n"
+    inline = ""
+    if worker_src is not None:
+        if re.search(r"</script|<!--|<script", worker_src, flags=re.I):
+            raise SystemExit("the worker bundle contains text the HTML parser would act on inside <script>")
+        inline += '<script type="text/plain" id="borg-worker-src">\n' + worker_src + "\n</script>\n"
+    inline += "<script>\n" + transport + "\n</script>\n"
     return page[: m.start()] + inline + page[m.start():]
 
 
@@ -95,6 +103,9 @@ def main(argv=None) -> int:
     ap.add_argument("--lens-stride", type=int, default=3)
     ap.add_argument("--name", help="model name shown in the UI (default: the header's source)")
     ap.add_argument("--fragment", action="store_true", help="omit the document skeleton from index.html")
+    ap.add_argument("--inline-worker", action="store_true",
+                    help="embed worker.js in index.html (implied by --fragment): hosts that do not serve "
+                         "the page's own scripts to a Worker still run the engine")
     a = ap.parse_args(argv)
 
     header = read_header(a.model)
@@ -129,9 +140,11 @@ def main(argv=None) -> int:
     (out / "model.json").write_text(json.dumps(manifest, indent=1) + "\n")
     shutil.copyfile(a.wasm, out / "borg.wasm")
     asm = None if a.no_asm or not a.asm.exists() else a.asm
-    (out / "worker.js").write_text(bundle_worker(asm))
+    bundle = bundle_worker(asm)
+    (out / "worker.js").write_text(bundle)
     transport = (WASM_DIR / "wasm-transport.js").read_text()
-    (out / "index.html").write_text(page_for_static(a.page.read_text(), transport, a.fragment))
+    inline = bundle if a.inline_worker or a.fragment else None
+    (out / "index.html").write_text(page_for_static(a.page.read_text(), transport, a.fragment, inline))
     print(f"wrote {out}: {len(parts)} model parts, {size / 1e6:.1f} MB"
           + ("" if asm else " (no JavaScript fallback: run wasm/build-js.sh)"))
     return 0
