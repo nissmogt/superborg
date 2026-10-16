@@ -51,6 +51,7 @@
 
 /* ---- base ---- */
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 var(--font); overflow-x: hidden; }
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -108,7 +109,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 .intro p { margin: 0 0 12px; }
 .intro .sugg { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
 .intro .sugg .btn { justify-content: center; white-space: normal; text-align: center; }
-.msg { display: flex; flex-direction: column; min-width: 0; content-visibility: auto; contain-intrinsic-size: auto 60px; }
+.msg { display: flex; flex-direction: column; min-width: 0; }
 .msg.user { align-items: flex-end; }
 .msg.user .bubble { background: var(--surface-2); border: 1px solid var(--border); border-radius: 14px 14px 4px 14px; padding: 8px 12px;
   max-width: 88%; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -242,11 +243,12 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 @media (max-width: 900px) {
   .app { height: auto; min-height: 100vh; }
   .split { display: block; }
-  .chat { height: 76vh; height: 76svh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .chat { height: 66vh; height: 66svh; min-height: 360px; border-right: 0; border-bottom: 1px solid var(--border); }
   .viz { overflow: visible; padding: 0 16px 28px; }
-  .topbar { gap: 10px; padding: 8px 16px; flex-wrap: wrap; }
+  .topbar { gap: 4px 10px; padding: 8px 16px; flex-wrap: wrap; }
   .model { order: 3; flex-basis: 100%; font-size: 12px; }
-  .status { margin-left: auto; }
+  .status { flex: 1 1 0; min-width: 0; justify-content: flex-end; }
+  .status span { overflow: hidden; text-overflow: ellipsis; }
 }
 @media (prefers-reduced-motion: no-preference) { .chip, .t { transition: background-color .08s linear; } }
 </style>
@@ -255,9 +257,9 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 <div class="app">
   <header class="topbar">
     <div class="brand">superborg <span>inside</span></div>
-    <div class="model" id="modelInfo">connecting…</div>
-    <div class="status" id="status"><i></i><span id="statusText">connecting</span></div>
-    <button class="btn small" id="themeBtn" type="button" title="Colour theme: follows the system, or forced light or dark">Theme: auto</button>
+    <div class="model" id="modelInfo">loading…</div>
+    <div class="status" id="status"><i></i><span id="statusText">starting</span></div>
+    <button class="btn small" id="themeBtn" type="button" title="Colour theme: Auto follows the system; click for light or dark" aria-label="Colour theme: auto">Auto</button>
   </header>
   <main class="split">
     <section class="chat" aria-label="Chat">
@@ -281,7 +283,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
       </div>
       <div class="messages" id="messages"></div>
       <form class="composer" id="composer" autocomplete="off">
-        <textarea id="input" rows="1" aria-label="Message" placeholder="Message the model (Enter sends, Shift+Enter adds a line)"></textarea>
+        <textarea id="input" rows="1" aria-label="Message" title="Enter sends, Shift+Enter adds a line" placeholder="Message the model (Enter sends, Shift+Enter adds a line)"></textarea>
         <button type="submit" class="btn primary" id="sendBtn">Send</button>
       </form>
     </section>
@@ -295,7 +297,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
       <div class="grid">
         <div class="panel s12" id="pMap">
           <div class="ph">
-            <h2>Emergence map</h2>
+            <h2 title="Columns are reply tokens, rows are layers: embeddings at the bottom, the model's output at the top. Each cell is the probability that the logit lens (final norm + unembedding applied to the residual stream after that layer) gives the token the model finally chose. Layer k is the residual stream after block k.">Emergence map</h2>
             <div class="ctl">
               <div class="seg" role="group" aria-label="Column width">
                 <button type="button" data-mapmode="words" aria-pressed="true" title="Columns as wide as their token text">Words</button>
@@ -307,7 +309,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
               </div>
             </div>
           </div>
-          <p class="expl">Logit lens: what the model would predict if it stopped after each layer. Columns are reply tokens, rows are layers (embeddings at the bottom, output at the top); colour is the probability the lens gives the token the model finally chose.</p>
+          <p class="expl">Logit lens: what the model would predict if it stopped after each layer. Colour is the probability of the token it finally chose.</p>
           <div class="map-scroll" id="mapScroll" tabindex="0" aria-label="Emergence map. Arrow keys: left and right choose a token, up and down a layer.">
             <div class="map-spacer" id="mapSpacer"><canvas id="mapCanvas"></canvas></div>
           </div>
@@ -319,8 +321,8 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
         </div>
 
         <div class="panel s7" id="pRead">
-          <div class="ph"><h2>Layer-by-layer readout</h2></div>
-          <p class="expl">For the selected token: the lens's top prediction after each layer, and the chosen token's probability and rank there. Click a row to inspect that layer's attention and MLP.</p>
+          <div class="ph"><h2 title="For the selected token: the logit lens's top prediction after each layer (with its probability), and the chosen token's probability and rank (1 = top) there. Hover a row for the top 3; click it to inspect that layer's attention and MLP.">Layer-by-layer readout</h2></div>
+          <p class="expl">The lens's top guess after each layer, and the chosen token's probability and rank there.</p>
           <div class="rrow head" aria-hidden="true"><span class="ly">layer</span><span>lens top-1</span><span>p(chosen)</span><span class="rk">rank</span></div>
           <div id="readRows" role="table" aria-label="Logit lens per layer"></div>
           <div class="empty" id="readEmpty">Send a message to see each layer's prediction.</div>
@@ -328,15 +330,15 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 
         <div class="stack s5">
           <div class="panel" id="pOut">
-            <div class="ph"><h2>Output distribution</h2></div>
-            <p class="expl">The model's final probabilities for this step: the top 5 tokens.</p>
+            <div class="ph"><h2 title="The model's own output distribution for this step (top 5), its entropy, and the time spent decoding and tracing the token.">Output distribution</h2></div>
+            <p class="expl">What the model finally predicted at this step.</p>
             <div id="outRows"></div>
             <div class="stats" id="outStats"></div>
             <div class="empty" id="outEmpty">No token yet.</div>
           </div>
           <div class="panel" id="pContrib">
             <div class="ph">
-              <h2>Contributions</h2>
+              <h2 title="L2 norms per layer: of the attention block's output and the MLP block's output (what each adds to the residual stream), and of the residual stream after each layer (emb = the token embedding).">Contributions</h2>
               <div class="ctl">
                 <div class="seg" role="group" aria-label="Scale">
                   <button type="button" data-normscale="log" aria-pressed="true">log</button>
@@ -344,7 +346,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
                 </div>
               </div>
             </div>
-            <p class="expl">How much each layer writes into the residual stream (L2 norm of its attention and MLP outputs), and the size of the stream itself.</p>
+            <p class="expl">How much each layer's attention and MLP write into the residual stream.</p>
             <div class="chart-legend"><span><span class="linekey" style="background:var(--attn)"></span> attention out</span><span><span class="linekey" style="background:var(--mlp)"></span> MLP out</span><span><span class="linekey" style="background:var(--resid)"></span> residual</span></div>
             <div class="cv-box" id="contribBox"><canvas id="contribCanvas" aria-label="Per-layer norms"></canvas></div>
           </div>
@@ -352,10 +354,10 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 
         <div class="panel s8" id="pAttn">
           <div class="ph">
-            <h2>Attention</h2>
+            <h2 title="Head-averaged attention weights of the selected token's query position (outlined) over the context: prompt and reply so far. The trace records the 8 most attended positions per layer; &quot;All layers&quot; averages those lists. The underlined token is the one this step produced; later tokens are dimmed.">Attention</h2>
             <div class="ctl"><label class="sr-only" for="layerSel">Layer</label><select class="sel" id="layerSel"><option value="0">All layers (mean)</option></select></div>
           </div>
-          <p class="expl">Where the selected token's query looked, averaged over heads: shade is the attention weight on each context token (the 8 strongest positions are recorded per layer). Outlined: the query position.</p>
+          <p class="expl">Where this step's query (outlined) looked in the context, averaged over heads.</p>
           <div class="attn-wrap">
             <div style="min-width:0">
               <div class="chips" id="chips" aria-label="Context tokens shaded by attention"></div>
@@ -363,17 +365,18 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
               <div class="toplist" id="attnTop"></div>
             </div>
             <div class="ent-side">
-              <div class="ph"><h2>Head entropy</h2></div>
-              <p class="expl" style="max-width:24ch">Per layer and head. Dark: sharp (attends to few tokens); light: diffuse. Click a row to pick the layer.</p>
+              <div class="ph"><h2 title="Entropy of each head's attention distribution, relative to uniform attention over the context. Click a row to select that layer; click it again for all layers.">Head entropy</h2></div>
+              <p class="expl" style="max-width:26ch">How focused each head's attention is. Click a row to pick a layer.</p>
               <div class="cv-box" id="entBox"><canvas id="entCanvas" aria-label="Attention entropy per layer and head"></canvas></div>
+              <div class="legend"><canvas id="entLegend" width="170" height="26" aria-label="Attention sharpness scale"></canvas></div>
             </div>
           </div>
           <div class="empty" id="attnEmpty" hidden>No token yet.</div>
         </div>
 
         <div class="panel s4" id="pMlp">
-          <div class="ph"><h2>MLP neurons</h2><span class="expl" style="margin:0" id="mlpLayer"></span></div>
-          <p class="expl">The most strongly activated hidden units of the selected layer, with their signed activations.</p>
+          <div class="ph"><h2 title="The hidden units (inputs of the MLP down-projection) with the largest absolute activation in the selected layer; with all layers, the strongest across layers.">MLP neurons</h2><span class="expl" style="margin:0" id="mlpLayer"></span></div>
+          <p class="expl">The most active hidden units of the selected layer (signed).</p>
           <div id="mlpRows"></div>
           <div class="empty" id="mlpEmpty">No token yet.</div>
         </div>
@@ -628,10 +631,14 @@ function applyScrolls(chatChanged) {
 /* Scroll positions changed by the user (wheel, touch, scrollbar, keys) are read in the scroll event;
    the page's own scrolling is not, so following live never forces an extra layout. */
 function trackUserScroll(elm, onUser) {
-  let t = -1e9;
+  let t = -1e9, dragging = false;
   const mark = () => { t = performance.now(); };
-  for (const ev of ["wheel", "touchstart", "touchmove", "pointerdown", "keydown"]) elm.addEventListener(ev, mark, { passive: true });
-  elm.addEventListener("scroll", () => { if (performance.now() - t < 1500) onUser(); }, { passive: true });
+  for (const ev of ["wheel", "touchmove", "keydown"]) elm.addEventListener(ev, mark, { passive: true });
+  // a scrollbar drag: scroll events while the pointer that went down on the element is held
+  elm.addEventListener("pointerdown", () => { dragging = true; }, { passive: true });
+  window.addEventListener("pointerup", () => { dragging = false; }, { passive: true });
+  window.addEventListener("pointercancel", () => { dragging = false; }, { passive: true });
+  elm.addEventListener("scroll", () => { if (dragging || performance.now() - t < 400) onUser(); }, { passive: true });
 }
 
 /* ---------------------------------------------------------------- tooltip */
@@ -887,8 +894,8 @@ function mapTip(e, hit) {
 }
 
 /* ---------------------------------------------------------------- legends */
-function drawRampLegend(cv, rmp, ticks, title) {
-  const w = 200, h = 26, x0 = 4, bw = w - 8 - (title ? 0 : 0);
+function drawRampLegend(cv, rmp, ticks, w = 200) {
+  const h = 26, x0 = 4, bw = w - 8;
   const ctx = sizeCanvas(cv, w, h);
   ctx.clearRect(0, 0, w, h);
   for (let i = 0; i < bw; i++) { ctx.fillStyle = rmp.css[Math.round(i / (bw - 1) * 255)]; ctx.fillRect(x0 + i, 2, 1.5, 8); }
@@ -903,6 +910,7 @@ function drawLegends() {
   const lg = [[0, "≤1e−5"], [0.2, "1e−4"], [0.4, "1e−3"], [0.6, ".01"], [0.8, ".1"], [1, "1"]];
   drawRampLegend($("mapLegend"), LENS, S.prefs.mapScale === "log" ? lg : lin);
   drawRampLegend($("attnLegend"), ATT, [[0, "0"], [attT(0.05), ".05"], [attT(0.25), ".25"], [attT(0.5), ".5"], [1, "1"]]);
+  drawRampLegend($("entLegend"), ENT, [[0, "diffuse"], [1, "sharp"]], 170);
 }
 
 /* ---------------------------------------------------------------- selection bar */
@@ -1327,7 +1335,8 @@ function renderStatus() {
     setText(tx, `generating · ${rate ? rate.toFixed(1) : "–"} tok/s · ${n} tokens`);
     return;
   }
-  setText(tx, S.lastDone ? `ready · last reply ${S.lastDone.tok_per_s} tok/s` : "ready");
+  setText(tx, S.lastDone ? `ready · ${S.lastDone.tok_per_s} tok/s` : "ready");
+  st.title = S.lastDone ? `last reply: ${S.lastDone.n_gen} tokens at ${S.lastDone.tok_per_s} tokens/s (with tracing)` : "";
 }
 function showEngineStatus(m) {
   if (S.ready || !m) return;
@@ -1505,7 +1514,8 @@ function readSettingsUI() {
 function applyTheme() {
   const t = S.prefs.theme;
   if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
-  setText($("themeBtn"), "Theme: " + t);
+  setText($("themeBtn"), t[0].toUpperCase() + t.slice(1));
+  $("themeBtn").setAttribute("aria-label", "Colour theme: " + t);
   readColors();
   invalidate("theme", "map");
 }
@@ -1661,6 +1671,7 @@ window.addEventListener("beforeunload", () => { if (S.generating) BORG.stop(); }
 
 /* ---------------------------------------------------------------- start */
 async function start() {
+  if (window.matchMedia("(max-width: 900px)").matches) input.placeholder = "Message the model";
   syncSegs();
   applyTheme();
   msgs.replaceChildren(intro());
