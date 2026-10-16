@@ -49,6 +49,10 @@ BORG_API int borg_pool_size(const borg_pool *pool);
 /* ---- model ---------------------------------------------------------------- */
 /* Returns NULL on failure and writes a message into err (if err != NULL). */
 BORG_API borg_model *borg_model_load(const char *path, char *err, int errlen);
+/* Load from a buffer holding a whole .borg file (for environments without files, e.g.
+ * WebAssembly in a browser). The buffer must stay valid, unchanged and 64-byte aligned
+ * until borg_model_free; the model does not take ownership. */
+BORG_API borg_model *borg_model_load_memory(const void *data, size_t size, char *err, int errlen);
 BORG_API void borg_model_free(borg_model *model);
 BORG_API void borg_model_config(const borg_model *model, borg_config *out);
 BORG_API const char *borg_model_header(const borg_model *model); /* raw JSON header, NUL-terminated */

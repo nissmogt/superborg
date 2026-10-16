@@ -95,6 +95,7 @@ static int map_file(const char *path, borg_model *m, char *err, int errlen) {
 
 static void unmap_file(borg_model *m) {
     if (!m->map) return;
+    if (m->map_is_malloc == 2) return; /* caller's buffer (borg_model_load_memory) */
     if (m->map_is_malloc) { free(m->map); return; }
 #if defined(_WIN32)
     UnmapViewOfFile(m->map);
@@ -271,12 +272,9 @@ void borg_model_free(borg_model *m) {
     free(m);
 }
 
-borg_model *borg_model_load(const char *path, char *err, int errlen) {
-    if (err && errlen > 0) err[0] = 0;
-    borg_model *m = (borg_model *)calloc(1, sizeof(borg_model));
-    if (!m) { borg_set_err(err, errlen, "out of memory"); return NULL; }
+/* Parse and validate a model whose bytes are already at m->map; frees m on failure. */
+static borg_model *load_mapped(borg_model *m, const char *path, char *err, int errlen) {
     json_value *root = NULL;
-    if (map_file(path, m, err, errlen)) goto fail;
     const uint8_t *base = (const uint8_t *)m->map;
     if (m->map_size < 16 || memcmp(base, "BORG", 4) != 0) { borg_set_err(err, errlen, "%s is not a .borg file", path); goto fail; }
     uint32_t version;
@@ -434,6 +432,27 @@ fail:
     json_free(root);
     borg_model_free(m);
     return NULL;
+}
+
+borg_model *borg_model_load(const char *path, char *err, int errlen) {
+    if (err && errlen > 0) err[0] = 0;
+    borg_model *m = (borg_model *)calloc(1, sizeof(borg_model));
+    if (!m) { borg_set_err(err, errlen, "out of memory"); return NULL; }
+    if (map_file(path, m, err, errlen)) {
+        borg_model_free(m);
+        return NULL;
+    }
+    return load_mapped(m, path, err, errlen);
+}
+
+borg_model *borg_model_load_memory(const void *data, size_t size, char *err, int errlen) {
+    if (err && errlen > 0) err[0] = 0;
+    borg_model *m = (borg_model *)calloc(1, sizeof(borg_model));
+    if (!m) { borg_set_err(err, errlen, "out of memory"); return NULL; }
+    m->map = (void *)data;
+    m->map_size = size;
+    m->map_is_malloc = 2;
+    return load_mapped(m, "<memory>", err, errlen);
 }
 
 void borg_model_config(const borg_model *m, borg_config *out) { *out = m->cfg; }
