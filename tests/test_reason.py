@@ -245,7 +245,10 @@ def test_max_tokens_truncates_output():
 def test_cot_prompt_and_answer():
     llm = FakeLLM(lambda c: "16-3-4=9 eggs, 9*2=18.\nAnswer: 18")
     ans = solve(llm, GSM_Q, strategy="cot")
-    assert ans.answer == "18" and is_cot(llm.calls[0]) and "Answer:" in llm.calls[0]["prompt"]
+    assert ans.answer == "18" and is_cot(llm.calls[0]) and "\\boxed{}" in llm.calls[0]["prompt"]
+    assert ans.text.endswith("Answer: 18") and ans.text.count("Answer: 18") == 1
+    llm = FakeLLM(lambda c: "16-3-4=9 eggs, 9*2=18, so \\boxed{18}")
+    assert solve(llm, GSM_Q, strategy="cot").text.endswith("\\boxed{18}\n\nAnswer: 18")
     assert ans.candidates[0]["kind"] == "cot" and "prompt" not in ans.candidates[0]
 
 

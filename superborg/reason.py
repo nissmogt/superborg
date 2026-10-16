@@ -159,6 +159,14 @@ def _strip_thinking(text: str) -> str:
     return text
 
 
+def _with_answer_line(text: str, answer: str | None) -> str:
+    """User-facing text ending in a plain "Answer: ..." line (boxed LaTeX reads badly in a terminal)."""
+    text = text.rstrip()
+    if answer is None or re.search(r"(?:^|\n)\**(?:final )?answer\**\s*[:：][^\n]*\Z", text, re.I):
+        return text
+    return f"{text}\n\nAnswer: {answer}"
+
+
 def _clean_short(seg: str) -> str:
     seg = seg.strip().strip("*").strip()
     seg = re.sub(r"^\$+|\$+$", "", seg).strip()
@@ -364,7 +372,9 @@ def classify(question: str, context: str | None = None) -> tuple[str, str]:
 # =========================================================================================
 # prompts (kept short: small models degrade with long instructions)
 
-COT_PROMPT = "{question}\n\nSolve this step by step. End with a final line of the form \"Answer: <answer>\"."
+# Qwen-family models are trained on this exact phrasing; on GSM8K #0-39 it beat
+# 'Solve this step by step. End with a final line "Answer: <answer>"' 18/40 to 15/40.
+COT_PROMPT = "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 PAL_PROMPT = ("{question}\n\nWrite a short Python program that computes the answer to this problem. "
               "Use clear variable names and store the final result in a variable named `answer`.")
 PAL_REPAIR = "The program failed:\n{error}\n\nWrite the corrected program. Store the final result in `answer`."
@@ -376,8 +386,19 @@ CODE_FENCE = "```python\n"
 
 # Optional worked examples, given as earlier chat turns: (question, assistant reply).
 # For PAL the reply is the program body (it is wrapped in a code fence).
+# Two short worked examples (written for this purpose, not from GSM8K) show small models
+# the expected shape: one variable per quantity, `answer = ...`, no prose.
 COT_EXAMPLES: list[tuple[str, str]] = []
-PAL_EXAMPLES: list[tuple[str, str]] = []
+PAL_EXAMPLES: list[tuple[str, str]] = [
+    ("A baker makes 3 batches of 24 cookies. She sells 50 cookies and gives 10 to her neighbors. "
+     "How many cookies does she have left?",
+     "cookies_made = 3 * 24\ncookies_sold = 50\ncookies_given_away = 10\n"
+     "answer = cookies_made - cookies_sold - cookies_given_away"),
+    ("A jacket costs $80. It is on sale for 25% off, and Mia then pays 10% sales tax on the sale price. "
+     "How much does Mia pay?",
+     "price = 80\nsale_price = price - price * 25 / 100\ntax = sale_price * 10 / 100\n"
+     "answer = sale_price + tax"),
+]
 
 
 def _with_examples(template: str, question: str, examples: list[tuple[str, str]], fence: bool = False) -> list[dict]:
@@ -496,7 +517,8 @@ def _cot_batch(s: _Session, q: str, numeric: bool | None, k: int, temperature: f
 
 def _cot(s: _Session, q: str, numeric: bool | None) -> Answer:
     g = _cot_sample(s, q, numeric, 0.0, 1.0, 0, stream=True)
-    return Answer(text=_strip_thinking(g["text"]).strip(), answer=g["answer"], strategy="cot", candidates=[_slim(g)])
+    return Answer(text=_with_answer_line(_strip_thinking(g["text"]), g["answer"]), answer=g["answer"],
+                  strategy="cot", candidates=[_slim(g)])
 
 
 def _sample_loop(s: _Session, n: int, make: Callable[[int], dict], early_stop: bool, label: str,
@@ -549,7 +571,7 @@ def _vote(s: _Session, q: str, numeric: bool | None, n: int, temperature: float,
     else:
         best = cands[info["winner_index"]]
     n_agree = info["counts"].get(key, 0) if key else 0
-    text = _strip_thinking(best["text"]).strip()
+    text = _with_answer_line(_strip_thinking(best["text"]), best.get("answer"))
     if len(cands) > 1:
         text += f"\n\n({n_agree} of {len(cands)} sampled solutions agree.)"
     return Answer(text=text, answer=best.get("answer"), strategy="vote", candidates=[_slim(c) for c in cands])
@@ -697,7 +719,8 @@ def _mix(s: _Session, q: str, numeric: bool | None, n: int, temperature: float, 
     # show a written solution for the winning answer when there is one (easier to read than code)
     best = next((c for c in cots if c.get("key") == key), None)
     best = best or cands[info["winner_index"]]
-    body = _strip_thinking(best["text"]).strip() if best["kind"] == "cot" else _pal_text(best)
+    body = _with_answer_line(_strip_thinking(best["text"]), best.get("answer")) if best["kind"] == "cot" \
+        else _pal_text(best)
     agree_p = sum(c.get("key") == key for c in progs)
     agree_c = sum(c.get("key") == key for c in cots)
     text = body + (f"\n\n({agree_p} of {len(progs)} programs and {agree_c} of {len(cots)} written solutions "
@@ -733,7 +756,7 @@ def _verify(s: _Session, q: str, numeric: bool | None, n: int, temperature: floa
         s.note(f"[verify] answer {cands[i].get('answer')}: votes {counts[k]}/{total}, P(correct) {p_yes:.2f}\n")
     best_key = max(scores, key=lambda k: (scores[k], counts[k]))
     best = next(c for c in cands if c.get("key") == best_key)
-    text = _strip_thinking(best["text"]).strip() + \
+    text = _with_answer_line(_strip_thinking(best["text"]), best.get("answer")) + \
         f"\n\n(Chosen from {len(counts)} distinct answers by vote and self-verification.)"
     return Answer(text=text, answer=best.get("answer"), strategy="verify", candidates=[_slim(c) for c in cands])
 
