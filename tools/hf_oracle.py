@@ -19,6 +19,12 @@ BORG_MODELS_DIR = os.environ.get("BORG_MODELS_DIR", os.path.join(_SCRATCH, "borg
 # ~24 tokens: mixes words, digits and punctuation, and ends where the continuation is predictable.
 PROMPT_TEXT = "In 1969, Neil Armstrong became the first person to walk on the Moon. He said"
 N_GEN = 32
+# Long-context check: the first LONG_PROMPT_TOKENS tokens of the converter's calibration text
+# (prose, code, numbers), so RoPE, the causal mask and the KV cache run well past the short prompt.
+LONG_PROMPT_TOKENS = 200
+LONG_N_GEN = 8
+LONG_PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "superborg", "data", "calibration.txt")
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,15 @@ def hf_prompt_tokens(model_dir: str, text: str = PROMPT_TEXT) -> list[int]:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_dir)
     return [int(t) for t in tok(text)["input_ids"]]
+
+
+def long_prompt_tokens(model_dir: str, n: int = LONG_PROMPT_TOKENS) -> list[int]:
+    """The first n prompt ids of LONG_PROMPT_FILE (BOS included when the model adds one)."""
+    with open(LONG_PROMPT_FILE, encoding="utf-8") as f:
+        toks = hf_prompt_tokens(model_dir, f.read())
+    if len(toks) < n:
+        raise ValueError(f"{LONG_PROMPT_FILE} gives only {len(toks)} tokens, need {n}")
+    return toks[:n]
 
 
 _CHILD = r"""

@@ -303,8 +303,8 @@ class ReferenceModel:
         if start_pos is None:
             self.reset()
             start_pos = 0
-        elif start_pos > self.n_past:
-            raise ValueError(f"start_pos {start_pos} is beyond the cached length {self.n_past}")
+        elif not 0 <= start_pos <= self.n_past:
+            raise ValueError(f"start_pos {start_pos} is outside the cached length 0..{self.n_past}")
         else:
             self.truncate(start_pos)
 
@@ -375,8 +375,11 @@ class ReferenceModel:
         ignore_eos. eos_ids defaults to the tokenizer's eos_ids. Ties in argmax go
         to the lowest id, as in torch.argmax.
         """
+        prompt = list(prompt)
+        if not prompt:
+            raise ValueError("generate needs at least one prompt token")
         stop = set(self.eos_ids() if eos_ids is None else eos_ids)
-        logits = self.forward(list(prompt))
+        logits = self.forward(prompt)
         out: list[int] = []
         for _ in range(max_new_tokens):
             tok = int(np.argmax(logits[-1]))

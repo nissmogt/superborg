@@ -39,6 +39,8 @@ STRATEGIES: dict[str, str] = {
     "pal": "program-aided: the model writes Python that computes the answer; it runs in a sandboxed "
            "subprocess, with one repair attempt on error",
     "pal_vote": "several sampled programs are executed and their results majority-voted",
+    "mix": "programs and written step-by-step solutions vote together, weighted by answer plausibility; "
+           "stops early when the greedy program and the greedy solution agree",
     "verify": "sampled solutions are checked by the model itself (log-prob of 'Yes'), combined with the vote",
     "rag": "answer grounded in the given context (retrieved text) with [n] citations; prompt-lookup decoding",
     "calc": "evaluate a bare arithmetic expression exactly, without the model",
@@ -241,12 +243,37 @@ def answers_match(pred: str | None, gold: str | None, tol: float = 1e-6) -> bool
     return normalize_text(pred) == normalize_text(gold)
 
 
+_NEG_CUES = re.compile(r"(?<![\w])-\d|\b(?:negative|below zero|minus|loss|lost|lose|debt|owe[sd]?|deficit|"
+                       r"temperature|degrees|decrease|difference|change)\b", re.I)
+
+
+def plausibility(answer: str | None, question: str = "") -> float:
+    """Prior weight of a numeric answer to a word problem, used to weigh votes.
+
+    Answers to everyday quantity questions are almost always non-negative and whole (or
+    money with cents), and a negative or 14.333333 result usually means a misread problem.
+    Such answers are down-weighted, never excluded: they still win when nothing else does.
+    Non-numeric answers weigh 1.
+    """
+    if answer is None:
+        return 0.0
+    if not re.fullmatch(r"\s*-?[\d.]+\s*", answer):
+        return 1.0
+    w = 1.0
+    if answer.strip().startswith("-") and not _NEG_CUES.search(question):
+        w *= 0.25
+    if "." in answer:
+        w *= 0.6 if len(answer.split(".", 1)[1].strip()) <= 2 else 0.3
+    return w
+
+
 def majority_vote(cands: list[dict]) -> tuple[str | None, dict]:
-    """Most common answer key among candidates with an answer.
+    """Answer key with the largest total vote weight (candidate "weight", default 1).
 
     Ties go to the higher mean log-probability when every tied group has one, else to
     the group whose first member came earliest (sample 0 is the greedy one).
-    Returns (key, info) with info = {"counts": {key: n}, "tie": bool, "winner_index": i}.
+    Returns (key, info) with info = {"counts": {key: n}, "scores": {key: weight},
+    "tie": bool, "winner_index": i}.
     """
     groups: "OrderedDict[str, list[int]]" = OrderedDict()
     for i, c in enumerate(cands):
@@ -254,10 +281,11 @@ def majority_vote(cands: list[dict]) -> tuple[str | None, dict]:
         if k is not None:
             groups.setdefault(k, []).append(i)
     if not groups:
-        return None, {"counts": {}, "tie": False, "winner_index": None}
+        return None, {"counts": {}, "scores": {}, "tie": False, "winner_index": None}
     counts = {k: len(v) for k, v in groups.items()}
-    top = max(counts.values())
-    tied = [k for k, n in counts.items() if n == top]
+    scores = {k: sum(float(cands[i].get("weight", 1.0)) for i in v) for k, v in groups.items()}
+    top = max(scores.values())
+    tied = [k for k, w in scores.items() if w >= top - 1e-9]
 
     def mean_lp(k):
         lps = [cands[i].get("logprob") for i in groups[k]]
@@ -271,20 +299,22 @@ def majority_vote(cands: list[dict]) -> tuple[str | None, dict]:
             best = max(tied, key=lambda k: (lps[k], -groups[k][0]))
         else:
             best = min(tied, key=lambda k: groups[k][0])
-    return best, {"counts": counts, "tie": len(tied) > 1, "winner_index": groups[best][0]}
+    return best, {"counts": counts, "scores": {k: round(v, 4) for k, v in scores.items()},
+                  "tie": len(tied) > 1, "winner_index": groups[best][0]}
 
 
 def _decided(cands: list[dict], total: int) -> bool:
-    """True when the leader cannot be overtaken (or tied) by the samples still to come."""
-    counts: dict[str, int] = {}
+    """True when the leader cannot be overtaken (or tied) by the samples still to come
+    (each can add a weight of at most 1)."""
+    scores: dict[str, float] = {}
     for c in cands:
         if c.get("key") is not None:
-            counts[c["key"]] = counts.get(c["key"], 0) + 1
-    if not counts:
+            scores[c["key"]] = scores.get(c["key"], 0.0) + float(c.get("weight", 1.0))
+    if not scores:
         return False
-    ranked = sorted(counts.values(), reverse=True)
-    second = ranked[1] if len(ranked) > 1 else 0
-    return ranked[0] > second + (total - len(cands))
+    ranked = sorted(scores.values(), reverse=True)
+    second = ranked[1] if len(ranked) > 1 else 0.0
+    return ranked[0] > second + (total - len(cands)) + 1e-9
 
 
 # =========================================================================================
@@ -374,6 +404,11 @@ class _Session:
         self.tokens = 0
         # decode several samples in lockstep when the LLM supports it (weights are read once per step)
         self.batch = batch and callable(getattr(llm, "sample_n", None))
+        self.question = ""
+        self.prior = True  # weigh numeric votes by plausibility()
+
+    def weight(self, answer: str | None) -> float:
+        return plausibility(answer, self.question) if self.prior else (0.0 if answer is None else 1.0)
 
     def prompt(self, messages: list[dict], prefix: str = "") -> str:
         return self.llm.render(messages, enable_thinking=self.enable_thinking) + prefix
@@ -439,9 +474,9 @@ def _direct(s: _Session, q: str, numeric: bool | None) -> Answer:
     return Answer(text=_strip_thinking(g["text"]).strip(), answer=ans, strategy="direct", candidates=[_slim(g)])
 
 
-def _cot_finish(g: dict, numeric: bool | None) -> dict:
+def _cot_finish(s: _Session, g: dict, numeric: bool | None) -> dict:
     ans = extract_answer(g["text"], numeric)
-    g.update(kind="cot", answer=ans, key=answer_key(ans))
+    g.update(kind="cot", answer=ans, key=answer_key(ans), weight=s.weight(ans))
     return g
 
 
@@ -449,14 +484,14 @@ def _cot_sample(s: _Session, q: str, numeric: bool | None, temperature: float, t
                 stream: bool = False) -> dict:
     g = s.gen(_with_examples(COT_PROMPT, q, COT_EXAMPLES), temperature=temperature, top_p=top_p, seed=seed,
               stream=stream)
-    return _cot_finish(g, numeric)
+    return _cot_finish(s, g, numeric)
 
 
 def _cot_batch(s: _Session, q: str, numeric: bool | None, k: int, temperature: float, top_p: float,
                seed: int) -> list[dict]:
     gens = s.gen_many(_with_examples(COT_PROMPT, q, COT_EXAMPLES), k, temperature=temperature, top_p=top_p,
                       seed=seed)
-    return [_cot_finish(g, numeric) for g in gens]
+    return [_cot_finish(s, g, numeric) for g in gens]
 
 
 def _cot(s: _Session, q: str, numeric: bool | None) -> Answer:
@@ -555,7 +590,8 @@ def _run_program(s: _Session, g: dict, msgs: list[dict], repair: bool, timeout: 
         g["tokens"] += g2["tokens"]
         g["seconds"] = round(g["seconds"] + g2["seconds"], 3)
     g.update(kind="program", code=code, ok=res.ok, error=res.error, stdout=res.stdout[:500], value=res.value,
-             answer=ans, key=answer_key(ans), attempts=attempts, text=CODE_FENCE + code + "\n```")
+             answer=ans, key=answer_key(ans), weight=s.weight(ans), attempts=attempts,
+             text=CODE_FENCE + code + "\n```")
     return g
 
 
@@ -608,9 +644,10 @@ def _pal_vote(s: _Session, q: str, numeric: bool | None, n: int, temperature: fl
         # no program worked, or a tie: a step-by-step solution decides (or answers outright)
         g = _cot_sample(s, q, numeric, 0.0, 1.0, 0)
         g["tiebreaker"] = True
+        g["weight"] = 0.0  # it only breaks the tie; it does not vote
         if key is not None and info["tie"]:
-            top = max(info["counts"].values())
-            tied = [k for k, v in info["counts"].items() if v == top]
+            top = max(info["scores"].values())
+            tied = [k for k, v in info["scores"].items() if v >= top - 1e-9]
             if g["key"] in tied:
                 key = g["key"]
                 info["winner_index"] = next(i for i, c in enumerate(cands) if c.get("key") == key)
@@ -622,6 +659,50 @@ def _pal_vote(s: _Session, q: str, numeric: bool | None, n: int, temperature: fl
     n_prog = sum(1 for c in cands if c.get("kind") == "program")
     text = _pal_text(best) + f"\n\n({info['counts'][key]} of {n_prog} sampled programs agree.)"
     return Answer(text=text, answer=best["answer"], strategy="pal_vote", candidates=[_slim(c) for c in cands])
+
+
+def _mix(s: _Session, q: str, numeric: bool | None, n: int, temperature: float, top_p: float, seed: int,
+         early_stop: bool, timeout: float) -> Answer:
+    """Programs and written step-by-step solutions vote together.
+
+    The two formats fail differently (programs slip on reading the problem, prose on
+    arithmetic), so agreement between them is strong evidence: when the greedy program
+    and the greedy solution agree, sampling is skipped.
+    """
+    p0 = _pal_sample(s, q, 0.0, 1.0, _seed(seed, 0), repair=True, timeout=timeout)
+    s.note(f"[program 1/{n}] answer: {p0.get('answer')}\n")
+    c0 = _cot_sample(s, q, numeric, 0.0, 1.0, _seed(seed, 0))
+    s.note(f"[solution 1/{n}] answer: {c0.get('answer')}\n")
+    cands = [p0, c0]
+    agree = p0.get("key") is not None and p0.get("key") == c0.get("key")
+    if n > 1 and not (early_stop and agree):
+        if s.batch:
+            cands += _pal_batch(s, q, n - 1, temperature, top_p, _seed(seed, 1), timeout)
+            cands += _cot_batch(s, q, numeric, n - 1, temperature, top_p, _seed(seed, 2))
+        else:
+            for i in range(1, n):
+                for make in (lambda: _pal_sample(s, q, temperature, top_p, _seed(seed, i), False, timeout),
+                             lambda: _cot_sample(s, q, numeric, temperature, top_p, _seed(seed, i))):
+                    if early_stop and _decided(cands, 2 * n):
+                        break
+                    cands.append(make())
+        for c in cands[2:]:
+            s.note(f"[{'program' if c['kind'] == 'program' else 'solution'}] answer: {c.get('answer')}\n")
+    key, info = majority_vote(cands)
+    if key is None:
+        return Answer(text=_strip_thinking(c0["text"]).strip(), answer=c0.get("answer"), strategy="mix",
+                      candidates=[_slim(c) for c in cands])
+    progs = [c for c in cands if c["kind"] == "program"]
+    cots = [c for c in cands if c["kind"] == "cot"]
+    # show a written solution for the winning answer when there is one (easier to read than code)
+    best = next((c for c in cots if c.get("key") == key), None)
+    best = best or cands[info["winner_index"]]
+    body = _strip_thinking(best["text"]).strip() if best["kind"] == "cot" else _pal_text(best)
+    agree_p = sum(c.get("key") == key for c in progs)
+    agree_c = sum(c.get("key") == key for c in cots)
+    text = body + (f"\n\n({agree_p} of {len(progs)} programs and {agree_c} of {len(cots)} written solutions "
+                   f"agree.)")
+    return Answer(text=text, answer=best.get("answer"), strategy="mix", candidates=[_slim(c) for c in cands])
 
 
 def _verify(s: _Session, q: str, numeric: bool | None, n: int, temperature: float, top_p: float, seed: int,
@@ -706,7 +787,7 @@ def _slim(c: dict) -> dict:
 def solve(llm, question: str, strategy: str = "auto", samples: int = 5, max_tokens: int = 512, seed: int = 0,
           stream: Callable[[str], None] | None = None, context: str | None = None, *,
           temperature: float = 0.7, top_p: float = 0.95, early_stop: bool = True, enable_thinking: bool = False,
-          numeric: bool | None = None, timeout: float = 10.0, batch: bool = True) -> Answer:
+          numeric: bool | None = None, timeout: float = 10.0, batch: bool = True, prior: bool = True) -> Answer:
     """Answer `question` with test-time reasoning.
 
     llm: a superborg.LLM (anything with render/tokenize/generate_tokens/score/formatter).
@@ -718,6 +799,7 @@ def solve(llm, question: str, strategy: str = "auto", samples: int = 5, max_toke
     numeric: force numeric (True) or text (False) answer extraction; None guesses.
     batch: sample candidates together with llm.sample_n when available (otherwise one at a
     time, stopping early once the majority is decided).
+    prior: weigh numeric votes by plausibility() (negative / long fractional answers count less).
     """
     if strategy not in STRATEGIES:
         raise ValueError(f"unknown strategy {strategy!r}; choose from {', '.join(STRATEGIES)}")
@@ -725,6 +807,7 @@ def solve(llm, question: str, strategy: str = "auto", samples: int = 5, max_toke
     samples = max(1, int(samples))
     s = _Session(llm, max_tokens=max(1, int(max_tokens)), enable_thinking=enable_thinking, stream=stream,
                  batch=batch)
+    s.question, s.prior = question, prior
     route = ""
     kind = None
     if strategy == "auto":
@@ -751,6 +834,8 @@ def solve(llm, question: str, strategy: str = "auto", samples: int = 5, max_toke
             ans = _pal(s, question, numeric, timeout)
         elif strategy == "pal_vote":
             ans = _pal_vote(s, question, numeric, samples, temperature, top_p, seed, early_stop, timeout)
+        elif strategy == "mix":
+            ans = _mix(s, question, numeric, samples, temperature, top_p, seed, early_stop, timeout)
         elif strategy == "verify":
             ans = _verify(s, question, numeric, samples, temperature, top_p, seed, early_stop)
         elif strategy == "rag":

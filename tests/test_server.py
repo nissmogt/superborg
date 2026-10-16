@@ -478,15 +478,18 @@ def test_client_disconnect_mid_stream(server):
     assert st == 200, out
 
 
-def test_short_body_then_hangup(server):
+def test_short_body_then_hangup(server, capsys):
     """A client that announces more body than it sends and hangs up gets a 400 it never reads;
     the handler must cope (no traceback) and the server keeps serving."""
     host, port = server.server_address[:2]
-    sock = socket.create_connection((host, port), timeout=30)
-    sock.sendall(b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
-    sock.shutdown(socket.SHUT_WR)
-    sock.close()
+    for _ in range(3):
+        sock = socket.create_connection((host, port), timeout=30)
+        sock.sendall(b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        sock.shutdown(socket.SHUT_WR)
+        sock.close()
     assert call(server, "POST", "/v1/completions", {"prompt": "Hi", "max_tokens": 1})[0] == 200
+    time.sleep(0.3)
+    assert "Traceback" not in capsys.readouterr().err
 
 
 def test_handler_has_socket_timeout():

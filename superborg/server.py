@@ -493,6 +493,8 @@ class Service:
             raise APIError(400, "'context' must be a string", param="context")
         if context is not None:
             _text(context, "'context'", "context")
+        if strategy == "rag" and not context:  # checked here so a streamed request gets a plain 400
+            raise APIError(400, "strategy 'rag' needs 'context' (reference text)", param="context")
         samples = _number(body, "samples", 5, int, 1, 64)
         route = ""
         if not code_ok:

@@ -284,6 +284,10 @@ def test_tiny_model_matches_hf(name, tmp_path):
     np.testing.assert_allclose(np.concatenate(inc), ours, rtol=0, atol=2e-5 * scale)
     np.testing.assert_allclose(ref.forward(toks[60:], start_pos=60), ours[60:], rtol=0, atol=2e-5 * scale)
     assert ref.n_past == len(toks)
+    for bad in (-1, len(toks) + 1):  # a negative start used to wipe the cache and return NaN logits
+        with pytest.raises(ValueError):
+            ref.forward(toks[:2], start_pos=bad)
+    assert ref.n_past == len(toks)
 
     # lazy dequantization gives bit-identical results to dequantizing at load time
     qpath = str(tmp_path / f"{name}-q4_0.borg")
@@ -291,6 +295,26 @@ def test_tiny_model_matches_hf(name, tmp_path):
     eager, lazy = ReferenceModel(qpath, lazy=False), ReferenceModel(qpath, lazy=True)
     assert lazy.lazy and not eager.lazy
     np.testing.assert_array_equal(eager.forward(toks), lazy.forward(toks))
+
+
+@pytest.mark.parametrize("name", ["llama-llama3-gelu", "qwen3-qknorm"])
+def test_tiny_half_precision_files(name, tmp_path):
+    """f16 and bf16 files: HF with its matrices rounded the same way gives the same logits, eager and lazy."""
+    need_hf()
+    import torch
+    model, d = _make_tiny(name, str(tmp_path))
+    toks = np.random.default_rng(1).integers(0, 320, size=60).tolist()
+    for qt, tdt in (("f16", torch.float16), ("bf16", torch.bfloat16)):
+        out = str(tmp_path / f"{name}-{qt}.borg")
+        convert.convert(d, out, qt, log=None)
+        rounded = type(model)(model.config).eval()
+        rounded.load_state_dict({k: v.to(tdt).float() if v.ndim == 2 else v for k, v in model.state_dict().items()})
+        with torch.no_grad():
+            hf = rounded(torch.tensor([toks])).logits[0].numpy()
+        scale = np.abs(hf).max()
+        for lazy in (False, True):
+            ours = ReferenceModel(out, lazy=lazy).forward(toks)
+            assert np.abs(ours - hf).max() / scale < 2e-5, (qt, lazy)
 
 
 def test_converter_deterministic(tmp_path):
@@ -530,6 +554,39 @@ def test_greedy_matches_hf(model, hf):
     ref = get_ref(model, "f32")
     out = ref.generate(hf["tokens"].tolist(), len(hf["gen_tokens"]), ignore_eos=True)
     assert out == hf["gen_tokens"].tolist()
+
+
+@pytest.fixture(scope="module")
+def hf_long(model):
+    """HF float32 eager logits over a 200-token prompt and its KV-cached greedy continuation.
+    Not kept in _HF_CACHE: at Qwen's vocabulary this is 120 MB per model."""
+    need_hf()
+    _REF.clear()
+    gc.collect()
+    return ho.hf_run(model.hf_path, ho.long_prompt_tokens(model.hf_path), n_gen=ho.LONG_N_GEN)
+
+
+def test_long_prompt_matches_hf(model, hf_long):
+    """The ~22-token prompt above leaves RoPE angles, the causal mask and the KV cache barely
+    exercised. Here every position of a 200-token prompt is checked against HF, then HF's
+    KV-cached greedy steps are reproduced by incremental decoding after the long prefill."""
+    ref = get_ref(model, "f32")
+    T = len(hf_long["tokens"])
+    seq, theirs = teacher_forced(hf_long)
+    ours = ref.forward(seq)
+    scale = float(np.abs(theirs).max())
+    err = np.abs(ours - theirs).max(axis=1)
+    steps = [ref.forward(seq[:T])[-1:]]
+    for i in range(T, len(seq)):
+        steps.append(ref.forward([seq[i]], start_pos=i))
+    inc = np.concatenate(steps)
+    err_inc = np.abs(inc - hf_long["gen_logits"]).max()
+    report(f"{model.key}: T={T} max|dlogit| {err.max():.2e} (last 20 prompt positions {err[T - 20:T].max():.2e}); "
+           f"incremental after prefill vs HF KV-cached steps {err_inc:.2e}; scale {scale:.1f}")
+    assert err.max() / scale < 2e-5
+    _assert_same_argmax(ours, theirs, scale)
+    assert err_inc / scale < 2e-5
+    assert inc.argmax(-1).tolist() == hf_long["gen_tokens"].tolist()
 
 
 @pytest.mark.parametrize("qtype", QTYPES)

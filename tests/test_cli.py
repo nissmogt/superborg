@@ -83,14 +83,18 @@ def test_missing_model():
 
 
 def test_argument_validation(tmp_path):
+    hf = tmp_path / "hf"
+    hf.mkdir()
+    (hf / "config.json").write_text("{}")
+    offline = {"HF_ENDPOINT": "http://127.0.0.1:9"}  # nothing listens there
     # rejected by argparse before anything is loaded or downloaded
-    for args in (("convert", str(tmp_path), str(tmp_path / "x.borg"), "--qtype", "q5"),
+    for args in (("convert", str(hf), str(tmp_path / "x.borg"), "--qtype", "q5"),
                  ("pull", "org/repo", "--dest", str(tmp_path), "--qtype", "int3"),
                  ("bench", "m.borg", "--repeat", "0"),
                  ("bench", "m.borg", "--prompt", "0"),
                  ("ask", "m.borg", "q", "--samples", "0")):
-        p = sb(*args, check=False)
-        assert p.returncode == 2 and "Traceback" not in p.stderr, (args, p.stderr)
+        p = sb(*args, env=offline, check=False)
+        assert p.returncode == 2 and "error: argument" in p.stderr and "Traceback" not in p.stderr, (args, p.stderr)
     # a missing calibration file is reported before `pull` touches the network
     p = sb("pull", "org/repo", "--dest", str(tmp_path), "--qtype", "q4_0", "--calibrate", str(tmp_path / "nope.txt"),
            env={"HF_ENDPOINT": "http://127.0.0.1:9"}, check=False)

@@ -217,7 +217,7 @@ def test_classify_context_means_rag():
 
 
 def test_strategies_contract():
-    for name in ("direct", "cot", "vote", "pal", "pal_vote", "verify", "auto", "rag"):
+    for name in ("direct", "cot", "vote", "pal", "pal_vote", "mix", "verify", "auto", "rag"):
         assert name in STRATEGIES and isinstance(STRATEGIES[name], str)
     names = [f.name for f in fields(Answer)]
     assert names[:6] == ["text", "answer", "strategy", "candidates", "elapsed_s", "tokens"]
@@ -366,6 +366,45 @@ def test_pal_vote_all_programs_fail():
     llm = FakeLLM(lambda c: "Answer: 5" if is_cot(c) else "undefined_name\n```")
     ans = solve(llm, "q", strategy="pal_vote", samples=2)
     assert ans.answer == "5" and ans.strategy == "pal_vote"
+
+
+def test_plausibility_prior():
+    from superborg.reason import plausibility
+    assert plausibility("18", GSM_Q) == 1.0 and plausibility("2.5") == 0.6
+    assert plausibility("-65000", GSM_Q) == 0.25 and plausibility("14.333333") == 0.3
+    assert plausibility("-3", "The temperature fell from 5 to -3 degrees. What is it now?") == 1.0
+    assert plausibility("Paris") == 1.0 and plausibility(None) == 0.0
+
+
+def test_weighted_vote():
+    cands = [{"key": "-5", "weight": 0.25}] * 3 + [{"key": "7", "weight": 1.0}]
+    key, info = majority_vote(cands)
+    assert key == "7" and info["counts"] == {"-5": 3, "7": 1} and info["scores"]["-5"] == 0.75
+
+
+def test_mix_stops_when_program_and_solution_agree():
+    llm = FakeBatchLLM(lambda c: "answer = 18\n```" if is_pal(c) else "16-3-4=9, 9*2=18\nAnswer: 18")
+    ans = solve(llm, GSM_Q, strategy="mix", samples=5)
+    assert ans.answer == "18" and ans.strategy == "mix" and len(llm.calls) == 2 and llm.batches == []
+    assert "Answer: 18" in ans.text and "1 of 1 programs and 1 of 1 written" in ans.text
+
+
+def test_mix_weighted_vote_over_both_formats():
+    def responder(c):
+        if is_pal(c):
+            return "answer = -5\n```"
+        return "Answer: 7" if c["index"] % 2 else "Answer: 9"
+    llm = FakeBatchLLM(responder)
+    ans = solve(llm, GSM_Q, strategy="mix", samples=3)
+    # programs: three votes for -5 at weight 0.25; solutions: 7 and 9 split
+    assert [b["n"] for b in llm.batches] == [2, 2]
+    kinds = [c["kind"] for c in ans.candidates]
+    assert kinds.count("program") == 3 and kinds.count("cot") == 3
+    assert ans.answer in ("7", "9") and ans.answer != "-5"
+    # without batching: one by one, same candidates
+    llm2 = FakeLLM(responder)
+    ans2 = solve(llm2, GSM_Q, strategy="mix", samples=3, early_stop=False)
+    assert len(ans2.candidates) == 6
 
 
 def test_verify_prefers_verified_minority():
