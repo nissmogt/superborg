@@ -228,10 +228,12 @@ def test_ask_context_dir(model, tmp_path):
 
 
 def test_bench(model):
-    d = json.loads(sb("bench", model, "--prompt", "48", "--gen", "16", "-t", THREADS, "--lookup", "3",
+    # 240 tokens repeat the ~105-token benchmark passage, so the continuation repeats it too and
+    # prompt lookup (which needs a 2-token match) has something to draft
+    d = json.loads(sb("bench", model, "--prompt", "240", "--gen", "16", "-t", THREADS, "--lookup", "3",
                       "--json").stdout)
     plain, look = d["results"]["plain"], d["results"]["lookup"]
-    assert plain["prompt_tokens"] == 48 and plain["gen_tokens"] == 16
+    assert plain["prompt_tokens"] == 240 and plain["gen_tokens"] == 16
     assert plain["prefill_tok_s"] > 0 and plain["decode_tok_s"] > 0
     assert look["drafted"] > 0 and "speedup" in look and "matches_plain" in look
     out = sb("bench", model, "--prompt", "32", "--gen", "8", "-t", THREADS, "--draft",

@@ -329,8 +329,6 @@ def test_converter_deterministic(tmp_path):
             assert fa.read() == fb.read(), q
 
 
-@pytest.mark.xfail(reason="convert_config ignores transformers>=5 'rope_parameters' (rope_theta/rope_scaling); "
-                          "see report", strict=False)
 def test_converter_reads_rope_parameters(tmp_path):
     need_hf()
     _, d = _make_tiny("llama-llama3-gelu", str(tmp_path), legacy_rope_keys=False)

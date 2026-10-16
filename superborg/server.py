@@ -526,6 +526,8 @@ class Service:
                                        max_tokens=kw["max_tokens"],
                                        seed=kw["seed"] if body.get("seed") is not None else 0,
                                        context=context, **extra)
+                # inside the lock: shutdown frees the model once it holds the lock
+                prompt_tokens = len(self.llm.tokenize(question, add_bos=False))
             except CodeExecutionDisabled as e:
                 raise APIError(403, f"answering this needs code execution: {e}", type_="permission_error",
                                param="reasoning") from e
@@ -536,7 +538,6 @@ class Service:
         info = {"strategy": ans.strategy, "answer": ans.answer, "route": getattr(ans, "route", ""),
                 "elapsed_s": round(float(ans.elapsed_s), 3), "tokens": ans.tokens,
                 "candidates": len(ans.candidates or [])}
-        prompt_tokens = len(self.llm.tokenize(question, add_bos=False))
         usage = self._usage(prompt_tokens, int(ans.tokens or 0))
         if chunk is not None:
             # the final answer exists only once the strategy has compared its candidates

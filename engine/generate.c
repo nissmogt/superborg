@@ -85,7 +85,10 @@ static int emit(gen_state *g, int32_t tok) {
 
 /* Prompt lookup: continuation of the latest earlier match of the trailing n-gram. */
 static int lookup_propose(const int32_t *seq, int len, int ngram, int k, int32_t *draft) {
-    for (int g = ngram; g >= 1; g--) {
+    /* single-token matches are mostly coincidences on ordinary text: drafting from them costs a
+     * wider verification pass for little gain, so they are used only when asked for (ngram 1) */
+    const int min_g = ngram >= 2 ? 2 : 1;
+    for (int g = ngram; g >= min_g; g--) {
         if (len < g + 1) continue;
         const int32_t *pat = seq + len - g;
         for (int i = len - g - 1; i >= 0; i--) {
@@ -247,6 +250,12 @@ int borg_generate(borg_ctx *c, const int32_t *prompt, int n_prompt, const borg_g
                     continue;
                 }
                 next = y;
+                break;
+            }
+            if (k == 0) {
+                /* no drafts: the plain sampler, so a seed gives the same tokens as sequence 0 of
+                 * borg_generate_multi */
+                next = borg_sampler_sample(smp, Li, hist_i, nhist_i);
                 break;
             }
             borg_sampler_probs(smp, Li, hist_i, nhist_i);

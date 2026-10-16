@@ -25,6 +25,7 @@ class LLM:
 
     def __init__(self, path: str, threads: int = 0, n_ctx: int = 4096, kv_f16: bool = False,
                  draft: str | None = None, n_draft: int = 6, pool: Pool | None = None):
+        self._own_pool = pool is None
         self.pool = pool or Pool(threads)
         self.model = Model(path, pool=self.pool)
         n_ctx = min(n_ctx, self.model.max_seq_len) if n_ctx > 0 else 0
@@ -142,7 +143,8 @@ class LLM:
         for obj in (self.draft_ctx, self.draft_model, self.ctx, self.model):
             if obj is not None:
                 obj.close()
-        self.pool.close()
+        if self._own_pool:  # a pool passed in by the caller may be shared with other models
+            self.pool.close()
 
     def __enter__(self):
         return self

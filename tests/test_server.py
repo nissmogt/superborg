@@ -113,12 +113,7 @@ CHAT = {"messages": [{"role": "user", "content": "Name three colors."}], "max_to
 
 
 def warm_call(srv, path: str, req: dict):
-    """The second of two identical requests.
-
-    q8_0 logits currently depend on how a prompt is batched (Q8_BATCH_BUG in test_engine.py)
-    and a repeated prompt re-evaluates only its last token, so outputs are compared only
-    between requests that take the same path: both on a warm cache.
-    """
+    """The second of two identical requests (both served from a warm prompt cache)."""
     call(srv, "POST", path, req)
     return call(srv, "POST", path, req)
 

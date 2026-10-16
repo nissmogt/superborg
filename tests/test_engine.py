@@ -165,16 +165,6 @@ def test_decode_logits_shapes(smol):
         ctx.close()
 
 
-Q8_BATCH_BUG = (
-    "engine bug: on AVX2/AVX-512 builds q8_0 matrices use dot_q8_0_q8a_x4 (one accumulator) for "
-    "groups of 4 tokens and vec_dot_q8_0_q8a (two alternating accumulators) for single tokens and "
-    "remainders; the different float summation order flips activation re-quantization (q8a) "
-    "roundings and grows into logit differences of ~0.5, so q8_0 logits depend on how tokens are "
-    "batched (prefill chunking, speculative verification). Fix: give vec_dot_q8_0_q8a the same "
-    "accumulation order as the x4 kernel (engine/kernels.c)."
-)
-
-
 @pytest.mark.parametrize("name", ["smollm2-135m-q8_0.borg", "smollm2-135m-q4_0.borg", "smollm2-135m-f32.borg",
                                   "qwen2.5-0.5b-q8_0.borg"])
 def test_incremental_equals_batched(pool, name):
@@ -196,9 +186,6 @@ def test_incremental_equals_batched(pool, name):
         scale = float(np.abs(batched).max())
         worst = max(float(np.abs(x - batched).max()) for x in (inc, chunked))
         same_argmax = all((x.argmax(axis=1) == batched.argmax(axis=1)).all() for x in (inc, chunked))
-        if (worst > 1e-4 * scale or not same_argmax) and m.header.get("quant") == "q8_0" \
-                and eng.simd() != "neon":
-            pytest.xfail(f"{Q8_BATCH_BUG} (max |diff| {worst:.3f})")
         assert worst <= 1e-4 * scale, f"max |batched - incremental| = {worst}"
         assert same_argmax
     finally:
@@ -212,7 +199,8 @@ def test_repeated_request_same_greedy_output(pool, name):
     """Sending the same prompt twice must give the same greedy text.
 
     The second call finds the prompt in the cache and re-evaluates only its last token; a
-    4-token prompt is otherwise evaluated by the 4-token q8_0 kernel (see Q8_BATCH_BUG).
+    4-token prompt is otherwise evaluated by the 4-token kernels, which must sum in the same
+    order as the 1-token kernels.
     """
     eng = _engine()
     m = eng.Model(model_path(name), pool=pool)
@@ -222,8 +210,6 @@ def test_repeated_request_same_greedy_output(pool, name):
         first = ctx.generate(prompt, max_tokens=12, sampling=greedy())
         again = ctx.generate(prompt, max_tokens=12, sampling=greedy())
         assert again.n_reused == len(prompt) - 1
-        if first.tokens != again.tokens and m.header.get("quant") == "q8_0" and eng.simd() != "neon":
-            pytest.xfail(f"{Q8_BATCH_BUG} ({first.text!r} vs {again.text!r})")
         assert first.tokens == again.tokens, (first.text, again.text)
     finally:
         ctx.close()
@@ -506,8 +492,6 @@ def test_generate_multi(pool, name):
         ref = single.generate(prompt, max_tokens=12, sampling=greedy())
         for i, g in enumerate(multi):
             assert "".join(pieces[i]) == g.text
-            if g.tokens != ref.tokens and m.header.get("quant") == "q8_0" and eng.simd() != "neon":
-                pytest.xfail(f"{Q8_BATCH_BUG} (sequence {i}: {g.text!r} vs {ref.text!r})")
             assert g.tokens == ref.tokens and g.text == ref.text, (i, g.text, ref.text)
 
         samp = Sampling(temperature=0.9, top_k=5, seed=100)
@@ -630,7 +614,7 @@ def exact_two_token_dist(model, ctx, prompt: list[int], temperature: float, top_
 
     The logits are computed the way generate() computes them on a warm cache: the prompt
     prefilled in one chunk, its last token re-evaluated alone, then one token at a time
-    (see Q8_BATCH_BUG for why the batching must match exactly).
+    (batched and single-token kernels give bit-identical results, so any batching would do).
     """
     ctx.reset()
     ctx.decode(prompt, logits=None)
@@ -670,9 +654,7 @@ def sample_counts(ctx, prompt, n: int, temperature: float, top_k: int, **spec) -
 
 
 N_DIST = int(os.environ.get("BORG_TEST_DIST_SAMPLES", "200"))
-# Verification batches stay below 4 tokens (pending + 2 drafts) so that q8_0 logits do not
-# depend on the batch size while Q8_BATCH_BUG is open.
-N_DRAFT = 2
+N_DRAFT = 5  # verification batches of up to 6 tokens exercise the 4-token kernels
 
 
 @pytest.mark.parametrize("mode", ["plain", "draft", "lookup"])
