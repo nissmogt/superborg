@@ -26,6 +26,8 @@ import numpy as np
 
 __all__ = ["TraceSession", "TraceOptions"]
 
+PREFILL_CHUNK = 128  # prompt tokens per forward pass while prefilling; should_stop is checked in between
+
 
 @dataclass
 class TraceOptions:
@@ -122,7 +124,7 @@ class TraceSession:
         p_top = np.exp(zt - lse[:, None])
         p_chosen = np.exp(zc.astype(np.float64) - lse)
         return [{"layer": li,
-                 "top": [[self.token_text(int(t)), round(float(p), 4)] for t, p in zip(top[j], p_top[j])],
+                 "top": [[self.token_text(int(t)), round(float(p), 4), int(t)] for t, p in zip(top[j], p_top[j])],
                  "p": round(float(p_chosen[j]), 5),
                  "rank": int(rank[j])}
                 for j, li in enumerate(layers)]
@@ -158,7 +160,8 @@ class TraceSession:
             "pos": int(tr["pos"]),
             "prob": round(float(probs[chosen]), 5),
             "entropy": round(float(-(p * np.log(p)).sum()), 4),
-            "alternatives": [[self.token_text(int(t)), round(float(probs[t]), 4)] for t in final_top],
+            # [text, p, id]: different byte tokens can decode to the same text (U+FFFD)
+            "alternatives": [[self.token_text(int(t)), round(float(probs[t]), 4), int(t)] for t in final_top],
             "lens": lens,
             "norms": {"attn": [round(float(x), 3) for x in norms[:, 0]],
                       "mlp": [round(float(x), 3) for x in norms[:, 1]],
@@ -172,9 +175,16 @@ class TraceSession:
     def stream_chat(self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.0,
                     top_p: float = 1.0, top_k: int = 0, seed: int = 0, enable_thinking: bool = False,
                     should_stop=None) -> Iterator[dict]:
-        """Yield {"type": "prompt" | "token" | "done", ...} events while generating a reply.
+        """Yield {"type": "prefill" | "prompt" | "token" | "done", ...} events while generating a reply.
 
-        should_stop: optional callable checked between tokens (client disconnected, stop pressed)."""
+        The uncached part of the prompt is evaluated PREFILL_CHUNK tokens at a time; when that takes
+        more than one chunk, a {"type": "prefill", "done", "total"} event follows every chunk but the
+        last. Errors in the request itself (ValueError: empty, or too long for the context) are
+        raised before the first event.
+
+        should_stop: optional callable checked before each prompt chunk and between tokens (client
+        disconnected, stop pressed). A stop during the prompt ends with "prompt" then a "done" event
+        with no tokens."""
         llm = self.llm
         ctx = llm.ctx
         text = llm.render(messages, enable_thinking=enable_thinking)
@@ -186,32 +196,58 @@ class TraceSession:
             raise ValueError(f"the conversation ({len(prompt)} tokens) does not fit the {ctx.n_ctx}-token context")
         max_tokens = max(1, min(int(max_tokens), room))
         t0 = time.perf_counter()
-        reused = ctx.sync(prompt[:-1])
-        logits = ctx.decode([prompt[-1]], "last")
-        t_prompt = time.perf_counter() - t0
-        yield {"type": "prompt", "tokens": [self.token_text(t) for t in prompt], "n_prompt": len(prompt),
-               "n_reused": reused, "prompt_ms": round(t_prompt * 1000, 1)}
+        reused = 0  # the cached prefix, short of the last prompt token (its logits are needed)
+        for a, b in zip(ctx.tokens, prompt[:-1]):
+            if a != b:
+                break
+            reused += 1
+        ctx.truncate(reused)
+        n, total = len(prompt), len(prompt) - reused
+
+        def prompt_event() -> dict:
+            return {"type": "prompt", "tokens": [self.token_text(t) for t in prompt], "n_prompt": n,
+                    "n_reused": reused, "prompt_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+        for start in range(reused, n, PREFILL_CHUNK):
+            if start > reused:
+                yield {"type": "prefill", "done": start - reused, "total": total}
+            if should_stop and should_stop():
+                yield prompt_event()
+                yield {"type": "done", "text": "", "n_gen": 0, "stop_reason": "cancelled", "seconds": 0.0,
+                       "tok_per_s": 0.0}
+                return
+            end = min(start + PREFILL_CHUNK, n)
+            if end < n:
+                ctx.decode(prompt[start:end], logits=None)
+                continue
+            if end - 1 > start:
+                ctx.decode(prompt[start:end - 1], logits=None)
+            t1 = time.perf_counter()  # the last token alone: its pass gives the first reply token's decode_ms
+            logits = ctx.decode([prompt[-1]], "last")
+            t_decode = time.perf_counter() - t1
+        yield prompt_event()
         rng = np.random.default_rng(seed)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         stops = llm.formatter.stop_strings()
         out_text, n_gen, stop_reason = "", 0, "length"
         t_gen = time.perf_counter()
-        t_decode = 0.0
         for i in range(max_tokens):
             tok, probs = self._sample(logits, rng, temperature, top_p, top_k)
             t1 = time.perf_counter()
             report = self.token_report(tok, probs)
             t_trace = time.perf_counter() - t1
+            # decode_ms: the forward pass that produced this token's logits
+            times = {"decode_ms": round(t_decode * 1000, 1), "trace_ms": round(t_trace * 1000, 1)}
             if llm.model.is_eog(tok):
                 stop_reason = "eos"
                 yield {"type": "token", "i": i, "id": tok, "text": "", "raw": self.token_text(tok), "eos": True,
-                       "trace_ms": round(t_trace * 1000, 1), **report}
+                       **times, **report}
                 break
             piece = decoder.decode(llm.model.token_bytes(tok))
             out_text += piece
             n_gen += 1
             yield {"type": "token", "i": i, "id": tok, "text": piece, "raw": self.token_text(tok), "eos": False,
-                   "decode_ms": round(t_decode * 1000, 1), "trace_ms": round(t_trace * 1000, 1), **report}
+                   **times, **report}
             if any(s in out_text for s in stops):
                 stop_reason = "stop"
                 break

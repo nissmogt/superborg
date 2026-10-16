@@ -7,8 +7,10 @@
 # Needs clang with the wasm32-wasi target and binaryen's wasm2js (BINARYEN_WASM2JS, or on PATH,
 # or `npx -y binaryen@123.0.0`). The output defines borgAsmInstantiate(imports) for wasm/borg-runtime.js.
 set -eu
+OUT=${1:-}
+case $OUT in ''|/*) ;; *) OUT="$PWD/$OUT" ;; esac  # a relative path is the caller's
 cd "$(dirname "$0")/.."
-OUT=${1:-build/borg-asm.js}
+OUT=${OUT:-build/borg-asm.js}
 CC=${CC:-clang}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -18,7 +20,7 @@ $CC --target=wasm32-wasi -O3 -mcpu=mvp -mexec-model=reactor -std=c11 -fvisibilit
     engine/json.c engine/model.c engine/kernels.c engine/pool.c engine/tokenizer.c engine/forward.c \
     engine/sample.c engine/generate.c engine/json_mode.c \
     -o "$TMP/borg-mvp.wasm" -lm -lwasi-emulated-mman \
-    -Wl,--export-dynamic -Wl,--export=malloc -Wl,--export=free -Wl,--max-memory=4294967296
+    -Wl,--export-dynamic -Wl,--export=malloc -Wl,--export=free -Wl,--max-memory=2147418112
 if [ -n "${BINARYEN_WASM2JS:-}" ]; then W2J=$BINARYEN_WASM2JS
 elif command -v wasm2js >/dev/null 2>&1; then W2J=wasm2js
 else W2J="npx -y -p binaryen@123.0.0 wasm2js"; fi
@@ -29,6 +31,13 @@ python3 - "$TMP/borg-esm.js" "$OUT" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 src = re.sub(r"^import \* as \w+ from '[^']+';\n", "", src, flags=re.M)
+# wasm2js grows memory with new ArrayBuffer(Math_imul(newPages, 65536)), which overflows at 2 GiB and
+# throws RangeError out of malloc (its signed HEAP32[p >> 2] indexing cannot reach past 2 GiB anyway):
+# fail the grow there instead, so malloc returns NULL and the runtime reports out of memory
+grow = "  if ((oldPages < newPages) && (newPages < 65536)) {"
+if src.count(grow) != 1:
+    sys.exit("build-js.sh: unexpected wasm2js memory.grow code")
+src = src.replace(grow, "  if (newPages > 32767) return -1;\n" + grow)
 cut = src.index("var retasmFunc = asmFunc(")
 body = src[:cut]
 open(sys.argv[2], "w").write(

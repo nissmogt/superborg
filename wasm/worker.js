@@ -3,10 +3,15 @@
 // Messages from the page:
 //   {op: "init", base?}                 download the engine and model listed in model.json
 //   {op: "info", id}                    -> {id, info}
-//   {op: "chat", id, body}              -> {id, event} for every TraceSession event, then {id, end: true}
-//   {op: "stop"}                        cancel the running generation (it ends with stop_reason "cancelled")
+//   {op: "chat", id, body}              -> {id, event} for every TraceSession event, then {id, end: true};
+//                                       body as POST /api/chat (superborg/ui.py), with "request_id"?
+//   {op: "stop", id?, request_id?}      cancel the running generation (it ends with stop_reason
+//                                       "cancelled"), or only the one with that request_id; a request_id
+//                                       whose chat has not started yet is remembered, and that chat
+//                                       ends at once -> {id, stop: {stopped} | {stopped: false, pending: true}}
 //   {op: "reset"}                       drop the KV cache
 // Messages to the page without an id: {status: {text, progress}}, {ready: info}, {fatal: message}.
+// A chat while another runs gets the one event {type: "error", message, code: "busy"}.
 //
 // model.json: {"wasm": "borg.wasm", "n_ctx", "lens_stride",
 //              "model": {"name", "id", "size", "wrap"?, "parts": [{"path", "size"}...]}}
@@ -21,7 +26,10 @@
 
 if (typeof Borg === "undefined") importScripts("borg-runtime.js", "trace-session.js");
 
-let session = null, model = null, ctx = null, busy = false, stopFlag = false, nCtx = 2048;
+let session = null, model = null, ctx = null, nCtx = 2048, modelName = "", defaultStride = 3;
+let running = null;               // {requestId, stopped} of the generation in progress
+const started = [];               // request ids of the last 64 generations
+const earlyStops = new Map();     // request_id -> time, for stops that came before their chat
 
 const post = (m) => self.postMessage(m);
 const status = (text, progress = null) => post({ status: { text, progress } });
@@ -29,7 +37,7 @@ const status = (text, progress = null) => post({ status: { text, progress } });
 // Let queued messages (stop) run between tokens: a MessageChannel round trip is not clamped like setTimeout.
 const tick = () => new Promise((resolve) => {
   const ch = new MessageChannel();
-  ch.port1.onmessage = () => resolve();
+  ch.port1.onmessage = () => { ch.port1.close(); resolve(); };
   ch.port2.postMessage(0);
 });
 
@@ -53,6 +61,18 @@ function cacheGet(db, key) {
       r.onsuccess = () => resolve(r.result || null);
       r.onerror = () => resolve(null);
     } catch (e) { resolve(null); }
+  });
+}
+// drop the parts of other versions of this model (another id, part size or split)
+function cachePrune(db, prefix, keep) {
+  if (!db) return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction("parts", "readwrite"), st = tx.objectStore("parts");
+      const r = st.getAllKeys();
+      r.onsuccess = () => { for (const k of r.result) if (String(k).startsWith(prefix) && !keep.has(k)) st.delete(k); };
+      tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+    } catch (e) { resolve(); }
   });
 }
 function cachePut(db, key, value) {
@@ -106,7 +126,9 @@ async function fetchBytes(url, onProgress) {
 async function init(base) {
   const url = (p) => new URL(p, base || self.location.href).href;
   status("Loading the engine");
-  const manifest = await (await fetch(url("model.json"))).json();
+  const res = await fetch(url("model.json"));
+  if (!res.ok) throw new Error(`cannot download model.json: HTTP ${res.status}`);
+  const manifest = await res.json().catch(() => { throw new Error("model.json is not valid JSON"); });
   nCtx = manifest.n_ctx || 2048;
   const log = (s) => console.warn("[borg]", s);
   let borg, slow = false;
@@ -124,10 +146,12 @@ async function init(base) {
   const mm = manifest.model, total = mm.size;
   const reservation = borg.reserveModel(total);
   const db = await openCache();
+  const keyOf = (part) => `${mm.name}:${mm.id || ""}:${part.path}:${part.size}`;
+  await cachePrune(db, `${mm.name}:`, new Set(mm.parts.map(keyOf)));  // before downloading: room for this one
   let done = 0, off = 0, fromCache = 0;
   const pct = (x) => Math.round((100 * x) / total);
   for (const part of mm.parts) {
-    const key = `${mm.name}:${mm.id || ""}:${part.path}:${part.size}`;
+    const key = keyOf(part);
     let bytes = await cacheGet(db, key);
     if (bytes && bytes.byteLength === part.size) {
       bytes = new Uint8Array(bytes);
@@ -150,40 +174,129 @@ async function init(base) {
   model = reservation.load();
   ctx = model.context({ nCtx, kvF16: true });
   // the JavaScript build is about 4x slower: trace fewer lens layers by default
-  session = new TraceSession(model, ctx, { lensStride: (manifest.lens_stride || 3) * (slow ? 2 : 1) });
-  const info = session.info();
-  info.model = mm.name || info.model;
-  return info;
+  defaultStride = Math.min(Math.max(1, (manifest.lens_stride || 3) * (slow ? 2 : 1)), model.config.n_layers);
+  session = new TraceSession(model, ctx, { lensStride: defaultStride });
+  modelName = mm.name;
+  return info();
 }
 
+// as GET /api/info of superborg/ui.py
 function info() {
   const i = session.info();
-  i.busy = busy;
+  i.model = modelName || i.model;
+  i.lens_stride = defaultStride;
+  i.lens_layers = session.lensLayers(defaultStride);
+  i.max_tokens_default = Math.min(512, ctx.nCtx);
+  i.busy = !!running;
   return i;
 }
 
+const ROLES = new Set(["system", "user", "assistant", "tool", "developer", "function"]);
+const validRequestId = (v) => typeof v === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(v);
+
+// OpenAI content: a string or a list of text parts (superborg/server.py _content_text)
+function contentText(c, where) {
+  if (c == null) return "";
+  if (typeof c === "string") return c;
+  if (!Array.isArray(c)) throw new Error(`${where}: 'content' must be a string or a list of parts`);
+  return c.map((part, j) => {
+    if (typeof part === "string") return part;
+    if (part && typeof part === "object" && (part.type === "text" || part.type === "input_text")) {
+      if (typeof part.text !== "string") throw new Error(`${where}.content[${j}]: 'text' must be a string`);
+      return part.text;
+    }
+    if (part && typeof part === "object") throw new Error(`${where}: content part type '${part.type}' is not supported`);
+    throw new Error(`${where}.content[${j}] must be a string or an object`);
+  }).join("");
+}
+
+// streamChat options for a chat body, checked like superborg/ui.py's parse_chat (throws on a bad value)
+function parseChat(body) {
+  const num = (name, dflt, lo, hi, int = true) => {
+    const v = body[name] ?? dflt;
+    if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`'${name}' must be a finite number`);
+    if (int && !Number.isInteger(v)) throw new Error(`'${name}' must be an integer`);
+    if (v < lo || v > hi)
+      throw new Error(hi === Infinity ? `'${name}' must be at least ${lo}` : `'${name}' must be in [${lo}, ${hi}]`);
+    return v;
+  };
+  const msgs = body.messages;
+  if (!Array.isArray(msgs) || !msgs.length) throw new Error("'messages' must be a non-empty list");
+  const messages = msgs.map((m, i) => {
+    if (!m || typeof m !== "object" || typeof m.role !== "string")
+      throw new Error(`messages[${i}] must be an object with a 'role'`);
+    if (!ROLES.has(m.role)) throw new Error(`messages[${i}]: unknown role '${m.role}'`);
+    return { role: m.role === "developer" ? "system" : m.role, content: contentText(m.content, `messages[${i}]`) };
+  });
+  const rid = body.request_id;
+  if (rid != null && !validRequestId(rid))
+    throw new Error("'request_id' must be 1-64 characters from A-Z, a-z, 0-9, '_' and '-'");
+  if (body.enable_thinking != null && typeof body.enable_thinking !== "boolean")
+    throw new Error("'enable_thinking' must be true or false");
+  return {
+    requestId: rid ?? null,
+    messages,
+    // above the context or the layer count: the most there is
+    maxTokens: Math.min(num("max_tokens", Math.min(512, ctx.nCtx), 1, Infinity), ctx.nCtx),
+    lensStride: Math.min(num("lens_stride", defaultStride, 1, Infinity), model.config.n_layers),
+    temperature: num("temperature", 0, 0, 2, false),
+    topP: num("top_p", 1, 0, 1, false),
+    topK: num("top_k", 0, 0, 2 ** 30),
+    seed: num("seed", 0, 0, 2 ** 64 - 1),
+    enableThinking: body.enable_thinking === true,
+  };
+}
+
+function stop(requestId) {
+  if (requestId == null || (running && running.requestId === requestId)) {
+    if (running) running.stopped = true;
+    return { stopped: !!running };
+  }
+  if (started.includes(requestId)) return { stopped: false };  // that one has ended already
+  // its chat has not started (it may still be on its way): remember the id, the last 64 for 60 s
+  earlyStops.delete(requestId);
+  earlyStops.set(requestId, Date.now());
+  if (earlyStops.size > 64) earlyStops.delete(earlyStops.keys().next().value);
+  return { stopped: false, pending: true };
+}
+
+// a generation with this id starts: was it stopped already?
+function stoppedEarly(requestId) {
+  for (const [k, t] of earlyStops) if (Date.now() - t > 60000) earlyStops.delete(k);
+  if (requestId == null) return false;
+  started.push(requestId);
+  if (started.length > 64) started.shift();
+  return earlyStops.delete(requestId);
+}
+
 async function chat(id, body) {
-  if (busy) { post({ id, event: { type: "error", error: "a generation is already running" } }); post({ id, end: true }); return; }
-  busy = true;
-  stopFlag = false;
+  let opt;
   try {
-    if (body.lens_stride) session.opt.lensStride = Math.max(1, body.lens_stride | 0);
-    const gen = session.streamChat(body.messages || [], {
-      maxTokens: body.max_tokens ?? 256,
-      temperature: body.temperature ?? 0,
-      topP: body.top_p ?? 1,
-      topK: body.top_k ?? 0,
-      seed: body.seed ?? 0,
-      shouldStop: () => stopFlag,
-    });
-    for (const ev of gen) {
+    opt = parseChat(body);
+  } catch (e) {
+    post({ id, event: { type: "error", message: e.message } });
+    post({ id, end: true });
+    return;
+  }
+  if (running) {
+    post({ id, event: { type: "error", message: "a generation is already running", code: "busy" } });
+    post({ id, end: true });
+    return;
+  }
+  const gen = running = { requestId: opt.requestId, stopped: stoppedEarly(opt.requestId) };
+  try {
+    session.opt.lensStride = opt.lensStride;
+    const events = session.streamChat(opt.messages, Object.assign({}, opt, { shouldStop: () => gen.stopped }));
+    for (const ev of events) {
       post({ id, event: ev });
-      await tick(); // let a stop message in
+      await tick(); // let a stop message in (between tokens and between prompt chunks)
     }
   } catch (e) {
-    post({ id, event: { type: "error", error: String(e && e.message ? e.message : e) } });
+    const ev = { type: "error", message: String(e && e.message ? e.message : e) };
+    if (e && e.code) ev.code = e.code;
+    post({ id, event: ev });
   } finally {
-    busy = false;
+    running = null;
     post({ id, end: true });
   }
 }
@@ -196,12 +309,14 @@ self.onmessage = async (e) => {
       if (!ready) ready = init(m.base);
       post({ ready: await ready });
     } else if (m.op === "stop") {
-      stopFlag = true;
+      const rid = m.request_id ?? null;
+      const r = rid === null || validRequestId(rid) ? stop(rid) : { stopped: false, error: "bad request_id" };
+      if (m.id != null) post({ id: m.id, stop: r });
     } else if (m.op === "info") {
       await ready;
       post({ id: m.id, info: info() });
     } else if (m.op === "reset") {
-      if (!busy && ctx) ctx.truncate(0);
+      if (!running && ctx) ctx.truncate(0);
     } else if (m.op === "chat") {
       await ready;
       await chat(m.id, m.body || {});

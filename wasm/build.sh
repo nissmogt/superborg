@@ -7,8 +7,10 @@
 # wasi-sdk packages). The module imports a handful of WASI functions; wasm/borg-runtime.js
 # provides them, so it runs in browsers and Node without a WASI runtime.
 set -eu
+OUT=${1:-}
+case $OUT in ''|/*) ;; *) OUT="$PWD/$OUT" ;; esac  # a relative path is the caller's
 cd "$(dirname "$0")/.."
-OUT=${1:-build/borg.wasm}
+OUT=${OUT:-build/borg.wasm}
 CC=${CC:-clang}
 mkdir -p "$(dirname "$OUT")"
 SYSROOT_FLAG=""

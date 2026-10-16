@@ -133,16 +133,21 @@ const borg_tensor *model_find_tensor(const borg_model *m, const char *name) {
     return NULL;
 }
 
-static size_t tensor_expected_bytes(const borg_tensor *t) {
-    int64_t n = 1;
-    for (int i = 0; i < t->ndim; i++) n *= t->shape[i];
+/* In 64 bits, so a size that does not fit a 32-bit size_t (wasm32) cannot wrap to a small one;
+   UINT64_MAX (matches no tensor) when the shape's element count passes 2^60. */
+static uint64_t tensor_expected_bytes(const borg_tensor *t) {
+    uint64_t n = 1;
+    for (int i = 0; i < t->ndim; i++) {
+        if (t->shape[i] && n > ((uint64_t)1 << 60) / (uint64_t)t->shape[i]) return UINT64_MAX;
+        n *= (uint64_t)t->shape[i];
+    }
     switch (t->dtype) {
-    case DT_F32: case DT_U32: case DT_I32: return (size_t)n * 4;
-    case DT_F16: case DT_BF16: return (size_t)n * 2;
-    case DT_U8: return (size_t)n;
-    case DT_Q8_0: return (size_t)(n / QK) * sizeof(block_q8_0);
-    case DT_Q4_0: return (size_t)(n / QK) * sizeof(block_q4_0);
-    case DT_Q4_1: return (size_t)(n / QK) * sizeof(block_q4_1);
+    case DT_F32: case DT_U32: case DT_I32: return n * 4;
+    case DT_F16: case DT_BF16: return n * 2;
+    case DT_U8: return n;
+    case DT_Q8_0: return n / QK * sizeof(block_q8_0);
+    case DT_Q4_0: return n / QK * sizeof(block_q4_0);
+    case DT_Q4_1: return n / QK * sizeof(block_q4_1);
     default: return 0;
     }
 }
@@ -289,7 +294,7 @@ static borg_model *load_mapped(borg_model *m, const char *path, char *err, int e
     m->header_json[hlen] = 0;
     root = json_parse(m->header_json, hlen, err, errlen);
     if (!root) goto fail;
-    size_t data_start = (16 + hlen + 63) / 64 * 64;
+    const uint64_t data_start = (16 + hlen + 63) / 64 * 64;
 
     /* tensors */
     const json_value *tens = json_get(root, "tensors");
@@ -308,14 +313,14 @@ static borg_model *load_mapped(borg_model *m, const char *path, char *err, int e
             borg_set_err(err, errlen, "tensor %s: bad shape", t->name); goto fail;
         }
         t->ndim = shape->len;
-        for (int d = 0; d < t->ndim; d++) /* 2^31 per dimension and ndim <= 4 keep products in int64 */
+        for (int d = 0; d < t->ndim; d++) /* element counts are checked by tensor_expected_bytes */
             if (json_int(&shape->items[d], -1, 0, (double)INT_MAX, &t->shape[d])) {
                 borg_set_err(err, errlen, "tensor %s: bad shape", t->name); goto fail;
             }
-        int64_t off64, nb64;
+        int64_t off64, nb64; /* each at most map_size: the 64-bit sum cannot wrap */
         if (json_int(json_get(tv, "offset"), -1, 0, (double)m->map_size, &off64) ||
             json_int(json_get(tv, "nbytes"), -1, 0, (double)m->map_size, &nb64) ||
-            data_start + (size_t)off64 + (size_t)nb64 > m->map_size) {
+            data_start + (uint64_t)off64 + (uint64_t)nb64 > (uint64_t)m->map_size) {
             borg_set_err(err, errlen, "tensor %s lies outside the file", t->name); goto fail;
         }
         const size_t off = (size_t)off64, nb = (size_t)nb64;
@@ -323,10 +328,10 @@ static borg_model *load_mapped(borg_model *m, const char *path, char *err, int e
             borg_set_err(err, errlen, "tensor %s is not 64-byte aligned", t->name); goto fail;
         }
         t->nbytes = nb;
-        if (tensor_expected_bytes(t) != t->nbytes) {
+        if (tensor_expected_bytes(t) != (uint64_t)nb64) {
             borg_set_err(err, errlen, "tensor %s: size %zu does not match its shape", t->name, t->nbytes); goto fail;
         }
-        t->data = base + data_start + off;
+        t->data = base + (size_t)data_start + off;
     }
 
     /* config */

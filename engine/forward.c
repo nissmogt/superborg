@@ -25,6 +25,13 @@
 #endif
 
 /* ---- context lifecycle ---------------------------------------------------- */
+/* calloc of a * b elements of esz bytes, or NULL when that does not fit size_t: on 32-bit targets
+   (wasm32) the product of n_ctx or n_batch and model sizes would otherwise wrap to a small buffer */
+static void *calloc2(uint64_t a, uint64_t b, size_t esz) {
+    if (b && a > SIZE_MAX / esz / b) return NULL;
+    return calloc((size_t)(a * b), esz);
+}
+
 borg_ctx_params borg_ctx_default_params(void) {
     borg_ctx_params p = {0, 0, 0};
     return p;
@@ -103,23 +110,23 @@ borg_ctx *borg_ctx_new(borg_model *m, borg_pool *pool, const borg_ctx_params *pa
     if (F > max_cols) max_cols = F;
     if (NQ > max_cols) max_cols = NQ;
     c->max_cols = (max_cols + QK - 1) / QK * QK;
-    const size_t kv_elems = (size_t)cfg->n_layers * NKV * (size_t)c->n_ctx;
+    const uint64_t kv_rows = (uint64_t)cfg->n_layers * NKV; /* times n_ctx elements */
     const size_t esz = c->kv_f16 ? 2 : 4;
 
     c->tokens = (int32_t *)calloc((size_t)c->n_ctx, sizeof(int32_t));
-    c->k_cache = calloc(kv_elems, esz);
-    c->v_cache = calloc(kv_elems, esz);
+    c->k_cache = calloc2(kv_rows, (uint64_t)c->n_ctx, esz);
+    c->v_cache = calloc2(kv_rows, (uint64_t)c->n_ctx, esz);
     c->inv_freq = (float *)calloc((size_t)HD / 2, sizeof(float));
-    c->x = (float *)calloc((size_t)B * D, sizeof(float));
-    c->xb = (float *)calloc((size_t)B * (NQ > D ? NQ : D), sizeof(float));
-    c->xb2 = (float *)calloc((size_t)B * D, sizeof(float));
-    c->q = (float *)calloc((size_t)B * NQ, sizeof(float));
-    c->k = (float *)calloc((size_t)B * NKV, sizeof(float));
-    c->v = (float *)calloc((size_t)B * NKV, sizeof(float));
-    c->hb = (float *)calloc((size_t)B * F, sizeof(float));
-    c->hb2 = (float *)calloc((size_t)B * F, sizeof(float));
-    c->xq = (block_q8a *)calloc((size_t)B * (c->max_cols / QK), sizeof(block_q8a));
-    c->att = (float *)calloc((size_t)nthreads * c->n_ctx, sizeof(float));
+    c->x = (float *)calloc2(B, D, sizeof(float));
+    c->xb = (float *)calloc2(B, NQ > D ? NQ : D, sizeof(float));
+    c->xb2 = (float *)calloc2(B, D, sizeof(float));
+    c->q = (float *)calloc2(B, NQ, sizeof(float));
+    c->k = (float *)calloc2(B, NKV, sizeof(float));
+    c->v = (float *)calloc2(B, NKV, sizeof(float));
+    c->hb = (float *)calloc2(B, F, sizeof(float));
+    c->hb2 = (float *)calloc2(B, F, sizeof(float));
+    c->xq = (block_q8a *)calloc2(B, c->max_cols / QK, sizeof(block_q8a));
+    c->att = (float *)calloc2(nthreads, c->n_ctx, sizeof(float));
     c->embd = (float *)calloc((size_t)D, sizeof(float));
     c->row_ctx = (borg_ctx **)calloc((size_t)B, sizeof(borg_ctx *));
     c->row_pos = (int *)calloc((size_t)B, sizeof(int));
@@ -140,7 +147,7 @@ int borg_ctx_enable_stats(borg_ctx *c, int enable) {
         return 0;
     }
     if (c->stats) return 0;
-    c->stats = (double *)calloc((size_t)c->model->cfg.n_layers * SITE_COUNT * c->max_cols, sizeof(double));
+    c->stats = (double *)calloc2((uint64_t)c->model->cfg.n_layers * SITE_COUNT, c->max_cols, sizeof(double));
     c->stats_tokens = 0;
     return c->stats ? 0 : -1;
 }
@@ -181,9 +188,9 @@ int borg_ctx_enable_trace(borg_ctx *c, int enable) {
     }
     const borg_config *cfg = &c->model->cfg;
     if (!c->tr_resid) {
-        c->tr_resid = (float *)calloc((size_t)(cfg->n_layers + 1) * cfg->dim, sizeof(float));
-        c->tr_attn = (float *)calloc((size_t)cfg->n_layers * cfg->n_heads * c->n_ctx, sizeof(float));
-        c->tr_mlp = (float *)calloc((size_t)cfg->n_layers * cfg->hidden_dim, sizeof(float));
+        c->tr_resid = (float *)calloc2(cfg->n_layers + 1, cfg->dim, sizeof(float));
+        c->tr_attn = (float *)calloc2((uint64_t)cfg->n_layers * cfg->n_heads, c->n_ctx, sizeof(float));
+        c->tr_mlp = (float *)calloc2(cfg->n_layers, cfg->hidden_dim, sizeof(float));
         c->tr_norms = (float *)calloc((size_t)cfg->n_layers * 3, sizeof(float));
         if (!c->tr_resid || !c->tr_attn || !c->tr_mlp || !c->tr_norms) {
             free(c->tr_resid);

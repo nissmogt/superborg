@@ -82,6 +82,7 @@ typedef struct {
 } borg_ctx_params;
 
 BORG_API borg_ctx_params borg_ctx_default_params(void);
+/* NULL when out of memory, or when a buffer's size does not fit size_t (32-bit targets: wasm32). */
 BORG_API borg_ctx *borg_ctx_new(borg_model *model, borg_pool *pool, const borg_ctx_params *params);
 BORG_API void borg_ctx_free(borg_ctx *ctx);
 BORG_API int borg_ctx_n_ctx(const borg_ctx *ctx);

@@ -1,6 +1,7 @@
 // Page-side transport for the in-browser engine: runs wasm/worker.js in a Web Worker and exposes
 // the interface the chat UI (superborg/web/index.html) expects from window.BORG_TRANSPORT:
-//   info() -> Promise<info>, chat(body, onEvent) -> Promise, stop() -> Promise, onStatus(cb)
+//   info() -> Promise<info>, chat(body, onEvent) -> Promise, stop(requestId?) -> Promise<{stopped, pending?}>,
+//   onStatus(cb)
 // Load this before the UI's main script. The worker file is "worker.js" next to the page.
 
 /* global window, Worker, Blob, URL, fetch, location */
@@ -32,6 +33,7 @@
     const p = pending.get(m.id);
     if (!p) return;
     if (m.info) { pending.delete(m.id); p.resolve(m.info); }
+    else if (m.stop) { pending.delete(m.id); p.resolve(m.stop); }
     else if (m.event) p.onEvent && p.onEvent(m.event);
     else if (m.end) { pending.delete(m.id); p.resolve(); }
   }
@@ -50,20 +52,23 @@
   }
   start().catch((e) => onMessage({ data: { fatal: String(e.message || e) } }));
 
-  function request(op, extra, onEvent) {
-    return ready.then(() => new Promise((resolve, reject) => {
+  function post(op, extra, onEvent) {
+    return new Promise((resolve, reject) => {
       const id = nextId++;
       pending.set(id, { resolve, reject, onEvent });
       worker.postMessage(Object.assign({ op, id }, extra));
-    }));
+    });
   }
+  const request = (op, extra, onEvent) => ready.then(() => post(op, extra, onEvent));
 
   window.BORG_TRANSPORT = {
     kind: "wasm",
     ready,
     info: () => request("info", {}),
     chat: (body, onEvent) => request("chat", { body }, onEvent),
-    stop: async () => { if (worker) worker.postMessage({ op: "stop" }); },
+    // not queued behind the engine's start: the worker remembers a stop for a chat it has not seen yet
+    stop: async (requestId) => (worker ? post("stop", requestId ? { request_id: requestId } : {})
+      .catch(() => ({ stopped: false })) : { stopped: false }),
     reset: async () => { if (worker) worker.postMessage({ op: "reset" }); },
     onStatus: (cb) => { statusCbs.push(cb); cb(lastStatus); },
   };

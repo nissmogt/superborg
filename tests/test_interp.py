@@ -54,8 +54,8 @@ def test_lens_report_matches_float64_softmax(session):
         for got, want in zip(ev["lens"], ref):
             assert got["layer"] == want["layer"] and got["rank"] == want["rank"]
             assert got["p"] == pytest.approx(want["p"], abs=1e-5)
-            assert [s for s, _ in got["top"]] == [s for s, _ in want["top"]]
-            assert [p for _, p in got["top"]] == pytest.approx([p for _, p in want["top"]], abs=1e-4)
+            assert [x[0] for x in got["top"]] == [x[0] for x in want["top"]]
+            assert [x[1] for x in got["top"]] == pytest.approx([x[1] for x in want["top"]], abs=1e-4)
         n += 1
     assert n >= 2
 
@@ -72,12 +72,86 @@ def test_lens_stride_keeps_the_output_layer(session):
 
 
 def test_should_stop_cancels_after_the_current_token(session):
-    seen = []
-    evs = list(session.stream_chat([{"role": "user", "content": "Count from one to fifty."}], max_tokens=40,
-                                   should_stop=lambda: len(seen) >= 2 or seen.append(1)))
+    evs = []
+    for ev in session.stream_chat([{"role": "user", "content": "Count from one to fifty."}], max_tokens=40,
+                                  should_stop=lambda: sum(e["type"] == "token" for e in evs) >= 3):
+        evs.append(ev)
     toks = [e for e in evs if e["type"] == "token"]
     assert evs[-1]["type"] == "done" and evs[-1]["stop_reason"] == "cancelled"
     assert len(toks) == 3 and evs[-1]["n_gen"] == 3
+
+
+def test_token_ids_with_alternatives_and_lens_tops(session):
+    """[text, p, id]: byte tokens of one emoji all read U+FFFD, so only the id tells them apart."""
+    for ev in session.stream_chat([{"role": "user", "content": "Reply with three emoji."}], max_tokens=8,
+                                  temperature=1.0, seed=5):
+        if ev["type"] != "token":
+            continue
+        rows = ev["alternatives"] + [r for x in ev["lens"] for r in x["top"]]
+        assert all(len(r) == 3 and isinstance(r[2], int) and r[0] == session.token_text(r[2]) for r in rows)
+        assert len({r[2] for r in ev["alternatives"]}) == len(ev["alternatives"])
+        chosen = [r for r in ev["alternatives"] if r[2] == ev["id"]]
+        assert not chosen or abs(chosen[0][1] - ev["prob"]) < 1e-4
+        assert ev["lens"][-1]["top"][0][2] == ev["alternatives"][0][2]  # the last layer is the output
+
+
+def test_decode_ms_on_every_token(session):
+    """Including the first (the pass over the prompt's last token) and an end-of-turn token."""
+    toks = [e for e in session.stream_chat(Q, max_tokens=40) if e["type"] == "token"]
+    assert toks[-1]["eos"], "expected the reply to end within 40 tokens"
+    assert all(e["decode_ms"] > 0 and e["trace_ms"] >= 0 for e in toks)
+
+
+def _long_prompt(n_items: int) -> list[dict]:
+    text = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(n_items))
+    return [{"role": "user", "content": text + "\nSummarize."}]
+
+
+def test_prefill_in_chunks(session, monkeypatch):
+    from superborg import interp
+    msgs = _long_prompt(25)  # about 330 tokens: three chunks
+    session.llm.ctx.reset()
+    evs = list(session.stream_chat(msgs, max_tokens=4))
+    pre = [e for e in evs if e["type"] == "prefill"]
+    prompt = next(e for e in evs if e["type"] == "prompt")
+    assert evs.index(prompt) == len(pre) and prompt["n_reused"] == 0  # progress first, then the prompt
+    total = prompt["n_prompt"]
+    assert [e["done"] for e in pre] == list(range(interp.PREFILL_CHUNK, total, interp.PREFILL_CHUNK))
+    assert all(e["total"] == total for e in pre) and len(pre) >= 2
+    # the same tokens as a prompt evaluated in one piece
+    session.llm.ctx.reset()
+    monkeypatch.setattr(interp, "PREFILL_CHUNK", 1 << 20)
+    one = list(session.stream_chat(msgs, max_tokens=4))
+    assert [e["type"] for e in one][0] == "prompt"
+    assert [e["id"] for e in one if e["type"] == "token"] == [e["id"] for e in evs if e["type"] == "token"]
+    # a prompt that fits one chunk sends no progress: here only the new turn is evaluated
+    again = list(session.stream_chat(msgs + [{"role": "assistant", "content": "Foxes."},
+                                             {"role": "user", "content": "Shorter."}], max_tokens=1))
+    assert again[0]["type"] == "prompt" and again[0]["n_reused"] > total // 2
+
+
+def test_should_stop_during_prefill(session):
+    """A stop between prompt chunks ends with "prompt" and an empty cancelled "done"; the chunks
+    already evaluated stay in the cache."""
+    from superborg import interp
+    msgs = _long_prompt(25)
+    session.llm.ctx.reset()
+    evs = []
+    for ev in session.stream_chat(msgs, max_tokens=4, should_stop=lambda: any(e["type"] == "prefill" for e in evs)):
+        evs.append(ev)
+    assert [e["type"] for e in evs] == ["prefill", "prompt", "done"]
+    assert evs[-1]["stop_reason"] == "cancelled" and evs[-1]["n_gen"] == 0 and evs[-1]["text"] == ""
+    assert evs[1]["prompt_ms"] > 0 and session.llm.ctx.n_past == interp.PREFILL_CHUNK
+    # stopped before anything is evaluated: no forward pass at all
+    evs = list(session.stream_chat(msgs, max_tokens=4, should_stop=lambda: True))
+    assert [e["type"] for e in evs] == ["prompt", "done"] and evs[0]["n_reused"] == interp.PREFILL_CHUNK
+    assert session.llm.ctx.n_past == interp.PREFILL_CHUNK
+
+
+def test_request_errors_come_before_any_event(session):
+    gen = session.stream_chat([{"role": "user", "content": "word " * 2000}], should_stop=lambda: True)
+    with pytest.raises(ValueError, match="context"):
+        next(gen)
 
 
 def test_info(session):

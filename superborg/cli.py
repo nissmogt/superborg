@@ -441,7 +441,7 @@ def cmd_ui(a) -> int:
     from .ui import serve_ui
 
     serve_ui(resolve_model(a.model), host=a.host, port=a.port, threads=a.threads, n_ctx=a.ctx,
-             lens_stride=a.lens_stride, open_browser=a.open, quiet=not a.verbose)
+             lens_stride=a.lens_stride, open_browser=a.open, quiet=not a.verbose, allow_hosts=a.allow_host)
     return 0
 
 
@@ -653,6 +653,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("model", help="path to a .borg file (or a name in $SUPERBORG_MODELS)")
     p.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1: this machine only)")
     p.add_argument("--port", type=int, default=8765, help="port (default 8765; 0 picks a free one)")
+    p.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                   help="also answer requests addressed to this host name (repeatable; local names and IP "
+                        "addresses always work, other names are refused as a guard against DNS rebinding)")
     p.add_argument("-t", "--threads", type=int, default=0, help="worker threads (default: all cores)")
     p.add_argument("-c", "--ctx", type=int, default=4096, help="context length in tokens (default 4096)")
     p.add_argument("--lens-stride", type=_positive, default=1, metavar="N",

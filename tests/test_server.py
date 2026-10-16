@@ -326,6 +326,13 @@ def test_completion_lookup_decoding(server):
     ("/v1/chat/completions", {"messages": [{"role": "wizard", "content": "x"}]}, 400, "role"),
     ("/v1/chat/completions", {"messages": [{"role": "user", "content": 5}]}, 400, "content"),
     ("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "image_url"}]}]}, 400, "image_url"),
+    # a text part's text must be a string: not str(None) or a dict's repr in the prompt, and no part is dropped
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "text", "text": None}]}]}, 400,
+     "content[0]: 'text' must be a string"),
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": ["a", {"type": "text", "text": {"a": 1}}]}]},
+     400, "content[1]: 'text' must be a string"),
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "text"}]}]}, 400, "'text'"),
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": ["a", 5]}]}, 400, "content[1] must be"),
     ("/v1/chat/completions", dict(CHAT, temperature="hot"), 400, "temperature"),
     ("/v1/chat/completions", dict(CHAT, temperature=5), 400, "temperature"),
     ("/v1/chat/completions", dict(CHAT, max_tokens=-1), 400, "max_tokens"),

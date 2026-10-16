@@ -7,7 +7,9 @@
 //   const logits = ctx.decode(model.tokenize("Hello"), "last");
 //
 // Memory views are re-created on every access because WebAssembly memory growth detaches
-// the old ArrayBuffer.
+// the old ArrayBuffer. Addresses are unsigned: a heap past 2 GiB gives i32 results that JS reads
+// as negative numbers, so every pointer from the module goes through `>>> 0` (or `>>> 2` to
+// index 32-bit views).
 
 /* global WebAssembly, TextDecoder, TextEncoder, performance */
 (function (root) {
@@ -21,19 +23,20 @@
     return {
       clock_time_get(id, precision, out) {
         const ns = BigInt(Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) * 1e6));
-        view().setBigUint64(out, ns, true);
+        view().setBigUint64(out >>> 0, ns, true);
         return 0;
       },
       fd_write(fd, iovs, iovsLen, nwritten) {
         const v = view();
         let n = 0, text = "";
+        iovs >>>= 0;
         for (let i = 0; i < iovsLen; i++) {
           const p = v.getUint32(iovs + i * 8, true), l = v.getUint32(iovs + i * 8 + 4, true);
           text += dec.decode(new Uint8Array(getMemory().buffer, p, l));
           n += l;
         }
         if (text.trim()) log(text.replace(/\n$/, ""));
-        v.setUint32(nwritten, n, true);
+        v.setUint32(nwritten >>> 0, n, true);
         return 0;
       },
       fd_close: () => 0,
@@ -87,13 +90,14 @@
     get f32() { return new Float32Array(this.x.memory.buffer); }
 
     malloc(n) {
-      const p = this.x.malloc(n);
+      const p = this.x.malloc(n) >>> 0;
       if (!p) throw new Error(`out of WebAssembly memory allocating ${n} bytes`);
       return p;
     }
     free(p) { if (p) this.x.free(p); }
 
     str(ptr, len) {
+      ptr >>>= 0;
       const u8 = this.u8;
       if (len === undefined) { len = 0; while (u8[ptr + len]) len++; }
       return this.dec.decode(u8.subarray(ptr, ptr + len));
@@ -113,7 +117,7 @@
      *  arrive (no second copy of the whole file): write(bytes, offset) each part, then load(). */
     reserveModel(size) {
       const raw = this.malloc(size + 64);
-      const base = (raw + 63) & ~63;
+      const base = raw + ((64 - (raw % 64)) % 64);
       return {
         base, size,
         write: (bytes, offset) => {
@@ -122,7 +126,7 @@
         },
         load: () => {
           const err = this.malloc(512);
-          const m = this.x.borg_model_load_memory(base, size, err, 512);
+          const m = this.x.borg_model_load_memory(base, size, err, 512) >>> 0;
           const msg = this.str(err);
           this.free(err);
           if (!m) { this.free(raw); throw new Error("cannot load model: " + msg); }
@@ -132,7 +136,7 @@
       };
     }
 
-    pool(nThreads = 1) { return this.x.borg_pool_new(nThreads); }
+    pool(nThreads = 1) { return this.x.borg_pool_new(nThreads) >>> 0; }
   }
 
   class Model {
@@ -164,7 +168,7 @@
         const out = b.malloc(cap * 4);
         const n = b.x.borg_tokenize(this.ptr, tp, bytes.length, addBos ? 1 : 0, special ? 1 : 0, out, cap);
         if (n >= 0) {
-          const toks = Array.from(b.i32.subarray(out >> 2, (out >> 2) + n));
+          const toks = Array.from(b.i32.subarray(out >>> 2, (out >>> 2) + n));
           b.free(out); b.free(tp);
           return toks;
         }
@@ -206,8 +210,8 @@
     context({ nCtx = 2048, nBatch = 0, kvF16 = true } = {}) {
       const b = this.b;
       const p = b.malloc(12);
-      b.i32.set([nCtx, nBatch, kvF16 ? 1 : 0], p >> 2);
-      const c = b.x.borg_ctx_new(this.ptr, this.pool, p);
+      b.i32.set([nCtx, nBatch, kvF16 ? 1 : 0], p >>> 2);
+      const c = b.x.borg_ctx_new(this.ptr, this.pool, p) >>> 0;
       b.free(p);
       if (!c) throw new Error("cannot allocate a context (try a smaller one)");
       return new Context(this, c);
@@ -226,8 +230,8 @@
 
     get nPast() { return this.b.x.borg_ctx_n_past(this.ptr); }
     tokens() {
-      const n = this.nPast, p = this.b.x.borg_ctx_tokens(this.ptr);
-      return Array.from(this.b.i32.subarray(p >> 2, (p >> 2) + n));
+      const n = this.nPast, p = this.b.x.borg_ctx_tokens(this.ptr) >>> 2;
+      return Array.from(this.b.i32.subarray(p, p + n));
     }
     truncate(n) { this.b.x.borg_ctx_truncate(this.ptr, n); }
 
@@ -246,12 +250,12 @@
       const b = this.b, n = tokens.length;
       if (!n) return null;
       const tp = b.malloc(n * 4);
-      b.i32.set(tokens, tp >> 2);
+      b.i32.set(tokens, tp >>> 2);
       const lp = mode ? this._logitsBuf(1) : 0;
       const rc = b.x.borg_decode(this.ptr, tp, n, lp, mode ? 1 : 0);
       b.free(tp);
       if (rc !== 0) throw new Error(rc === -1 ? "the context is full" : "decode failed (" + rc + ")");
-      return mode ? b.f32.slice(lp >> 2, (lp >> 2) + this.m.vocabSize) : null;
+      return mode ? b.f32.slice(lp >>> 2, (lp >>> 2) + this.m.vocabSize) : null;
     }
 
     /** Keep the cached prefix shared with `tokens`, evaluate the rest. Returns tokens reused. */
@@ -275,17 +279,17 @@
       if (pos < 0) return null;
       const L = c.n_layers, D = c.dim, H = c.n_heads, F = c.hidden_dim;
       const f = b.f32;
-      const rp = x.borg_ctx_trace_resid(this.ptr, 0) >> 2;
-      const np = x.borg_ctx_trace_norms(this.ptr) >> 2;
+      const rp = x.borg_ctx_trace_resid(this.ptr, 0) >>> 2;
+      const np = x.borg_ctx_trace_norms(this.ptr) >>> 2;
       const npos = pos + 1;
-      const ap = x.borg_ctx_trace_attn(this.ptr, 0, 0, 0) >> 2;
+      const ap = x.borg_ctx_trace_attn(this.ptr, 0, 0, 0) >>> 2;
       const attn = new Float32Array(L * H * npos);
       for (let l = 0; l < L; l++)
         for (let h = 0; h < H; h++) {
           const src = ap + (l * H + h) * this.nCtx;
           attn.set(f.subarray(src, src + npos), (l * H + h) * npos);
         }
-      const mp = x.borg_ctx_trace_mlp(this.ptr, 0) >> 2;
+      const mp = x.borg_ctx_trace_mlp(this.ptr, 0) >>> 2;
       return {
         pos, nPos: npos,
         resid: f.slice(rp, rp + (L + 1) * D),
@@ -299,12 +303,12 @@
     lens(layers) {
       const b = this.b, n = layers.length;
       const lp = b.malloc(n * 4);
-      b.i32.set(layers, lp >> 2);
+      b.i32.set(layers, lp >>> 2);
       const out = this._logitsBuf(n);
       const rc = b.x.borg_ctx_lens(this.ptr, lp, n, out);
       b.free(lp);
       if (rc !== 0) throw new Error("lens failed (" + rc + ")");
-      return b.f32.slice(out >> 2, (out >> 2) + n * this.m.vocabSize);
+      return b.f32.slice(out >>> 2, (out >>> 2) + n * this.m.vocabSize);
     }
   }
 

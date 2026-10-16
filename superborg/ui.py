@@ -9,28 +9,37 @@ MLP neurons.
 
 Endpoints (standard library only):
   GET  /            the app
-  GET  /api/info    model facts (TraceSession.info()) and whether a generation is running
+  GET  /api/info    model facts (TraceSession.info()), the defaults (lens_stride, lens_layers,
+                    max_tokens_default) and whether a generation is running (busy)
   POST /api/chat    {"messages": [...], "max_tokens", "temperature", "top_p", "top_k", "seed",
-                    "lens_stride", "enable_thinking"} -> Server-Sent Events, one JSON event per
-                    `data:` line: "prompt", then one "token" per generated token, then "done"
-                    (or an in-band "error"); see superborg.interp for the fields
-  POST /api/stop    cancel the running generation (it ends with a "done" event whose
-                    stop_reason is "cancelled")
+                    "lens_stride", "enable_thinking", "request_id"} -> Server-Sent Events, one JSON
+                    event per `data:` line: "prefill" progress for a long prompt, "prompt", then one
+                    "token" per generated token, then "done" (or an in-band "error"); see
+                    superborg.interp for the fields. max_tokens above n_ctx and lens_stride above
+                    n_layers are clamped.
+  POST /api/stop    cancel the running generation (it ends with a "done" event whose stop_reason
+                    is "cancelled"). With {"request_id": id} only the chat sent with that id is
+                    cancelled, and if it has not started yet it is cancelled as soon as it arrives
+                    (within STOP_MEMORY_S): {"stopped": false, "pending": true}
 
 One model and one KV cache serve every request, so one generation runs at a time and a second
-POST /api/chat gets 409 meanwhile. A client that disconnects cancels its generation. The server
-binds to localhost and only answers requests addressed to it by a local name and from its own
-page (Host and Origin checks), so other web sites cannot drive the model through the browser.
+POST /api/chat gets 409 meanwhile. A client that disconnects cancels its generation (at the next
+event written to it). The server only answers requests addressed to it by a local name, an IP
+address or a name given with --allow-host, and from its own page (Host and Origin checks), so
+other web sites cannot drive the model through the browser (DNS rebinding needs a host name).
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
 import select
 import socket
 import sys
 import threading
 import time
 import traceback
+from collections import deque
 from http.server import ThreadingHTTPServer
 from importlib import resources
 
@@ -40,6 +49,11 @@ __all__ = ["UIService", "make_ui_server", "serve_ui"]
 
 DEFAULT_PORT = 8765
 _LOOPBACK = ("127.0.0.1", "localhost", "::1")
+_REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+STOP_MEMORY = 64          # stops remembered for chats that have not started yet ...
+STOP_MEMORY_S = 60.0      # ... and for how long
+STREAM_WRITE_TIMEOUT_S = 30  # a client that stops reading the stream frees the model after this long
+STOP_GRACE_S = 2.0        # after a stop, a write blocked on such a client gives up after this long
 _SECURITY_HEADERS = {
     # the page is one file with inline script and style; it talks only to this server
     "Content-Security-Policy": ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -56,6 +70,15 @@ def _page() -> bytes:
     return resources.files("superborg").joinpath("web", "index.html").read_bytes()
 
 
+def _request_id(body: dict) -> str | None:
+    """The optional "request_id" of a /api/chat or /api/stop body (raises APIError 400)."""
+    rid = body.get("request_id")
+    if rid is not None and not (isinstance(rid, str) and _REQUEST_ID.fullmatch(rid)):
+        raise APIError(400, "'request_id' must be 1-64 characters from A-Z, a-z, 0-9, '_' and '-'",
+                       param="request_id")
+    return rid
+
+
 class UIService:
     """The model, its trace session and the one-generation-at-a-time policy (HTTP-independent)."""
 
@@ -63,12 +86,17 @@ class UIService:
         from .interp import TraceOptions, TraceSession
 
         self.llm = llm
-        self.default_stride = max(1, int(lens_stride))
+        # a stride past the last layer traces the same layers as one equal to it
+        self.default_stride = max(1, min(int(lens_stride), llm.model.config["n_layers"]))
         self.session = TraceSession(llm, TraceOptions(lens_stride=self.default_stride))
-        self.max_tokens_default = max_tokens_default
+        self.max_tokens_default = min(max_tokens_default, llm.n_ctx)
         self.lock = threading.Lock()        # held for the whole generation
-        self.cancel = threading.Event()     # set by /api/stop
+        self.cancel = threading.Event()     # set by /api/stop, cleared when a generation starts
         self.n_requests = 0
+        self._state = threading.Lock()      # orders begin/end/stop; guards the three fields below
+        self._running = None                # (request_id, on_stop) of the generation holding `lock`
+        self._started = deque(maxlen=STOP_MEMORY)  # request ids of recent generations
+        self._early_stops: dict[str, float] = {}   # request id -> when it was stopped before it started
 
     def info(self) -> dict:
         n_layers = self.session.cfg["n_layers"]
@@ -79,26 +107,66 @@ class UIService:
                     busy=self.lock.locked(), max_tokens_default=self.max_tokens_default)
 
     def parse_chat(self, body: dict) -> dict:
-        """Validated stream_chat arguments for a /api/chat body (raises APIError 400)."""
+        """Validated stream_chat arguments for a /api/chat body (raises APIError 400), plus its
+        lens_stride and request_id. max_tokens and lens_stride are clamped from above: the reply
+        is limited by the room left in the context anyway, and the last layer is always traced."""
         n_layers = self.session.cfg["n_layers"]
         seed = _number(body, "seed", 0, int, 0, (1 << 64) - 1)
         return {
             "messages": parse_messages(body),
-            "max_tokens": _number(body, "max_tokens", self.max_tokens_default, int, 1, self.llm.n_ctx),
+            "max_tokens": min(_number(body, "max_tokens", self.max_tokens_default, int, 1), self.llm.n_ctx),
             "temperature": _number(body, "temperature", 0.0, float, 0.0, 2.0),
             "top_p": _number(body, "top_p", 1.0, float, 0.0, 1.0),
             "top_k": _number(body, "top_k", 0, int, 0, 1 << 30),
             "seed": seed,
             "enable_thinking": _flag(body, "enable_thinking"),
-            "lens_stride": _number(body, "lens_stride", self.default_stride, int, 1, max(1, n_layers)),
+            "lens_stride": min(_number(body, "lens_stride", self.default_stride, int, 1), n_layers),
+            "request_id": _request_id(body),
         }
 
-    def stop(self) -> bool:
-        """Ask the running generation to stop; False when nothing is running."""
-        busy = self.lock.locked()
-        if busy:
+    def begin(self, request_id: str | None = None, on_stop=None) -> bool:
+        """Take the model for one generation (False when another one holds it); end() gives it back.
+        on_stop() is called when a stop reaches this generation. If request_id was stopped before
+        it got here, the generation starts cancelled."""
+        with self._state:
+            if not self.lock.acquire(blocking=False):
+                return False
+            self.n_requests += 1
+            self.cancel.clear()  # a stop meant for an earlier generation must not reach this one
+            self._running = (request_id, on_stop)
+            if request_id is not None:
+                self._started.append(request_id)
+                t = self._early_stops.pop(request_id, None)
+                if t is not None and time.monotonic() - t <= STOP_MEMORY_S:
+                    self.cancel.set()
+            return True
+
+    def end(self) -> None:
+        with self._state:
+            self._running = None
+            self.lock.release()
+
+    def stop(self, request_id: str | None = None) -> dict:
+        """Ask the running generation to stop: any one, or only the one with request_id.
+        {"stopped": True} when it was signalled. A stop for a request that has not started yet is
+        remembered for it: {"stopped": False, "pending": True}."""
+        with self._state:
+            now = time.monotonic()
+            for k in [k for k, t in self._early_stops.items() if now - t > STOP_MEMORY_S]:
+                del self._early_stops[k]
+            running = self._running
+            if running is None or (request_id is not None and request_id != running[0]):
+                if request_id is None or request_id in self._started:
+                    return {"stopped": False}
+                self._early_stops.pop(request_id, None)
+                self._early_stops[request_id] = now
+                while len(self._early_stops) > STOP_MEMORY:
+                    del self._early_stops[next(iter(self._early_stops))]
+                return {"stopped": False, "pending": True}
             self.cancel.set()
-        return busy
+        if running[1] is not None:
+            running[1]()
+        return {"stopped": True}
 
 
 class UIHandler(_BaseHandler):
@@ -106,7 +174,8 @@ class UIHandler(_BaseHandler):
     headers: only the app's own page may call the API."""
 
     ui: UIService  # set on the subclass made by make_ui_server
-    loopback_only: bool = True
+    allowed_hosts: frozenset = frozenset()  # host names accepted besides local names and IP addresses
+    _writing: float | None = None           # when the event write in progress began (time.monotonic())
 
     def _cors(self):  # same-origin only
         pass
@@ -118,16 +187,21 @@ class UIHandler(_BaseHandler):
 
     # -- request checks ---------------------------------------------------------
     def _host_ok(self) -> bool:
-        """DNS-rebinding guard: a page from another site that resolves its name to 127.0.0.1
-        reaches this server with its own name in Host."""
-        if not self.loopback_only:
-            return True
+        """DNS-rebinding guard: a page from another site that resolves its name to this machine
+        reaches this server with its own name in Host. An IP address cannot be rebound, so
+        those pass (a phone opens http://<LAN address>:port/), as do local and allowed names."""
         host = (self.headers.get("Host") or "").strip().lower()
         if host.startswith("["):
             name = host[1:host.find("]")] if "]" in host else host
         else:
             name = host.rsplit(":", 1)[0] if ":" in host else host
-        return name in _LOOPBACK
+        if name in _LOOPBACK or name in self.allowed_hosts:
+            return True
+        try:
+            ipaddress.ip_address(name)
+            return True
+        except ValueError:
+            return False
 
     def _origin_ok(self) -> bool:
         origin = self.headers.get("Origin")
@@ -137,8 +211,8 @@ class UIHandler(_BaseHandler):
 
     def _check(self, post: bool) -> None:
         if not self._host_ok():
-            raise APIError(403, "this server only answers requests addressed to localhost",
-                           type_="permission_error")
+            raise APIError(403, "this server only answers requests addressed to localhost, an IP address "
+                                "or a name given with --allow-host", type_="permission_error")
         if post:
             if not self._origin_ok():
                 raise APIError(403, "cross-origin requests are not allowed", type_="permission_error")
@@ -146,15 +220,38 @@ class UIHandler(_BaseHandler):
             if ctype != "application/json":
                 raise APIError(415, "send the request body as application/json")
 
-    def _client_gone(self) -> bool:
-        """True once the client has closed its end (it never sends anything after its request)."""
+    def _hangup_check(self):
+        """A callable that is True once the connection has failed (POLLERR/POLLHUP): the client reset
+        it, or closed it and refused an event written since. End of input alone does not count: a
+        client may half-close after its request and still read the stream (nc -N does). None
+        without select.poll (Windows) and on macOS, where a failed write is the only sign."""
+        if not hasattr(select, "poll") or sys.platform == "darwin":
+            # macOS emulates poll with kqueue and may report a half-close (FIN) as POLLHUP
+            return None
+        p = select.poll()  # unlike select.select, no limit on the descriptor number
+        p.register(self.connection, select.POLLERR | select.POLLHUP)
+        return lambda: bool(p.poll(0))
+
+    def _on_stop(self) -> None:
+        """A stop must free the model even if this client has stopped reading: writes from now on
+        give up after STOP_GRACE_S, and a write already blocked then is cut off by a shutdown."""
+        t = time.monotonic()
         try:
-            r, _, _ = select.select([self.connection], [], [], 0)
-            if not r:
-                return False
-            return self.connection.recv(1, socket.MSG_PEEK) == b""
-        except (OSError, ValueError):
-            return True
+            self.connection.settimeout(STOP_GRACE_S)
+        except OSError:
+            return
+
+        def cut():
+            w = self._writing
+            if w is not None and w <= t:
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        timer = threading.Timer(STOP_GRACE_S, cut)
+        timer.daemon = True
+        timer.start()
 
     # -- methods ---------------------------------------------------------------------
     def do_OPTIONS(self):  # noqa: N802 - no CORS: a preflight is refused
@@ -194,11 +291,15 @@ class UIHandler(_BaseHandler):
             if path not in ("/api/chat", "/api/stop"):
                 raise APIError(404, f"no route for POST {path}")
             self._check(post=True)
-            body = self._read_json() if path == "/api/chat" or self.headers.get("Content-Length", "0") != "0" else {}
+            has_body = self.headers.get("Content-Length", "0") != "0" or "Transfer-Encoding" in self.headers
+            body = self._read_json() if path == "/api/chat" or has_body else {}  # chunked: 411, never {}
             if path == "/api/stop":
-                return self._send_json(200, {"stopped": self.ui.stop()})
+                return self._send_json(200, self.ui.stop(_request_id(body)))
             kw = self.ui.parse_chat(body)
-            if not self.ui.lock.acquire(blocking=False):
+            rid = kw.pop("request_id")
+            # set before begin(): a stop may lower it from then on
+            self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)
+            if not self.ui.begin(rid, on_stop=self._on_stop):
                 raise APIError(409, "a generation is already running; stop it first (POST /api/stop)",
                                type_="busy")
         except APIError as e:
@@ -209,14 +310,12 @@ class UIHandler(_BaseHandler):
         try:
             self._chat(kw)
         finally:
-            self.ui.lock.release()
+            self.ui.end()
 
     def _chat(self, kw: dict) -> None:
         """Stream one generation as SSE (the lock is held). Errors before the first event are
         JSON responses; later ones are in-band {"type": "error"} events."""
         ui = self.ui
-        ui.cancel.clear()
-        ui.n_requests += 1
         ui.session.opt.lens_stride = kw.pop("lens_stride")
         self.close_connection = True  # the stream has no length; closing the connection ends it
         try:  # rendering is cheap; doing it here first turns a template refusal into a plain 400
@@ -224,12 +323,10 @@ class UIHandler(_BaseHandler):
         except Exception as e:  # noqa: BLE001 - templates reject some message orders (raise_exception)
             return self._send_error(APIError(400, f"the model's chat template rejected the messages: {e}",
                                              param="messages"))
-        gone = [False]
+        hung_up = self._hangup_check()
 
         def should_stop() -> bool:
-            if self._client_gone():
-                gone[0] = True
-            return gone[0] or ui.cancel.is_set()
+            return ui.cancel.is_set() or (hung_up is not None and hung_up())
 
         events = ui.session.stream_chat(**kw, should_stop=should_stop)
         try:
@@ -266,9 +363,13 @@ class UIHandler(_BaseHandler):
             events.close()  # stops the generator if it is still suspended (client gone)
 
     def _event(self, ev: dict) -> None:
-        self.wfile.write(b"data: " + json.dumps(ev, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                         + b"\n\n")
-        self.wfile.flush()
+        data = b"data: " + json.dumps(ev, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+        self._writing = time.monotonic()
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        finally:
+            self._writing = None
 
 
 class UIServer(ThreadingHTTPServer):
@@ -282,24 +383,26 @@ class UIServer6(UIServer):
 
 
 def make_ui_server(llm, host: str = "127.0.0.1", port: int = DEFAULT_PORT, lens_stride: int = 1,
-                   quiet: bool = True) -> UIServer:
-    """Create (but do not start) the UI server around a loaded superborg.LLM. port=0 picks a free port."""
+                   quiet: bool = True, allow_hosts=()) -> UIServer:
+    """Create (but do not start) the UI server around a loaded superborg.LLM. port=0 picks a free port.
+    allow_hosts: host names to answer besides local names and IP addresses (the bound one is added)."""
     ui = UIService(llm, lens_stride=lens_stride)
-    handler = type("BoundUIHandler", (UIHandler,), {"ui": ui, "quiet": quiet,
-                                                     "loopback_only": host in _LOOPBACK})
+    allowed = frozenset(h.strip().lower().strip("[]") for h in (*allow_hosts, host) if h.strip())
+    handler = type("BoundUIHandler", (UIHandler,), {"ui": ui, "quiet": quiet, "allowed_hosts": allowed})
     srv = (UIServer6 if ":" in host else UIServer)((host, port), handler)
     srv.ui = ui
     return srv
 
 
 def serve_ui(model_path: str, host: str = "127.0.0.1", port: int = DEFAULT_PORT, threads: int = 0,
-             n_ctx: int = 4096, lens_stride: int = 1, open_browser: bool = False, quiet: bool = True) -> None:
+             n_ctx: int = 4096, lens_stride: int = 1, open_browser: bool = False, quiet: bool = True,
+             allow_hosts=()) -> None:
     """Load a model and serve the UI until interrupted."""
     from . import LLM
 
     llm = LLM(model_path, threads=threads, n_ctx=n_ctx)
     try:
-        srv = make_ui_server(llm, host, port, lens_stride=lens_stride, quiet=quiet)
+        srv = make_ui_server(llm, host, port, lens_stride=lens_stride, quiet=quiet, allow_hosts=allow_hosts)
     except BaseException:
         llm.close()
         raise
@@ -309,8 +412,8 @@ def serve_ui(model_path: str, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     print(f"superborg: {llm.name} (n_ctx {llm.n_ctx}, lens stride {srv.ui.default_stride}) at {url}",
           file=sys.stderr, flush=True)
     if host not in _LOOPBACK:
-        print("superborg: WARNING: serving on a non-local address; anyone who can reach this port can use the model",
-              file=sys.stderr, flush=True)
+        print("superborg: WARNING: serving on a non-local address; anyone who can reach this port can use the model "
+              "(open it by IP address, or name the host with --allow-host)", file=sys.stderr, flush=True)
     if open_browser:
         import webbrowser
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()

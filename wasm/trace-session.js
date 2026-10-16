@@ -1,21 +1,31 @@
 // JavaScript port of superborg/interp.py: chat generation with per-token activation traces.
-// Emits the same events as TraceSession.stream_chat ("prompt", "token", "done"), so one UI
-// renders either the local Python server or the in-browser WebAssembly engine.
+// Emits the same events as TraceSession.stream_chat ("prefill", "prompt", "token", "done"), so one
+// UI renders either the local Python server or the in-browser WebAssembly engine.
 
 /* global self, globalThis, performance */
 (function (root) {
   "use strict";
 
-  function renderChat(info, messages, addGenerationPrompt = true) {
+  // The system prompt a chat template inserts when the conversation has none (SmolLM2: "You are a
+  // helpful AI assistant named SmolLM...", Qwen2.5: "You are Qwen, created by Alibaba Cloud...").
+  // superborg/chat.py renders the Jinja template itself; here the literal is read from the template.
+  function defaultSystem(tpl) {
+    const m = /<\|im_start\|>system(?:\n|\\n)([^<'"\\]+)<\|im_end\|>/.exec(tpl || "");
+    return m ? m[1] : null;
+  }
+
+  // The prompt superborg/chat.py's ChatFormatter.render gives (its built-in renderers, plus the
+  // template's default system prompt)
+  function renderChat(info, messages, addGenerationPrompt = true, enableThinking = false) {
     const fmt = info.chat_format || "plain";
-    const tpl = info.chat_template || "";
     const msgs = messages.slice();
-    if (tpl.includes("You are a helpful AI assistant named SmolLM") && (!msgs.length || msgs[0].role !== "system"))
-      msgs.unshift({ role: "system", content: "You are a helpful AI assistant named SmolLM, trained by Hugging Face" });
+    const sys = defaultSystem(info.chat_template);
+    if (sys && (!msgs.length || msgs[0].role !== "system")) msgs.unshift({ role: "system", content: sys });
     let out = "";
     if (fmt === "chatml" || fmt === "qwen3") {
       for (const m of msgs) out += `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`;
-      if (addGenerationPrompt) out += "<|im_start|>assistant\n" + (fmt === "qwen3" ? "<think>\n\n</think>\n\n" : "");
+      if (addGenerationPrompt)
+        out += "<|im_start|>assistant\n" + (fmt === "qwen3" && !enableThinking ? "<think>\n\n</think>\n\n" : "");
     } else if (fmt === "llama3") {
       out += "<|begin_of_text|>";
       for (const m of msgs) out += `<|start_header_id|>${m.role}<|end_header_id|>\n\n${m.content.trim()}<|eot_id|>`;
@@ -23,6 +33,13 @@
     } else if (fmt === "zephyr") {
       for (const m of msgs) out += `<|${m.role}|>\n${m.content}</s>\n`;
       if (addGenerationPrompt) out += "<|assistant|>\n";
+    } else if (fmt === "mistral") {
+      let pending = "";  // a system message goes in front of the next user turn
+      for (const m of msgs) {
+        if (m.role === "system") pending = m.content + "\n\n";
+        else if (m.role === "user") { out += `[INST] ${pending}${m.content} [/INST]`; pending = ""; }
+        else out += `${m.content}</s>`;
+      }
     } else {
       for (const m of msgs) out += `${m.role}: ${m.content}\n`;
       if (addGenerationPrompt) out += "assistant:";
@@ -31,7 +48,8 @@
   }
 
   function stopStrings(info) {
-    return { chatml: ["<|im_end|>"], qwen3: ["<|im_end|>"], llama3: ["<|eot_id|>"], zephyr: ["</s>"] }[info.chat_format] || [];
+    return { chatml: ["<|im_end|>"], qwen3: ["<|im_end|>"], llama3: ["<|eot_id|>"], zephyr: ["</s>"],
+             mistral: ["</s>"] }[info.chat_format] || [];
   }
 
   function mulberry32(seed) {
@@ -57,8 +75,15 @@
     return p;
   }
 
+  // indices of the k largest values, largest first (ties: lower index first)
   function topK(values, k) {
-    // indices of the k largest values (k is small: a simple insertion buffer)
+    const n = values.length;
+    if (k > 4096) {  // a sort of all indices: the insertion buffer below is O(n k) at worst
+      const ord = new Uint32Array(n);
+      for (let i = 0; i < n; i++) ord[i] = i;
+      ord.sort((a, b) => values[b] - values[a] || a - b);
+      return Array.from(ord.subarray(0, Math.min(k, n)));
+    }
     const idx = [], val = [];
     for (let i = 0; i < values.length; i++) {
       const v = values[i];
@@ -85,8 +110,8 @@
       ctx.enableTrace(true);
     }
 
-    lensLayers() {
-      const n = this.cfg.n_layers, s = Math.max(1, this.opt.lensStride | 0), out = [];
+    lensLayers(stride = this.opt.lensStride) {
+      const n = this.cfg.n_layers, s = Math.max(1, stride | 0), out = [];
       for (let l = 0; l <= n; l += s) out.push(l);
       if (out[out.length - 1] !== n) out.push(n);
       return out;
@@ -98,7 +123,7 @@
         model: m.name, arch: m.header.arch, quant: m.header.quant, n_layers: c.n_layers, n_heads: c.n_heads,
         n_kv_heads: c.n_kv_heads, dim: c.dim, hidden_dim: c.hidden_dim, vocab: m.vocabSize, n_ctx: this.ctx.nCtx,
         chat_format: m.tokenizerInfo.chat_format, threads: 1, lens_layers: this.lensLayers(),
-        backend: "wasm (" + m.b.simd + ")",
+        lens_stride: Math.min(Math.max(1, this.opt.lensStride | 0), c.n_layers), backend: "wasm (" + m.b.simd + ")",
       };
     }
 
@@ -113,17 +138,42 @@
       const scaled = new Float32Array(n);
       for (let i = 0; i < n; i++) scaled[i] = logits[i] / temperature;
       const p = softmaxRow(scaled, 0, n, n);
-      let cand = topK(p, topKN > 0 ? Math.min(topKN, n) : 256);
-      if (topP < 1) {
-        let cum = 0, cut = cand.length;
-        for (let i = 0; i < cand.length; i++) { cum += p[cand[i]]; if (cum >= topP) { cut = i + 1; break; } }
-        cand = cand.slice(0, cut);
+      const cand = this.candidates(p, topP, topKN);
+      if (!cand) {  // the whole distribution: a draw needs no sort
+        let r = rand(), last = 0;
+        for (let i = 0; i < n; i++) if (p[i] > 0) { last = i; r -= p[i]; if (r < 0) return { tok: i, probs }; }
+        return { tok: last, probs };
       }
       let tot = 0;
       for (const i of cand) tot += p[i];
       let r = rand() * tot;
       for (const i of cand) { r -= p[i]; if (r <= 0) return { tok: i, probs }; }
       return { tok: cand[cand.length - 1], probs };
+    }
+
+    /** The tokens interp.py's _sample draws from, most probable first: at most top_k of them, cut
+     *  where the cumulative probability reaches top_p (null: every token, no truncation). */
+    candidates(p, topP, topKN) {
+      const n = p.length, k = topKN > 0 ? Math.min(topKN, n) : n;
+      if (k === n && topP >= 1) return null;
+      let cand = null;
+      if (topP < 1) {
+        // tokens below t hold at most (1 - top_p) / 2 of the mass together, so the cut falls before
+        // them: sort only the rest
+        const t = (1 - topP) / (2 * n);
+        let mass = 0;
+        cand = [];
+        for (let i = 0; i < n; i++) if (p[i] >= t) { cand.push(i); mass += p[i]; }
+        if (mass >= topP) cand.sort((a, b) => p[b] - p[a] || a - b);
+        else cand = null;  // (rounding)
+      }
+      cand = cand ? cand.slice(0, k) : topK(p, k);
+      if (topP < 1) {
+        let cum = 0, cut = cand.length;
+        for (let i = 0; i < cand.length; i++) { cum += p[cand[i]]; if (cum >= topP) { cut = i + 1; break; } }
+        cand = cand.slice(0, cut);
+      }
+      return cand;
     }
 
     tokenReport(chosen, probs) {
@@ -142,7 +192,7 @@
         let s = 0;
         for (let i = 0; i < n; i++) s += Math.exp(z[i] - mx);
         const lse = mx + Math.log(s);
-        return { layer: li, top: topK(z, o.lensTop).map((t) => [m.tokenText(t), r4(Math.exp(z[t] - lse))]),
+        return { layer: li, top: topK(z, o.lensTop).map((t) => [m.tokenText(t), r4(Math.exp(z[t] - lse)), t]),
                  p: r5(Math.exp(zc - lse)), rank };
       });
       const attnN = [], mlpN = [], resid = [];
@@ -179,29 +229,55 @@
       for (let i = 0; i < probs.length; i++) if (probs[i] > 0) entropy -= probs[i] * Math.log(probs[i]);
       return {
         pos: tr.pos, prob: r5(probs[chosen]), entropy: r4(entropy),
-        alternatives: topK(probs, o.finalTop).map((t) => [m.tokenText(t), r4(probs[t])]),
+        alternatives: topK(probs, o.finalTop).map((t) => [m.tokenText(t), r4(probs[t]), t]),
         lens, norms: { attn: attnN, mlp: mlpN, resid }, attn_top: attnTop, attn_entropy: attnEnt, mlp_top: mlpTop,
       };
     }
 
-    /** Generator of events; `shouldStop()` is polled between tokens. */
-    * streamChat(messages, { maxTokens = 256, temperature = 0, topP = 1, topK: topKN = 0, seed = 0, shouldStop } = {}) {
+    /** Generator of events; `shouldStop()` is polled before each chunk of `prefillChunk` prompt tokens
+     *  (a "prefill" event follows every chunk but the last) and between tokens. */
+    * streamChat(messages, { maxTokens = 256, temperature = 0, topP = 1, topK: topKN = 0, seed = 0, enableThinking = false,
+                             shouldStop, prefillChunk = 64 } = {}) {
       const m = this.model, ctx = this.ctx, info = m.tokenizerInfo;
-      const text = renderChat(info, messages);
+      const text = renderChat(info, messages, true, enableThinking);
       const prompt = m.tokenize(text, false, true);
+      if (!prompt.length) throw new Error("empty prompt");
       const room = ctx.nCtx - prompt.length - 1;
-      if (room <= 0) throw new Error(`the conversation (${prompt.length} tokens) does not fit the ${ctx.nCtx}-token context`);
+      if (room <= 0)
+        throw Object.assign(new Error(`the conversation (${prompt.length} tokens) does not fit the ${ctx.nCtx}-token context`),
+                            { code: "context_length_exceeded" });
       maxTokens = Math.max(1, Math.min(maxTokens | 0, room));
       const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
-      let t0 = now();
-      const reused = ctx.sync(prompt.slice(0, -1));
-      let logits = ctx.decode([prompt[prompt.length - 1]], "last");
-      yield { type: "prompt", tokens: prompt.map((t) => m.tokenText(t)), n_prompt: prompt.length, n_reused: reused,
-              prompt_ms: Math.round(now() - t0) };
+      const t0 = now();
+      // keep the cached prefix, short of the last prompt token (its logits are needed), and evaluate
+      // the rest in chunks, as superborg/interp.py does
+      const n = prompt.length, cached = ctx.tokens();
+      let reused = 0;
+      while (reused < cached.length && reused < n - 1 && cached[reused] === prompt[reused]) reused++;
+      ctx.truncate(reused);
+      const total = n - reused;
+      const promptEvent = () => ({ type: "prompt", tokens: prompt.map((t) => m.tokenText(t)), n_prompt: n,
+                                   n_reused: reused, prompt_ms: Math.round(now() - t0) });
+      let logits, tDecode;  // decode_ms: the forward pass that produced the token's logits
+      for (let s = reused; s < n; s += prefillChunk) {
+        if (s > reused) yield { type: "prefill", done: s - reused, total };
+        if (shouldStop && shouldStop()) {
+          yield promptEvent();
+          yield { type: "done", text: "", n_gen: 0, stop_reason: "cancelled", seconds: 0, tok_per_s: 0 };
+          return;
+        }
+        const e = Math.min(s + prefillChunk, n);
+        if (e < n) { ctx.decode(prompt.slice(s, e), null); continue; }
+        if (e - 1 > s) ctx.decode(prompt.slice(s, e - 1), null);
+        const tLast = now();  // the last token alone: its pass gives the first reply token's decode_ms
+        logits = ctx.decode([prompt[n - 1]], "last");
+        tDecode = now() - tLast;
+      }
+      yield promptEvent();
       const rand = mulberry32(seed);
       const dec = new TextDecoder("utf-8");
       const stops = stopStrings(info);
-      let out = "", nGen = 0, stop = "length", tDecode = 0;
+      let out = "", nGen = 0, stop = "length";
       const tGen = now();
       for (let i = 0; i < maxTokens; i++) {
         const { tok, probs } = this.sample(logits, rand, temperature, topP, topKN);
@@ -210,7 +286,8 @@
         const traceMs = Math.round(now() - t1);
         if (m.isEog(tok)) {
           stop = "eos";
-          yield Object.assign({ type: "token", i, id: tok, text: "", raw: m.tokenText(tok), eos: true, trace_ms: traceMs }, report);
+          yield Object.assign({ type: "token", i, id: tok, text: "", raw: m.tokenText(tok), eos: true,
+                                decode_ms: Math.round(tDecode), trace_ms: traceMs }, report);
           break;
         }
         const piece = dec.decode(m.tokenBytes(tok), { stream: true });
@@ -234,5 +311,5 @@
 
   root.TraceSession = TraceSession;
   root.renderChat = renderChat;
-  if (typeof module !== "undefined" && module.exports) module.exports = { TraceSession, renderChat };
+  if (typeof module !== "undefined" && module.exports) module.exports = { TraceSession, renderChat, stopStrings, topK };
 })(typeof self !== "undefined" ? self : globalThis);
