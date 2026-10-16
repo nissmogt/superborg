@@ -77,6 +77,10 @@ void borg_ctx_free(borg_ctx *c) {
     free(c->row_ctx);
     free(c->row_pos);
     free(c->stats);
+    free(c->tr_resid);
+    free(c->tr_attn);
+    free(c->tr_mlp);
+    free(c->tr_norms);
     free(c);
 }
 
@@ -167,6 +171,56 @@ static void record_stats(borg_ctx *c, int layer, int site, const float *x, int T
             const double v = x[(size_t)t * ldx + i];
             s[i] += v * v;
         }
+}
+
+/* ---- activation trace ----------------------------------------------------- */
+int borg_ctx_enable_trace(borg_ctx *c, int enable) {
+    if (!enable) {
+        c->trace_on = 0;
+        return 0;
+    }
+    const borg_config *cfg = &c->model->cfg;
+    if (!c->tr_resid) {
+        c->tr_resid = (float *)calloc((size_t)(cfg->n_layers + 1) * cfg->dim, sizeof(float));
+        c->tr_attn = (float *)calloc((size_t)cfg->n_layers * cfg->n_heads * c->n_ctx, sizeof(float));
+        c->tr_mlp = (float *)calloc((size_t)cfg->n_layers * cfg->hidden_dim, sizeof(float));
+        c->tr_norms = (float *)calloc((size_t)cfg->n_layers * 3, sizeof(float));
+        if (!c->tr_resid || !c->tr_attn || !c->tr_mlp || !c->tr_norms) {
+            free(c->tr_resid);
+            free(c->tr_attn);
+            free(c->tr_mlp);
+            free(c->tr_norms);
+            c->tr_resid = c->tr_attn = c->tr_mlp = c->tr_norms = NULL;
+            return -1;
+        }
+        c->trace_pos = -1;
+    }
+    c->trace_on = 1;
+    return 0;
+}
+
+int borg_ctx_trace_pos(const borg_ctx *c) { return c->tr_resid ? c->trace_pos : -1; }
+
+const float *borg_ctx_trace_resid(const borg_ctx *c, int layer) {
+    if (!c->tr_resid || c->trace_pos < 0 || layer < 0 || layer > c->model->cfg.n_layers) return NULL;
+    return c->tr_resid + (size_t)layer * c->model->cfg.dim;
+}
+
+const float *borg_ctx_trace_attn(const borg_ctx *c, int layer, int head, int *n_pos) {
+    const borg_config *cfg = &c->model->cfg;
+    if (!c->tr_attn || c->trace_pos < 0 || layer < 0 || layer >= cfg->n_layers || head < 0 || head >= cfg->n_heads)
+        return NULL;
+    if (n_pos) *n_pos = c->trace_pos + 1;
+    return c->tr_attn + ((size_t)layer * cfg->n_heads + head) * c->n_ctx;
+}
+
+const float *borg_ctx_trace_mlp(const borg_ctx *c, int layer) {
+    if (!c->tr_mlp || c->trace_pos < 0 || layer < 0 || layer >= c->model->cfg.n_layers) return NULL;
+    return c->tr_mlp + (size_t)layer * c->model->cfg.hidden_dim;
+}
+
+const float *borg_ctx_trace_norms(const borg_ctx *c) {
+    return c->tr_norms && c->trace_pos >= 0 ? c->tr_norms : NULL;
 }
 
 int borg_ctx_n_ctx(const borg_ctx *c) { return c->n_ctx; }
@@ -364,6 +418,8 @@ static void attention_range(void *arg, int b, int e, int ith) {
             for (int j = 0; j <= pos; j++) att[j] = vec_dot_f32(K + (size_t)j * HD, q, HD) * scale;
         }
         softmax(att, pos + 1);
+        if (c->trace_on && kc == c && tok == t->T - 1) /* rows are distinct per item: no race */
+            memcpy(c->tr_attn + ((size_t)t->layer * cfg->n_heads + h) * c->n_ctx, att, (size_t)(pos + 1) * sizeof(float));
         memset(out, 0, (size_t)HD * sizeof(float));
         if (kc->kv_f16) {
             const uint16_t *V = (const uint16_t *)kc->v_cache + base;
@@ -418,6 +474,13 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, float *logits
     const int NQ = cfg->n_heads * HD, NKV = cfg->n_kv_heads * HD, F = cfg->hidden_dim;
 
     for (int t = 0; t < T; t++) mat_get_row(&m->tok_embd, toks[t], c->x + (size_t)t * D);
+    /* trace the last row when it belongs to this context (not other sequences of a multi batch) */
+    const int tr = c->trace_on && c->row_ctx[T - 1] == c;
+    const size_t last = (size_t)(T - 1) * D;
+    if (tr) {
+        c->trace_pos = c->row_pos[T - 1];
+        memcpy(c->tr_resid, c->x + last, (size_t)D * sizeof(float));
+    }
 
     for (int l = 0; l < cfg->n_layers; l++) {
         const borg_layer *L = &m->layers[l];
@@ -436,6 +499,7 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, float *logits
         record_stats(c, l, SITE_ATTN_OUT, c->xb, T, NQ);
         matmul1(c, &L->wo, c->xb2, D, T, c->xb, NQ);
         for (size_t i = 0; i < (size_t)T * D; i++) c->x[i] += c->xb2[i];
+        if (tr) c->tr_norms[l * 3] = sqrtf(vec_dot_f32(c->xb2 + last, c->xb2 + last, D));
 
         /* feed-forward */
         run_norm(c, c->xb, c->x, L->ffn_norm, T, D);
@@ -453,8 +517,14 @@ static void forward_chunk(borg_ctx *c, const int32_t *toks, int T, float *logits
             pool_for(c->pool, T * F, chunk, act_range, c);
         }
         record_stats(c, l, SITE_FFN_MID, c->hb, T, F);
+        if (tr) memcpy(c->tr_mlp + (size_t)l * F, c->hb + (size_t)(T - 1) * F, (size_t)F * sizeof(float));
         matmul1(c, &L->w_down, c->xb2, D, T, c->hb, F);
         for (size_t i = 0; i < (size_t)T * D; i++) c->x[i] += c->xb2[i];
+        if (tr) {
+            c->tr_norms[l * 3 + 1] = sqrtf(vec_dot_f32(c->xb2 + last, c->xb2 + last, D));
+            c->tr_norms[l * 3 + 2] = sqrtf(vec_dot_f32(c->x + last, c->x + last, D));
+            memcpy(c->tr_resid + (size_t)(l + 1) * D, c->x + last, (size_t)D * sizeof(float));
+        }
     }
 
     /* final norm and output projection */
@@ -608,5 +678,25 @@ int borg_ctx_load(borg_ctx *c, const char *path) {
     fclose(f);
     if (!ok) return -3;
     c->n_past = n;
+    return 0;
+}
+
+int borg_ctx_lens(borg_ctx *c, const int *layers, int n, float *logits) {
+    const borg_model *m = c->model;
+    const borg_config *cfg = &m->cfg;
+    if (!c->tr_resid || c->trace_pos < 0) return -1;
+    if (n <= 0) return 0;
+    if (!logits) return -2;
+    for (int i = 0; i < n; i++)
+        if (layers[i] < 0 || layers[i] > cfg->n_layers) return -3;
+    const int D = cfg->dim, V = cfg->vocab_size;
+    /* all requested layers go through the output matrix together: its weights are read once */
+    for (int done = 0; done < n;) {
+        const int T = n - done < c->n_batch ? n - done : c->n_batch;
+        for (int t = 0; t < T; t++)
+            rmsnorm(c->xb + (size_t)t * D, c->tr_resid + (size_t)layers[done + t] * D, m->output_norm, D, cfg->norm_eps);
+        matmul1(c, &m->output, logits + (size_t)done * V, V, T, c->xb, D);
+        done += T;
+    }
     return 0;
 }

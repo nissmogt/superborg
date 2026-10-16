@@ -106,6 +106,26 @@ BORG_API int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src);
 BORG_API int borg_ctx_save(const borg_ctx *ctx, const char *path);
 BORG_API int borg_ctx_load(borg_ctx *ctx, const char *path);
 
+/* Activation tracing for interpretability. When enabled, every borg_decode (and every target
+ * pass of borg_generate) records the internals of the LAST token it processed: the residual
+ * stream after each layer, each head's attention weights, the MLP hidden activations and
+ * the sizes of each layer's contributions. Speculative batches trace their last row only. */
+BORG_API int borg_ctx_enable_trace(borg_ctx *ctx, int enable);
+/* Position of the traced token, or -1 if nothing has been traced yet. */
+BORG_API int borg_ctx_trace_pos(const borg_ctx *ctx);
+/* Residual stream: layer 0 = token embedding, layer l = output of layer l (1..n_layers). dim floats. */
+BORG_API const float *borg_ctx_trace_resid(const borg_ctx *ctx, int layer);
+/* Softmax attention weights of a query head over positions 0..pos (pos + 1 floats via *n_pos). */
+BORG_API const float *borg_ctx_trace_attn(const borg_ctx *ctx, int layer, int head, int *n_pos);
+/* MLP hidden activations act(gate) * up of a layer (hidden_dim floats). */
+BORG_API const float *borg_ctx_trace_mlp(const borg_ctx *ctx, int layer);
+/* n_layers x 3 floats: norm of the attention output, of the MLP output, of the residual after. */
+BORG_API const float *borg_ctx_trace_norms(const borg_ctx *ctx);
+/* Logit lens: apply the final norm and output projection to the traced residual of each
+ * listed layer (0..n_layers) and write n * vocab_size logits. Layer n_layers gives the model's
+ * own logits. Uses the context's scratch memory and pool; call between decodes. */
+BORG_API int borg_ctx_lens(borg_ctx *ctx, const int *layers, int n, float *logits);
+
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);
 

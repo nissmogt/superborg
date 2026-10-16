@@ -136,6 +136,12 @@ struct borg_ctx {
     borg_ctx **row_ctx;  /* [n_batch] cache owner of each row in the current chunk */
     int *row_pos;        /* [n_batch] position of each row */
     double *stats;       /* optional [n_layers][SITE_COUNT][max_cols] sums of x^2 per input column */
+    /* activation trace of the last token of the latest forward chunk (borg_ctx_enable_trace) */
+    int trace_on, trace_pos;
+    float *tr_resid;     /* [n_layers + 1][dim]: embeddings, then the residual after each layer */
+    float *tr_attn;      /* [n_layers][n_heads][n_ctx]: attention weights over positions */
+    float *tr_mlp;       /* [n_layers][hidden_dim]: act(gate) * up */
+    float *tr_norms;     /* [n_layers][3]: |attention output|, |MLP output|, |residual after| */
     int64_t stats_tokens;
     int max_cols;        /* columns of xq rows */
 };
