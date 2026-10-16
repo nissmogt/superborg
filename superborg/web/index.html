@@ -96,7 +96,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 .chat { min-height: 0; min-width: 0; display: flex; flex-direction: column; background: var(--surface); border-right: 1px solid var(--border); }
 .chat-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 12px 8px 16px; border-bottom: 1px solid var(--border); }
 .chat-head h1 { font-size: 14px; font-weight: 600; margin: 0; flex: 1; }
-.messages { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; overscroll-behavior: contain; }
+.messages { flex: 1; min-height: 0; contain: strict; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; overscroll-behavior: contain; }
 .composer { flex: none; display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px 12px; border-top: 1px solid var(--border); }
 .composer textarea { flex: 1; min-width: 0; resize: none; height: 40px; max-height: 200px; padding: 9px 12px; border-radius: 9px;
   border: 1px solid var(--border-2); background: var(--page); line-height: 20px; }
@@ -200,7 +200,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 
 .attn-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; }
 @container viz (max-width: 560px) { .attn-wrap { grid-template-columns: minmax(0, 1fr); } }
-.chips { position: relative; max-height: 196px; overflow-y: auto; padding: 6px; border: 1px solid var(--grid); border-radius: 6px;
+.chips { position: relative; height: 196px; contain: strict; overflow-y: auto; padding: 6px; border: 1px solid var(--grid); border-radius: 6px;
   background: var(--page); font-family: var(--mono); font-size: 11.5px; line-height: 21px; overscroll-behavior: contain; }
 .chip { display: inline-block; max-width: 100%; padding: 0 3px; margin: 0 1px; border-radius: 3px; line-height: 18px; white-space: pre-wrap;
   word-break: break-all; vertical-align: top; }
@@ -956,7 +956,7 @@ function renderReadout(r) {
     setTok(o.ltTok, top1[0]);
     setText(o.ltP, fmtP(top1[1], 1e-4));
     o.lt.classList.toggle("match", r.R[l] === 0);
-    o.fill.style.width = (clamp(r.P[l], 0, 1) * 100).toFixed(1) + "%";
+    setWidth(o.fill, clamp(r.P[l], 0, 1) * 100);
     setText(o.v, fmtP(r.P[l]));
     setText(o.rk, "#" + fmtInt(r.R[l] + 1));
     o.rk.classList.toggle("first", r.R[l] === 0);
@@ -965,29 +965,44 @@ function renderReadout(r) {
   }
 }
 
+/* A fixed pool of rows inside `box`, created by make() on demand; returns the first n, hiding the rest. */
+function pool(box, n, make) {
+  const rows = box._rows || (box._rows = []);
+  while (rows.length < n) { const r = make(); rows.push(r); box.append(r.row); }
+  rows.forEach((r, i) => { const show = i < n; if (r.row.hidden === show) r.row.hidden = !show; });
+  return rows.slice(0, n);
+}
+function setWidth(node, pct) { const v = pct.toFixed(1) + "%"; if (node._w !== v) { node._w = v; node.style.width = v; } }
+
 /* ---------------------------------------------------------------- output distribution */
 function renderOutput(r) {
   const box = $("outRows"), st = $("outStats");
   $("outEmpty").hidden = !!r;
-  if (!r) { box.replaceChildren(); st.replaceChildren(); return; }
-  const rows = [];
+  if (!r) { pool(box, 0, null); st.replaceChildren(); return; }
+  const items = [];
   let found = false;
-  const maxP = Math.max(r.prob, ...r.alts.map((a) => a[1]), 1e-9);
-  const mk = (s, p, chosen) => {
-    const row = el("div", "orow" + (chosen ? " chosen" : ""));
-    const tc = el("span", "tc"); const t = el("span", "tok"); t.append(visFrag(s)); tc.append(t); if (chosen) tc.append(el("span", "tag", "chosen"));
-    const bar = el("span", "bar"); const f = el("i"); f.style.width = (p / Math.max(maxP, 0.05) * 100).toFixed(1) + "%"; bar.append(f);
-    row.append(tc, bar, el("span", "v", fmtP(p, 1e-4)));
-    return row;
-  };
-  for (const [s, p] of r.alts) { const c = !found && s === r.raw; if (c) found = true; rows.push(mk(s, p, c)); }
-  if (!found) rows.push(mk(r.raw, r.prob, true));
-  box.replaceChildren(...rows);
+  for (const [s, p] of r.alts) { const c = !found && s === r.raw; if (c) found = true; items.push([s, p, c]); }
+  if (!found) items.push([r.raw, r.prob, true]);
+  const maxP = Math.max(...items.map((a) => a[1]), 0.05);
+  const rows = pool(box, items.length, () => {
+    const row = el("div", "orow"), tc = el("span", "tc"), tok = el("span", "tok"), tag = el("span", "tag", "chosen");
+    const bar = el("span", "bar"), fill = el("i"), v = el("span", "v");
+    tc.append(tok, tag); bar.append(fill); row.append(tc, bar, v);
+    return { row, tok, tag, fill, v };
+  });
+  items.forEach(([s, p, c], i) => {
+    const o = rows[i];
+    o.row.classList.toggle("chosen", c);
+    o.tag.hidden = !c;
+    setTok(o.tok, s);
+    setWidth(o.fill, p / maxP * 100);
+    setText(o.v, fmtP(p, 1e-4));
+  });
   const stat = (k, v) => { const s = el("span"); s.append(k + " ", el("b", "", v)); return s; };
-  const items = [stat("p(chosen)", fmtP(r.prob)), stat("entropy", (r.entropy ?? 0).toFixed(3) + " nats")];
-  if (r.decode_ms != null) items.push(stat("decode", r.decode_ms + " ms"));
-  if (r.trace_ms != null) items.push(stat("trace", r.trace_ms + " ms"));
-  st.replaceChildren(...items);
+  const stats = [stat("p(chosen)", fmtP(r.prob)), stat("entropy", (r.entropy ?? 0).toFixed(3) + " nats")];
+  if (r.decode_ms != null) stats.push(stat("decode", r.decode_ms + " ms"));
+  if (r.trace_ms != null) stats.push(stat("trace", r.trace_ms + " ms"));
+  st.replaceChildren(...stats);
 }
 
 /* ---------------------------------------------------------------- contributions chart */
@@ -1119,7 +1134,7 @@ function renderAttention(r) {
   const box = $("chips");
   if (!r || !r.turn.prompt) {
     box.replaceChildren(); S.chipsTurn = null; S.chipEls = []; S.chipShaded = []; S.qEl = S.outEl = null;
-    $("attnTop").replaceChildren(el("div", "empty", "No token yet."));
+    const top = $("attnTop"); top._head = null; top._rows = null; top.replaceChildren(el("div", "empty", "No token yet."));
     return;
   }
   const turn = r.turn;
@@ -1154,18 +1169,23 @@ function renderAttention(r) {
   // top positions
   const list = [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
   const mx = Math.max(...list.map((x) => x[1]), 1e-9);
-  const rows = list.map(([p, w]) => {
-    const row = el("div", "arow");
-    row.dataset.p = p;
-    const t = el("span", "tok"); t.append(visFrag(chipText(turn, p)));
-    const bar = el("span", "bar"); const f = el("i"); f.style.width = (w / mx * 100).toFixed(1) + "%"; bar.append(f);
-    row.append(el("span", "ps", "@" + (p + 1)), t, bar, el("span", "v", fmtP(w, 1e-4)));
-    row.title = `position ${p + 1}${p === r.pos ? " (the query token itself)" : ""}: click to find it in the context`;
-    return row;
+  const top = $("attnTop");
+  if (!top._head) { top.replaceChildren(); top._rows = null; top._head = el("div", "expl"); top._head.style.margin = "0 0 4px"; top.append(top._head); }
+  setText(top._head, S.layer > 0 ? `Most attended positions at layer ${S.layer}` : "Most attended positions, mean over layers");
+  const rows = pool(top, list.length, () => {
+    const row = el("div", "arow"), ps = el("span", "ps"), tok = el("span", "tok"), bar = el("span", "bar"), fill = el("i"), v = el("span", "v");
+    bar.append(fill); row.append(ps, tok, bar, v);
+    return { row, ps, tok, fill, v };
   });
-  const head = el("div", "expl", S.layer > 0 ? `Most attended positions at layer ${S.layer}` : "Most attended positions, mean over layers");
-  head.style.margin = "0 0 4px";
-  $("attnTop").replaceChildren(head, ...rows);
+  list.forEach(([p, w], i) => {
+    const o = rows[i];
+    o.row.dataset.p = p;
+    setText(o.ps, "@" + (p + 1));
+    setTok(o.tok, chipText(turn, p));
+    setWidth(o.fill, w / mx * 100);
+    setText(o.v, fmtP(w, 1e-4));
+    o.row.title = `position ${p + 1}${p === r.pos ? " (the query token itself)" : ""}: click to find it in the context`;
+  });
 }
 
 function entGeom() {
@@ -1218,7 +1238,7 @@ function renderMlp(r) {
   const box = $("mlpRows");
   $("mlpEmpty").hidden = !!r;
   setText($("mlpLayer"), S.layer > 0 ? `layer ${S.layer}` : "all layers");
-  if (!r || !r.mK) { box.replaceChildren(); return; }
+  if (!r || !r.mK) { pool(box, 0, null); return; }
   let items = [];
   if (S.layer > 0) {
     const l = S.layer - 1;
@@ -1229,17 +1249,25 @@ function renderMlp(r) {
     items = items.slice(0, 8);
   }
   const mx = Math.max(...items.map((x) => Math.abs(x[2])), 1e-9);
-  box.replaceChildren(...items.map(([l, n, v]) => {
-    const row = el("div", "mrow");
-    const id = el("span", "id");
-    if (S.layer > 0) id.append("#", el("b", "", String(n)));
-    else id.append(`L${l} #`, el("b", "", String(n)));
-    const bar = el("span", "dbar"); const f = el("i", v >= 0 ? "pos" : "neg"); f.style.width = `calc(${(Math.abs(v) / mx * 50).toFixed(2)}% - 1px)`; bar.append(f);
-    row.append(id, bar, el("span", "v", (v >= 0 ? "+" : "−") + fmtN(Math.abs(v))));
-    row.title = `layer ${l}, neuron ${n}: activation ${v}`;
-    if (S.layer === 0) { row.style.cursor = "pointer"; row.dataset.l = l; }
-    return row;
-  }));
+  const rows = pool(box, items.length, () => {
+    const row = el("div", "mrow"), id = el("span", "id"), pre = document.createTextNode(""), nb = el("b");
+    const bar = el("span", "dbar"), fill = el("i"), v = el("span", "v");
+    id.append(pre, nb); bar.append(fill); row.append(id, bar, v);
+    return { row, pre, nb, fill, v };
+  });
+  items.forEach(([l, n, v], i) => {
+    const o = rows[i];
+    const pre = S.layer > 0 ? "#" : `L${l} #`;
+    if (o.pre.data !== pre) o.pre.data = pre;
+    setText(o.nb, String(n));
+    const cls = v >= 0 ? "pos" : "neg";
+    if (o.fill.className !== cls) o.fill.className = cls;
+    const w = `calc(${(Math.abs(v) / mx * 50).toFixed(1)}% - 1px)`;
+    if (o.fill._w !== w) { o.fill._w = w; o.fill.style.width = w; }
+    setText(o.v, (v >= 0 ? "+" : "\u2212") + fmtN(Math.abs(v)));
+    o.row.title = `layer ${l}, neuron ${n}: activation ${v}`;
+    if (S.layer === 0) { o.row.dataset.l = l; o.row.style.cursor = "pointer"; } else { delete o.row.dataset.l; o.row.style.cursor = ""; }
+  });
 }
 
 /* ---------------------------------------------------------------- transcript */
