@@ -130,6 +130,21 @@ BORG_API const float *borg_ctx_trace_norms(const borg_ctx *ctx);
  * listed layer (0..n_layers) and write n * vocab_size logits. Layer n_layers gives the model's
  * own logits. Uses the context's scratch memory and pool; call between decodes. */
 BORG_API int borg_ctx_lens(borg_ctx *ctx, const int *layers, int n, float *logits);
+/* The logit lens summarized inside the engine, so that the n * vocab_size logits are never
+ * written out: per listed layer, the k most likely tokens (logit descending, then id ascending),
+ * the logit of `chosen` and its rank (the number of strictly greater logits), and the row's
+ * log-sum-exp, the normalizer that turns a logit into a probability (p = exp(logit - lse)).
+ * Only the first n_vocab logits take part (the tokenizer's vocabulary; 0 = all). Every logit is
+ * computed by the kernel of borg_ctx_lens, so the values are identical; the exponentials, their
+ * sums and the result are double precision. The output matrix is read once for all layers, in
+ * row blocks spread over the pool, and the per-block partials are merged in a fixed order, so
+ * the result does not depend on the thread count. Returns 0 on success, -1 with nothing traced,
+ * -3 for a layer out of range, -4 for k outside 1..n_vocab, -5 for chosen outside 0..n_vocab-1,
+ * -6 for n_vocab above vocab_size and -7 when out of memory. */
+BORG_API int borg_ctx_lens_summary(borg_ctx *ctx, const int *layers, int n, int n_vocab, int k, int32_t chosen,
+                                   int32_t *top_ids /* [n][k], most likely first */, float *top_logits /* [n][k] */,
+                                   float *chosen_logit /* [n] */, int32_t *chosen_rank /* [n] */,
+                                   double *lse /* [n] */);
 
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);

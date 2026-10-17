@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,14 +59,14 @@ def asm_bin(tmp_path_factory):
     return out / "borg-asm.js"
 
 
-def node_case(case: str, req: dict, tmp_path: Path):
-    """Run one case of tests/js/wasm_cases.js."""
+def node_case(case: str, req: dict, tmp_path: Path, env: dict | None = None):
+    """Run one case of tests/js/wasm_cases.js (env: extra environment variables for node)."""
     if not shutil.which("node"):
         pytest.skip("node not installed")
     f = tmp_path / f"{case}.json"
     f.write_text(json.dumps(req))
     r = subprocess.run(["node", str(ROOT / "tests" / "js" / "wasm_cases.js"), case, str(f)],
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, text=True, timeout=600, env=dict(os.environ, **(env or {})))
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)
 
@@ -169,6 +170,28 @@ def test_javascript_build_matches_native(asm_bin, tmp_path):
     ref = native_logits(Q8)
     assert np.abs(logits - ref).max() <= 5e-2 * np.abs(ref).max()
     assert int(logits.argmax()) == int(ref.argmax())
+
+
+def test_fused_lens_matches_javascript_summary(wasm_bin, tmp_path):
+    """Context.lensSummary (borg_ctx_lens_summary in WebAssembly) against the full logits
+    summarized in JavaScript, the trace session's old path: the same tokens and ranks,
+    probabilities within 1e-6 and the same log-sum-exp; the reports agree to their rounding."""
+    out = node_case("lens", {"wasm": str(wasm_bin), "model": need(Q8), "chat": "What is the capital of France?",
+                             "max_tokens": 6, "k": 4}, tmp_path)
+    assert out["simd"] == "wasm-simd128" and len(out["tokens"]) == 6
+    for tok in out["tokens"]:
+        f, o = tok["fused"], tok["old"]
+        assert f["top"] == o["top"] and f["rank"] == o["rank"]
+        assert len(f["top"]) == 4 * len(tok["layers"]) and len(tok["layers"]) == 31
+        np.testing.assert_allclose(f["p"], o["p"], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(f["p_top"], o["p_top"], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(f["lse"], o["lse"], rtol=0, atol=1e-5)
+        assert f["rank"][-1] == 0  # greedy: the chosen token tops the last layer
+        for a, b in zip(tok["report"], tok["plain_report"]):
+            assert a["layer"] == b["layer"] and a["rank"] == b["rank"]
+            assert [x[2] for x in a["top"]] == [x[2] for x in b["top"]] and len(a["top"]) == 4
+            assert abs(a["p"] - b["p"]) <= 1.1e-5
+            assert all(abs(x[1] - y[1]) <= 1.1e-4 for x, y in zip(a["top"], b["top"]))
 
 
 def make_artifact():
@@ -310,8 +333,9 @@ def test_render_chat_matches_python_formatter(tmp_path):
         path = os.path.join(MODELS, name + ".borg")
         if os.path.exists(path):
             m = Model(path, threads=1)
-            infos.append(m.tokenizer_info)
             f = formatter_for(m)
+            # the header plus the special tokens' text, as trace-session.js's chatInfo(model) adds it
+            infos.append(dict(m.tokenizer_info, bos_token=f.bos_token, eos_token=f.eos_token, eos_tokens=f.eos_tokens))
             want.append(([f.render(c) for c in CHATS], f.stop_strings()))
             m.close()
     for fmt in ("chatml", "llama3", "zephyr", "mistral", "plain"):
@@ -322,6 +346,187 @@ def test_render_chat_matches_python_formatter(tmp_path):
     for info, (prompts, stops), g in zip(infos, want, got):
         assert g["prompts"] == prompts, info["chat_format"]
         assert g["stops"] == stops, info["chat_format"]
+
+
+# ---- chat templates: wasm/vendor/hfjinja.js (@huggingface/jinja) against superborg/chat.py (jinja2)
+
+HF_MODELS = os.environ.get(
+    "HF_MODELS_DIR", "/tmp/claude-0/-home-user-superborg/990fbcaa-dc72-53ae-9121-cd54b34a4307/scratchpad/models")
+# more checkpoints' tokenizer_config.json / chat_template.jinja, laid out as model directories
+TEMPLATES = os.environ.get(
+    "BORG_TEMPLATES_DIR", "/tmp/claude-0/-home-user-superborg/990fbcaa-dc72-53ae-9121-cd54b34a4307/scratchpad/work-templates")
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Weather by city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+CONVERSATIONS = {
+    "user": [{"role": "user", "content": "What is the capital of France?"}],
+    "system_multi": [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Hi"},
+                     {"role": "assistant", "content": "Hello!"}, {"role": "user", "content": "Name a colour."}],
+    "tools": [{"role": "user", "content": "Weather in Paris?"},
+              {"role": "assistant", "content": "",
+               "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]},
+              {"role": "tool", "name": "get_weather", "content": "{\"temp\": 18}"},
+              {"role": "assistant", "content": "It is 18 C."}, {"role": "user", "content": "And in Rome?"}],
+    # spaces next to the newlines around the think block: Python's strip('\n') keeps them
+    "think": [{"role": "user", "content": "Is 7 prime?"},
+              {"role": "assistant", "content": "<think>\n  Check divisors.  \n</think>\n\n  Yes, 7 is prime.  "},
+              {"role": "user", "content": "And 9?"}],
+    "reasoning_field": [{"role": "user", "content": "Is 7 prime?"},
+                        {"role": "assistant", "content": "Yes.", "reasoning_content": "7 has no divisors."},
+                        {"role": "user", "content": "And 9?"}],
+    "unicode": [{"role": "user", "content": "Café — 日本語 😀 \"quotes\" 'single' \\ backslash <tag> {{ braces }} %s \t tab"}],
+    "empty": [{"role": "system", "content": ""}, {"role": "user", "content": ""}],
+}
+SETTINGS = [
+    {"add_generation_prompt": True},
+    {"add_generation_prompt": False},
+    {"add_generation_prompt": True, "enable_thinking": False},
+    {"add_generation_prompt": True, "enable_thinking": True},
+    {"add_generation_prompt": False, "enable_thinking": False},
+    {"add_generation_prompt": False, "enable_thinking": True},
+    {"add_generation_prompt": True, "extra": {"date_string": "16 Oct 2026"}},
+    {"add_generation_prompt": True, "tools": True},
+]
+# divergences of the vendored release that are not patched: (template name part, case predicate, why)
+KNOWN_DIVERGENCES = [
+    ("smollm3", lambda case, got: "string" in got.get("error", "") and case.endswith("#7"),
+     "SmolLM3 pipes each tool dict through `| string`: Python gives the dict's repr, @huggingface/jinja 0.5.10 "
+     "has no string filter for objects (unreported upstream as of 2026-10-16)"),
+]
+
+
+def _special_token(value) -> str:
+    return (value.get("content") if isinstance(value, dict) else value) or ""
+
+
+def chat_templates() -> dict[str, dict]:
+    """{name: {"chat_template", "bos_token", "eos_token"}} of every checkpoint directory in
+    HF_MODELS_DIR and BORG_TEMPLATES_DIR that has a template (superborg.convert's reading)."""
+    from superborg.convert import load_chat_template
+    out = {}
+    for base in (HF_MODELS, TEMPLATES):
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            d = os.path.join(base, name)
+            tc_path = os.path.join(d, "tokenizer_config.json")
+            if not os.path.isfile(tc_path):
+                continue
+            with open(tc_path, encoding="utf-8") as f:
+                tc = json.load(f)
+            tpl = load_chat_template(d, tc)
+            if tpl:
+                out[name] = {"chat_template": tpl, "bos_token": _special_token(tc.get("bos_token")),
+                             "eos_token": _special_token(tc.get("eos_token"))}
+    return out
+
+
+def python_renders(info: dict) -> dict:
+    """ChatFormatter.render for every conversation x setting: {"case": {"text"} | {"error"}}."""
+    from superborg.chat import ChatFormatter
+    tokens = [info["bos_token"], info["eos_token"]]
+    f = ChatFormatter({"chat_template": info["chat_template"], "bos_id": 0 if tokens[0] else -1,
+                       "eos_id": 1 if tokens[1] else -1}, token_text=lambda i: tokens[i])
+    out = {}
+    for cn, conv in CONVERSATIONS.items():
+        for i, s in enumerate(SETTINGS):
+            kw = dict(s.get("extra", {}))
+            if "enable_thinking" in s:
+                kw["enable_thinking"] = s["enable_thinking"]
+            if s.get("tools"):
+                kw["tools"] = TOOLS
+            try:
+                out[f"{cn}#{i}"] = {"text": f.render(conv, add_generation_prompt=s["add_generation_prompt"], **kw)}
+            except Exception as e:  # noqa: BLE001 - raise_exception, or a feature the template needs
+                out[f"{cn}#{i}"] = {"error": f"{type(e).__name__}: {e}"}
+    return out
+
+
+@pytest.fixture(scope="module")
+def template_renders(tmp_path_factory):
+    """The node side of the matrix, once per locale: the vendored library under the default
+    (en-US) locale and under German, where its unpatched strftime_now would localize months."""
+    pytest.importorskip("jinja2")
+    templates = chat_templates()
+    if not templates:
+        pytest.skip(f"no chat templates under {HF_MODELS} or {TEMPLATES}")
+    req = {"templates": templates, "conversations": CONVERSATIONS, "settings": SETTINGS, "tools": TOOLS}
+    out = {}
+    for lang in ("C", "de_DE.UTF-8"):
+        out[lang] = node_case("template", req, tmp_path_factory.mktemp("tpl"), env={"LANG": lang, "LC_ALL": lang})
+    return templates, out
+
+
+@pytest.mark.parametrize("lang", ["C", "de_DE.UTF-8"])
+@pytest.mark.parametrize("name", sorted(chat_templates()) or ["(none)"])
+def test_chat_template_parity(template_renders, name, lang):
+    """Every template x conversation x setting renders to the same bytes in the browser engine's
+    renderChat and in superborg/chat.py, or fails on both sides; the vendored library's known
+    divergences (KNOWN_DIVERGENCES) are expected failures. date_string is passed explicitly in
+    one setting (Llama 3.x honour it); SmolLM3 (%d %B %Y) and gpt-oss (%Y-%m-%d) call
+    strftime_now themselves, which the vendored copy renders in the C locale like Python."""
+    templates, renders = template_renders
+    info, got = templates[name], renders[lang][name]
+    want = python_renders(info)
+    assert set(got) == set(want)
+    bad, known = [], []
+    for case, w in want.items():
+        g = got[case]
+        if "error" in w:
+            if "error" not in g:
+                bad.append((case, "python error, js text", w["error"]))
+            continue
+        if g.get("text") == w["text"]:
+            continue
+        reason = next((why for part, pred, why in KNOWN_DIVERGENCES if part in name.lower() and pred(case, g)), None)
+        (known if reason else bad).append((case, reason or g, w["text"][:200] if reason is None else ""))
+    assert not bad, bad[:3]
+    assert sum("error" not in w for w in want.values()) >= len(CONVERSATIONS)  # the template did render
+    if known:
+        pytest.xfail(f"{len(known)} known divergence(s): " + known[0][1])
+
+
+STRFTIME_FORMATS = ["%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%a %A %b %B %c", "%d %e %f %H %I %j %k %l %m %M %p %P %S",
+                    "%U %w %W %x %X %y %Y %z %Z %%", "%C %D %F %T %R %u %G %V %g %h %s", "%n|%t|%-d|%-m|%-H|%Q|100%"]
+# local midnights and odd hours around year ends and ISO week boundaries, with milliseconds
+STRFTIME_TIMES = ["2026-10-16T23:05:09.123", "2026-01-01T00:00:00.000", "2026-01-04T07:05:09.000", "2026-01-05T12:00:00.500",
+                  "2027-01-01T13:00:00.000", "2028-12-31T23:59:59.999", "2024-12-30T01:00:00.000", "2021-01-03T00:30:00.000",
+                  "2026-03-29T02:30:00.000", "2026-12-31T11:59:59.000"]
+
+
+@pytest.mark.parametrize("lang", ["C", "de_DE.UTF-8"])
+def test_vendored_strftime_matches_python(tmp_path, lang):
+    """strftime_now in wasm/vendor/hfjinja.js (the strftime-c-locale patch) gives Python's
+    datetime.strftime for every directive, in any locale."""
+    import datetime
+    times = [datetime.datetime.fromisoformat(t) for t in STRFTIME_TIMES]
+    got = node_case("strftime", {"times": [int(t.timestamp() * 1000) for t in times], "formats": STRFTIME_FORMATS},
+                    tmp_path, env={"LANG": lang, "LC_ALL": lang})
+    want = [[t.strftime(f) for f in STRFTIME_FORMATS] for t in times]
+    assert got == want
+
+
+def test_vendored_jinja_is_the_pinned_release():
+    """wasm/vendor/hfjinja.js carries the version, hash, patches and license of wasm/vendor_jinja.py,
+    and so do the third-party notices."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("vendor_jinja", ROOT / "wasm" / "vendor_jinja.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    js = (ROOT / "wasm" / "vendor" / "hfjinja.js").read_text()
+    md = (ROOT / "wasm" / "vendor" / "THIRD_PARTY_NOTICES.md").read_text()
+    head = js[:js.index("*/")]
+    assert head.startswith(f"/*! {mod.NAME} {mod.VERSION} ") and mod.DIST_SHA256 in head and "MIT License" in head
+    assert js.rstrip().endswith('})(typeof self !== "undefined" ? self : globalThis);')
+    assert "root.HFJinja = { " + ", ".join(mod.EXPORTS) + " };" in js
+    for name, why, edits in mod.PATCHES:
+        assert name in head and f"**{name}**" in md and why in md
+        for _old, new in edits:
+            assert new in js
+    for s in (mod.VERSION, mod.DIST_SHA256, mod.LICENSE_SHA256, mod.DIST_URL, "Copyright (c) 2023 Hugging Face"):
+        assert s in md
+    assert not re.search(r"</script|<!--|<script", js, flags=re.I)  # make_artifact.py inlines the bundle
 
 
 # ---- wasm/worker.js: the browser engine's side of the page's protocol (as superborg/ui.py) -
@@ -366,7 +571,7 @@ def test_worker_info_and_part_cache(site, tmp_path):
 def test_worker_missing_manifest(tmp_path):
     (tmp_path / "site").mkdir()
     out = run_worker(tmp_path / "site", [["init", None]], tmp_path)
-    assert out == [{"fatal": "cannot download model.json: HTTP 404"}]
+    assert out == [{"fatal": "cannot download http://site.test/model.json: HTTP 404"}]
 
 
 def test_worker_chat_events(site, tmp_path):
@@ -437,6 +642,29 @@ def test_worker_messages_are_checked_like_the_server(site, tmp_path):
         {"type": "error", "message": "messages[0].content[0]: 'text' must be a string"},
         {"type": "error", "message": "messages[0]: content part type 'image_url' is not supported"},
         {"type": "error", "message": "'enable_thinking' must be true or false"},
+    ]
+
+
+def test_worker_chat_template_kwargs(site, tmp_path):
+    """The chat body's chat_template_kwargs reach the template (SmolLM2's ignores date_string
+    and enable_thinking, so the prompt stays the same length); bad values are errors, as the
+    server's 400s."""
+    _, plain, extra, *bad = run_worker(site, [
+        ["init", None],
+        ["chat", {"messages": HI, "max_tokens": 1}],
+        ["chat", {"messages": HI, "max_tokens": 1,
+                  "chat_template_kwargs": {"date_string": "16 Oct 2026", "enable_thinking": True}}],
+        ["chat", {"messages": HI, "chat_template_kwargs": [1]}],
+        ["chat", {"messages": HI, "chat_template_kwargs": {"enable_thinking": "yes"}}],
+        ["chat", {"messages": HI, "chat_template_kwargs": {"messages": []}}],
+        ["chat", {"messages": HI, "chat_template_kwargs": {"add_generation_prompt": False}}],
+    ], tmp_path)
+    assert plain[0]["n_prompt"] == extra[0]["n_prompt"] and extra[-1]["type"] == "done"
+    assert [e for b in bad for e in b] == [
+        {"type": "error", "message": "'chat_template_kwargs' must be an object"},
+        {"type": "error", "message": "'chat_template_kwargs.enable_thinking' must be true or false"},
+        {"type": "error", "message": "'chat_template_kwargs' cannot set 'messages'"},
+        {"type": "error", "message": "'chat_template_kwargs' cannot set 'add_generation_prompt'"},
     ]
 
 

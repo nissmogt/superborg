@@ -55,7 +55,7 @@
     if (m.status) return setStatus(m.status);
     if (m.ready) { setStatus({ text: "", progress: null, ready: true }); return readyResolve(m.ready); }
     if (m.fatal) {
-      setStatus({ text: m.fatal, progress: null, error: true });
+      setStatus({ text: m.fatal, progress: null, error: true, diag: m.diag || diag() });
       readyReject(new Error(m.fatal));
       for (const p of pending.values()) p.reject(new Error(m.fatal));
       pending.clear();
@@ -75,24 +75,64 @@
   // load them). Relative names resolve against the document's base URL, as the page's own
   // fetches do (a host may set <base>).
   const base = (typeof document !== "undefined" && document.baseURI) || location.href;
+  const params = new URLSearchParams(location.search);
+  const FORCE = params.get("borg") || (window.BORG_WASM && window.BORG_WASM.engine) || "";  // "main": no Worker
+
+  // What this browser offers, for the failure report (the page shows it when the engine cannot start).
+  function capabilities() {
+    const c = { ua: navigator.userAgent, origin: location.origin, base, worker: typeof Worker !== "undefined",
+                wasm: typeof WebAssembly !== "undefined", simd: false, mem4g: false, indexedDB: typeof indexedDB !== "undefined",
+                deviceMemory: navigator.deviceMemory || null, isolated: !!window.crossOriginIsolated };
+    try {  // a module with one v128 instruction
+      c.simd = c.wasm && WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11]));
+    } catch (e) { c.simd = "error: " + e.message; }
+    try { if (c.wasm) { new WebAssembly.Memory({ initial: 1, maximum: 65536 }); c.mem4g = true; } }
+    catch (e) { c.mem4g = "no: " + e.message; }
+    return c;
+  }
+  const caps = capabilities();
+  const diag = () => Object.entries(caps).map(([k, v]) => `${k}: ${v}`).join("\n");
+  const fail = (text) => onMessage({ data: { fatal: text, diag: diag() } });
   const blobWorker = (src) => new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
   let alive = false, how = "";
 
+  let silence = null;   // a worker that never reports in is replaced by the main-thread engine
   function attach(w) {
     worker = w;
-    w.onmessage = (e) => { alive = true; onMessage(e); };
+    w.onmessage = (e) => { alive = true; if (silence) { clearTimeout(silence); silence = null; } onMessage(e); };
     w.onerror = (e) => {
       if (!alive && how === "file") {    // its script did not load: try the same file as a blob
         w.terminate();
-        startFetched().catch((err) => onMessage({ data: { fatal: String(err.message || err) } }));
+        startFetched().catch((err) => fail(String(err.message || err)));
         return;
       }
+      if (!alive && how !== "main-thread") { w.terminate(); startMainThread(e && e.message); return; }
       const what = e && e.message ? e.message : "its script did not load";
-      onMessage({ data: { fatal: `the engine's worker (${how}) failed: ${what}` } });
+      fail(`the engine's worker (${how}) failed: ${what}`);
     };
+    if (how !== "main-thread")
+      silence = setTimeout(() => { if (!alive) { w.terminate(); startMainThread("no reply from the worker in 8 s"); } }, 8000);
     // a blob: worker sends no Referer, which some hosts require even for the page's own files:
     // let it fall back to fetching through the page
     w.postMessage({ op: "init", base, fetchVia: how === "file" ? "worker+page" : "page" });
+  }
+
+  // Last resort: run the engine's script on the page itself. It yields between tokens, so the
+  // page stays usable, but each token's work blocks it for its duration.
+  function startMainThread(reason) {
+    const inline = typeof document !== "undefined" && document.getElementById("borg-worker-src");
+    if (!inline || !inline.textContent.trim()) { fail(`the engine's worker failed (${reason || "unknown"}) and the page has no embedded engine`); return; }
+    if (window.borgEngine) return;
+    how = "main-thread";
+    console.warn("[borg] running the engine on the main thread:", reason);
+    const sc = document.createElement("script");
+    sc.textContent = inline.textContent;
+    document.head.appendChild(sc);
+    if (!window.borgEngine) { fail("the embedded engine did not start on the page (" + (reason || "") + ")"); return; }
+    const w = { postMessage: (m) => window.borgEngine.send(m), terminate() {}, onmessage: null, onerror: null };
+    window.borgEngine.onmessage = (e) => w.onmessage && w.onmessage(e);
+    attach(w);
+    setStatus({ text: "Starting the engine on the page (no worker: " + (reason || "") + ")", progress: null });
   }
 
   async function startFetched() {
@@ -105,9 +145,10 @@
 
   async function start() {
     const inline = typeof document !== "undefined" && document.getElementById("borg-worker-src");
+    if (FORCE === "main" || typeof Worker === "undefined") { startMainThread(FORCE === "main" ? "requested" : "no Worker in this browser"); return; }
     if (inline && inline.textContent.trim()) {
       how = "inline";
-      attach(blobWorker(inline.textContent));
+      try { attach(blobWorker(inline.textContent)); } catch (e) { startMainThread("cannot start a worker: " + e.message); }
       return;
     }
     try {
@@ -117,7 +158,7 @@
       await startFetched();
     }
   }
-  start().catch((e) => onMessage({ data: { fatal: String(e.message || e) } }));
+  start().catch((e) => fail(String(e.message || e)));
 
   function post(op, extra, onEvent) {
     return new Promise((resolve, reject) => {
@@ -138,5 +179,6 @@
       .catch(() => ({ stopped: false })) : { stopped: false }),
     reset: async () => { if (worker) worker.postMessage({ op: "reset" }); },
     onStatus: (cb) => { statusCbs.push(cb); cb(lastStatus); },
+    capabilities: () => Object.assign({ engine: how }, caps),
   };
 })();

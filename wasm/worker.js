@@ -6,7 +6,9 @@
 //                                       (try here first)
 //   {op: "info", id}                    -> {id, info}
 //   {op: "chat", id, body}              -> {id, event} for every TraceSession event, then {id, end: true};
-//                                       body as POST /api/chat (superborg/ui.py), with "request_id"?
+//                                       body as POST /api/chat (superborg/ui.py), with "request_id"? and
+//                                       "chat_template_kwargs"? (extra chat template variables, as
+//                                       superborg/server.py takes them)
 //   {op: "stop", id?, request_id?}      cancel the running generation (it ends with stop_reason
 //                                       "cancelled"), or only the one with that request_id; a request_id
 //                                       whose chat has not started yet is remembered, and that chat
@@ -33,7 +35,13 @@ let running = null;               // {requestId, stopped} of the generation in p
 const started = [];               // request ids of the last 64 generations
 const earlyStops = new Map();     // request_id -> time, for stops that came before their chat
 
-const post = (m) => self.postMessage(m);
+// Inside a Worker, messages go through postMessage. Loaded on the page's main thread instead
+// (a web view that refuses Workers), the page drives handleMessage directly and receives
+// replies through self.borgEngine.onmessage; the engine then runs between the page's frames.
+const IN_WORKER = typeof WorkerGlobalScope !== "undefined" ? self instanceof WorkerGlobalScope
+                                                          : typeof document === "undefined";
+const post = IN_WORKER ? (m) => self.postMessage(m)
+                       : (m) => { const h = self.borgEngine && self.borgEngine.onmessage; if (h) h({ data: m }); };
 const status = (text, progress = null) => post({ status: { text, progress } });
 
 // Let queued messages (stop) run between tokens: a MessageChannel round trip is not clamped like setTimeout.
@@ -275,6 +283,14 @@ function parseChat(body) {
     throw new Error("'request_id' must be 1-64 characters from A-Z, a-z, 0-9, '_' and '-'");
   if (body.enable_thinking != null && typeof body.enable_thinking !== "boolean")
     throw new Error("'enable_thinking' must be true or false");
+  // chat_template_kwargs reach the template as variables; enable_thinking in it counts unless the
+  // field above is given, and off is the default, as in superborg/server.py
+  const tmpl = body.chat_template_kwargs ?? {};
+  if (typeof tmpl !== "object" || Array.isArray(tmpl)) throw new Error("'chat_template_kwargs' must be an object");
+  if (tmpl.enable_thinking != null && typeof tmpl.enable_thinking !== "boolean")
+    throw new Error("'chat_template_kwargs.enable_thinking' must be true or false");
+  for (const k of ["messages", "add_generation_prompt"])
+    if (k in tmpl) throw new Error(`'chat_template_kwargs' cannot set '${k}'`);
   return {
     requestId: rid ?? null,
     messages,
@@ -285,7 +301,8 @@ function parseChat(body) {
     topP: num("top_p", 1, 0, 1, false),
     topK: num("top_k", 0, 0, 2 ** 30),
     seed: num("seed", 0, 0, 2 ** 64 - 1),
-    enableThinking: body.enable_thinking === true,
+    enableThinking: typeof body.enable_thinking === "boolean" ? body.enable_thinking : tmpl.enable_thinking === true,
+    chatTemplateKwargs: Object.keys(tmpl).length ? Object.assign({}, tmpl) : null,
   };
 }
 
@@ -344,8 +361,7 @@ async function chat(id, body) {
 }
 
 let ready = null;
-self.onmessage = async (e) => {
-  const m = e.data || {};
+async function handleMessage(m) {
   if (m.fetchResult) return onPageFetch(Object.assign({ done: true }, m.fetchResult));
   if (m.fetchProgress) return onPageFetch(m.fetchProgress);
   try {
@@ -368,4 +384,6 @@ self.onmessage = async (e) => {
   } catch (err) {
     post({ fatal: String(err && err.message ? err.message : err) });
   }
-};
+}
+if (IN_WORKER) self.onmessage = (e) => handleMessage(e.data || {});
+else self.borgEngine = { send: (m) => handleMessage(m || {}), onmessage: null };
