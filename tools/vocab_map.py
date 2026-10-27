@@ -31,8 +31,11 @@ It also prints the 5 nearest map neighbours of a few probe tokens (and, for comp
 nearest neighbours in the PCA space by cosine) so a human can judge whether neighbourhoods
 are semantic.
 
-Needs numpy, scikit-learn and umap-learn. Peak RSS is about 1.5 GB for a 152k x 896 vocabulary
-(the float32 matrix is freed once the PCA projection exists).
+Needs numpy, scikit-learn and umap-learn. Memory: the float32 matrix is freed once the PCA
+projection exists; each UMAP run of a 152k x 896 vocabulary then peaks at about 2 GB (its
+NN-descent phase), so the process tree peaks at about 4.2 GB with --n-jobs 2 and 1.7 GB with
+--n-jobs 1 (a 49k x 576 vocabulary: 0.9 GB per run). Four seeds of the 152k vocabulary take
+about 19 minutes with --n-jobs 2 on a shared 4-core machine.
 """
 from __future__ import annotations
 
