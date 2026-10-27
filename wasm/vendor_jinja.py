@@ -153,6 +153,48 @@ function strftime(date, format2) {
 }
 '''
 
+_CONCAT_OLD = '''\
+    if (left instanceof StringValue || right instanceof StringValue) {
+      switch (node.operator.value) {
+        case "+":
+          return new StringValue(left.value.toString() + right.value.toString());
+      }
+    }
+'''
+
+_CONCAT_NEW = '''\
+    if (left instanceof StringValue || right instanceof StringValue) {
+      switch (node.operator.value) {
+        case "+":
+          // local patch (str-concat): only str + str, as in Python; a dict or list is not turned into text
+          if (!(left instanceof StringValue && right instanceof StringValue)) {
+            throw new TypeError(`unsupported operand types for +: ${left.type} and ${right.type}`);
+          }
+          return new StringValue(left.value + right.value);
+      }
+    }
+'''
+
+_NONE_OLD = '''\
+      const lastEvaluated = this.evaluate(statement, environment);
+      if (lastEvaluated.type !== "NullValue" && lastEvaluated.type !== "UndefinedValue") {
+        result += lastEvaluated.toString();
+      }
+'''
+
+_NONE_NEW = '''\
+      const lastEvaluated = this.evaluate(statement, environment);
+      if (lastEvaluated.type === "NullValue") {
+        // local patch (none-output): {{ expr }} prints None as "None", like str(None) in Python;
+        // the statements that evaluate to None (set, macro, comment) print nothing, as before
+        if (statement.type !== "Set" && statement.type !== "Macro" && statement.type !== "Comment") {
+          result += "None";
+        }
+      } else if (lastEvaluated.type !== "UndefinedValue") {
+        result += lastEvaluated.toString();
+      }
+'''
+
 PATCHES = [
     ("strip-chars",
      "str.strip(), lstrip() and rstrip() ignore their characters argument (huggingface.js issue #2597, "
@@ -174,6 +216,19 @@ PATCHES = [
      "and the full directive set; templates that call strftime_now (SmolLM3 '%d %B %Y', gpt-oss "
      "'%Y-%m-%d', Llama 3.2 '%d %b %Y') must render the same prompt in every browser.",
      [(_STRFTIME_OLD, _STRFTIME_NEW)]),
+    ("str-concat",
+     "`+` with one str operand turns the other into text (a dict renders as \"[object Map]\"), while Python "
+     "raises TypeError for str + dict, list, int or bool; DeepSeek's templates concatenate "
+     "tool_calls[].function.arguments into the prompt, so a dict there gave a silently wrong browser prompt "
+     "where superborg/server.py answers 400. Only str + str concatenates now.",
+     [(_CONCAT_OLD, _CONCAT_NEW)]),
+    ("none-output",
+     "`{{ expr }}` prints nothing when the expression is None, while Python prints str(None), \"None\" "
+     "(an undefined variable prints nothing on both sides); a message whose content is null, as "
+     "OpenAI-style clients send tool-call turns, rendered differently in the browser for every template "
+     "that prints the content as it is (GLM-4-9B-0414, GLM-5.1). Only expressions print \"None\": the set, "
+     "macro and comment statements also evaluate to None and still print nothing.",
+     [(_NONE_OLD, _NONE_NEW)]),
 ]
 
 

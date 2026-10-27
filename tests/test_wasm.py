@@ -129,15 +129,39 @@ def test_logits_match_native_q8(wasm):
     got = np.array(wasm["logits"], np.float32)
     ref = native_logits(Q8)
     # 8-bit activations: a rounding that flips one quantized activation moves the logits by a few
-    # percent of their range; the native AVX2 and scalar builds differ from each other as much
-    assert np.abs(got - ref).max() <= 5e-2 * np.abs(ref).max()
+    # percent of their range; the native AVX-512 and scalar builds differ from each other as much
+    # (2.5-3.6% over five prompts; wasm against native 2.3-5.8%, with the plain and the interleaved
+    # kernels alike: bench/results/prefill_after.txt, section 7)
+    assert np.abs(got - ref).max() <= 8e-2 * np.abs(ref).max()
     assert int(got.argmax()) == int(ref.argmax())
 
 
+def _shape(x):
+    """The nesting of lists (and dicts' key sets) of a JSON value, without the numbers."""
+    if isinstance(x, dict):
+        return {k: _shape(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_shape(v) for v in x]
+    return type(x).__name__ if isinstance(x, (str, bool)) or x is None else "num"
+
+
+def _dense_rows(enc_rows, n):
+    from superborg.interp import decode_row
+    return np.array([decode_row(e, n) for e in enc_rows])
+
+
 def test_trace_events_match_python_schema(wasm, native):
+    """Every event of the WebAssembly session has the keys and nesting of the Python one; the
+    numbers agree within what the two engines' arithmetic allows (8-bit kernels on different
+    instruction sets): decoded attention rows within 0.05, per-head statistics within 0.1 and
+    per-head entropies within 0.2 nats, ranks and ids equal where the distributions are well
+    separated."""
+    from superborg.interp import decode_row
     session = TraceSession(native)
     ref = list(session.stream_chat([{"role": "user", "content": "What is the capital of France?"}], max_tokens=6))
     got = wasm["events"]
+    cfg = native.model.config
+    L, H = cfg["n_layers"], cfg["n_heads"]
     assert [e["type"] for e in got] == [e["type"] for e in ref]
     for g, r in zip(got, ref):
         assert set(g) == set(r), (sorted(set(g) ^ set(r)))
@@ -145,17 +169,94 @@ def test_trace_events_match_python_schema(wasm, native):
     toks_r = [e for e in ref if e["type"] == "token"]
     assert [e["id"] for e in toks_g] == [e["id"] for e in toks_r]
     for g, r in zip(toks_g, toks_r):
+        # the same nesting everywhere but in the sparse rows and top lists, whose lengths depend on the values
+        for k in set(g) - {"attn_rows", "attn_eff", "attn_top", "attn_heads", "alternatives", "lens", "rival", "mlp_top"}:
+            assert _shape(g[k]) == _shape(r[k]), k
         assert [x["layer"] for x in g["lens"]] == [x["layer"] for x in r["lens"]]
+        assert all(set(x) == {"layer", "top", "p", "rank", "entropy", "rival_p", "rival_rank"} for x in g["lens"])
         assert g["lens"][-1]["rank"] == 0 == r["lens"][-1]["rank"]  # greedy: the last layer's top token is chosen
-        assert abs(g["prob"] - r["prob"]) < 5e-2
+        assert g["lens"][-1]["rival_rank"] == 1 == r["lens"][-1]["rival_rank"]
+        # the late layers' lens rows differ by up to 0.24 relative between the 8-bit builds
+        # (bench/results/prefill_after.txt, section 7)
+        np.testing.assert_allclose([x["entropy"] for x in g["lens"]], [x["entropy"] for x in r["lens"]], rtol=0.3, atol=0.1)
+        assert abs(g["prob"] - r["prob"]) < 5e-2 and abs(g["entropy"] - r["entropy"]) < 0.2
         # [text, p, id] (the page tells same-text byte tokens apart by id); greedy: the top one is chosen
         assert g["alternatives"][0][2] == g["id"] == r["alternatives"][0][2]
+        assert len(g["rival"]) == 3 == len(r["rival"]) and g["rival"][2] == g["alternatives"][1][2]
         assert all(len(t) == 3 for x in g["lens"] + r["lens"] for t in x["top"])
         assert g["decode_ms"] >= 0 and r["decode_ms"] >= 0
-        assert len(g["attn_top"]) == len(r["attn_top"]) == native.model.config["n_layers"]
-        assert len(g["norms"]["resid"]) == native.model.config["n_layers"] + 1
+        assert len(g["attn_top"]) == len(r["attn_top"]) == L
+        assert len(g["norms"]["resid"]) == L + 1
         np.testing.assert_allclose(g["norms"]["resid"], r["norms"]["resid"], rtol=5e-2, atol=1e-2)
+        np.testing.assert_allclose(g["resid"]["norm"], r["resid"]["norm"], rtol=5e-2, atol=1e-2)
+        np.testing.assert_allclose(g["resid"]["spike"], r["resid"]["spike"], rtol=0.15, atol=0.5)
+        assert g["resid"]["xyz"] is None and r["resid"]["xyz"] is None
+        n = g["pos"] + 1
+        for key in ("attn_rows", "attn_eff"):
+            assert all(set(e) == {"scale", "sink", "pos", "w"} for e in g[key]) and len(g[key]) == len(r[key]) == L
+            dg, dr = _dense_rows(g[key], n), _dense_rows(r[key], n)
+            assert np.abs(dg - dr).max() < 0.05, key
+            assert all(e["pos"] == sorted(e["pos"]) and 0 not in e["pos"] for e in g[key])
+        assert [len(x) for x in g["attn_top"]] == [len(x) for x in r["attn_top"]]
+        assert all(p >= 1 for x in g["attn_top"] for p, _ in x)
+        top_g, top_r = [x[0][0] for x in g["attn_top"]], [x[0][0] for x in r["attn_top"]]
+        assert sum(a == b for a, b in zip(top_g, top_r)) >= 0.8 * L
+        assert [len(hl) for hl in g["attn_heads"]] == [H] * L and all(len(x) <= 3 and all(p >= 1 for p, _ in x)
+                                                                     for hl in g["attn_heads"] for x in hl)
+        for stat in g["head_stats"]:  # single heads differ more between the engines than their mean does
+            a, b = np.array(g["head_stats"][stat]), np.array(r["head_stats"][stat])
+            assert a.shape == b.shape == (L, H) and np.abs(a - b).max() < 0.1, stat
+        ent_diff = np.abs(np.array(g["attn_entropy"]) - np.array(r["attn_entropy"]))
+        assert ent_diff.max() < 0.2, ent_diff.max()  # per head, in nats: as head_stats, a single head's row
+        assert [len(x) for x in g["mlp_top"]] == [len(x) for x in r["mlp_top"]] == [6] * L
     assert got[-1]["text"] == ref[-1]["text"]
+
+
+def test_report_functions_match_python_on_the_same_input(native, tmp_path):
+    """wasm/trace-session.js's attentionReport, residReport and encodeRow against superborg/interp.py's
+    attention_report, resid_report and encode_row on identical arrays (a native trace plus a synthetic
+    basis): the same positions, 8-bit weights, ranks and shapes, numbers within rounding."""
+    import importlib.util
+    from superborg.interp import attention_report, encode_row, prepare_basis, resid_report
+    spec = importlib.util.spec_from_file_location("trace_basis", ROOT / "tools" / "trace_basis.py")
+    tb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tb)
+    cfg = native.model.config
+    L, H, KV, D = cfg["n_layers"], cfg["n_heads"], cfg["n_kv_heads"], cfg["dim"]
+    ctx = native.ctx
+    ctx.reset()
+    ctx.enable_trace()
+    toks = native.tokenize("The cat sat on the mat. The cat sat on the mat again, and the dog watched the cat.")
+    ctx.decode(toks, None)
+    tr = ctx.trace()
+    n = tr["pos"] + 1
+    rng = np.random.default_rng(5)
+    basis = tb.fit_basis(rng.standard_normal((40, L + 1, D)))
+    rows = [rng.random(50).tolist(), [1.0], [1.0, 0.0, 0.0], np.full(8, 1 / 8).tolist(), [0.9] + [1e-4] * 999]
+    req = {"L": L, "H": H, "KV": KV, "D": D, "n": n, "tokens": tr["tokens"].tolist(), "n_prompt": n - 5, "attn_top": 8,
+           "head_top": 3, "attn": tr["attn"].ravel().tolist(), "vnorm": tr["vnorm"].ravel().tolist(),
+           "resid": tr["resid"].ravel().tolist(), "basis": basis, "rows": rows}
+    js = node_case("report", req, tmp_path)
+    py = attention_report(tr["attn"], tr["vnorm"], tr["tokens"], n - 5, KV, 8, 3)
+    py["resid"] = resid_report(tr["resid"], prepare_basis(basis, L, D))
+    py["rows"] = [encode_row(np.array(r, dtype=np.float64)) for r in rows]
+    assert set(js) == set(py)
+    for key in ("attn_rows", "attn_eff", "rows"):
+        for a, b in zip(js[key], py[key]):
+            assert a["pos"] == b["pos"] and a["w"] == b["w"], key
+            assert a["sink"] == pytest.approx(b["sink"], abs=1.01e-4) and a["scale"] == pytest.approx(b["scale"], abs=1.01e-6)
+    for a, b in zip(js["attn_top"], py["attn_top"]):
+        assert [p for p, _ in a] == [p for p, _ in b] and [w for _, w in a] == pytest.approx([w for _, w in b], abs=1.01e-4)
+    for la, lb in zip(js["attn_heads"], py["attn_heads"]):
+        for a, b in zip(la, lb):
+            assert [p for p, _ in a] == [p for p, _ in b] and [w for _, w in a] == pytest.approx([w for _, w in b], abs=1.01e-4)
+    assert set(js["head_stats"]) == set(py["head_stats"])
+    for stat in py["head_stats"]:
+        np.testing.assert_allclose(js["head_stats"][stat], py["head_stats"][stat], rtol=0, atol=1.01e-3)
+    np.testing.assert_allclose(js["attn_entropy"], py["attn_entropy"], rtol=0, atol=1.01e-3)
+    for key in ("norm", "spike", "xyz"):
+        np.testing.assert_allclose(js["resid"][key], py["resid"][key], rtol=0, atol=1.01e-3)
+    assert js["rows"][1] == {"scale": 0, "sink": 1, "pos": [], "w": []} and js["rows"][4]["pos"] == []
 
 
 def test_javascript_build_matches_native(asm_bin, tmp_path):
@@ -181,16 +282,19 @@ def test_fused_lens_matches_javascript_summary(wasm_bin, tmp_path):
     assert out["simd"] == "wasm-simd128" and len(out["tokens"]) == 6
     for tok in out["tokens"]:
         f, o = tok["fused"], tok["old"]
-        assert f["top"] == o["top"] and f["rank"] == o["rank"]
+        assert f["top"] == o["top"] and f["rank"] == o["rank"] and f["rival_rank"] == o["rival_rank"]
         assert len(f["top"]) == 4 * len(tok["layers"]) and len(tok["layers"]) == 31
         np.testing.assert_allclose(f["p"], o["p"], rtol=0, atol=1e-6)
+        np.testing.assert_allclose(f["rival_p"], o["rival_p"], rtol=0, atol=1e-6)
         np.testing.assert_allclose(f["p_top"], o["p_top"], rtol=0, atol=1e-6)
         np.testing.assert_allclose(f["lse"], o["lse"], rtol=0, atol=1e-5)
-        assert f["rank"][-1] == 0  # greedy: the chosen token tops the last layer
+        np.testing.assert_allclose(f["entropy"], o["entropy"], rtol=0, atol=1e-6)
+        assert f["rank"][-1] == 0 and f["rival_rank"][-1] == 1  # greedy: the chosen token tops the last layer
         for a, b in zip(tok["report"], tok["plain_report"]):
-            assert a["layer"] == b["layer"] and a["rank"] == b["rank"]
+            assert a["layer"] == b["layer"] and a["rank"] == b["rank"] and a["rival_rank"] == b["rival_rank"]
             assert [x[2] for x in a["top"]] == [x[2] for x in b["top"]] and len(a["top"]) == 4
-            assert abs(a["p"] - b["p"]) <= 1.1e-5
+            assert abs(a["p"] - b["p"]) <= 1.1e-5 and abs(a["rival_p"] - b["rival_p"]) <= 1.1e-5
+            assert abs(a["entropy"] - b["entropy"]) <= 1.1e-4
             assert all(abs(x[1] - y[1]) <= 1.1e-4 for x, y in zip(a["top"], b["top"]))
 
 
@@ -368,6 +472,18 @@ CONVERSATIONS = {
                "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]},
               {"role": "tool", "name": "get_weather", "content": "{\"temp\": 18}"},
               {"role": "assistant", "content": "It is 18 C."}, {"role": "user", "content": "And in Rome?"}],
+    # OpenAI-style tool calls: content null, the arguments a dict or the JSON string clients send
+    # (DeepSeek's templates concatenate them into the prompt: a TypeError on both sides for a dict)
+    "tool_call_null": [{"role": "user", "content": "Weather in Paris?"},
+                       {"role": "assistant", "content": None,
+                        "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]},
+                       {"role": "tool", "name": "get_weather", "content": "{\"temp\": 18}"},
+                       {"role": "user", "content": "And in Rome?"}],
+    "tool_call_json": [{"role": "user", "content": "Weather in Paris?"},
+                       {"role": "assistant", "content": None,
+                        "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                       {"role": "tool", "name": "get_weather", "content": "{\"temp\": 18}"},
+                       {"role": "user", "content": "And in Rome?"}],
     # spaces next to the newlines around the think block: Python's strip('\n') keeps them
     "think": [{"role": "user", "content": "Is 7 prime?"},
               {"role": "assistant", "content": "<think>\n  Check divisors.  \n</think>\n\n  Yes, 7 is prime.  "},
@@ -507,6 +623,41 @@ def test_vendored_strftime_matches_python(tmp_path, lang):
     assert got == want
 
 
+def test_vendored_plus_concatenates_only_strings(tmp_path):
+    """The str-concat patch: `+` with a str operand needs a str on the other side, as in Python,
+    where @huggingface/jinja 0.5.10 rendered a dict as "[object Map]" (DeepSeek's templates
+    concatenate tool_calls[].function.arguments into the prompt); str + str is unchanged."""
+    pytest.importorskip("jinja2")
+    from superborg.chat import ChatFormatter
+    probe = "{{ 'args=' + messages[1].tool_calls[0].function.arguments + '|' + messages[0].content }}"
+    convs = {k: CONVERSATIONS[k] for k in ("tool_call_null", "tool_call_json")}
+    got = node_case("template", {"templates": {"probe": {"chat_template": probe, "bos_token": "", "eos_token": ""}},
+                                 "conversations": convs, "settings": SETTINGS[:1], "tools": TOOLS}, tmp_path)["probe"]
+    f = ChatFormatter({"chat_template": probe})
+    with pytest.raises(TypeError, match='can only concatenate str \\(not "dict"\\)'):
+        f.render(convs["tool_call_null"])
+    assert got["tool_call_null#0"] == {"error": "unsupported operand types for +: StringValue and ObjectValue"}
+    want = 'args={"city": "Paris"}|Weather in Paris?'
+    assert f.render(convs["tool_call_json"]) == want and got["tool_call_json#0"] == {"text": want}
+
+
+def test_vendored_none_prints_like_python(tmp_path):
+    """The none-output patch: an expression that is None prints "None" as in Python (a null message
+    content, a variable set to none, a macro's argument), where @huggingface/jinja 0.5.10 printed
+    nothing; an undefined value, an inline if without else, set, macro and comment statements
+    still print nothing."""
+    pytest.importorskip("jinja2")
+    from superborg.chat import ChatFormatter
+    probe = ("{{ messages[1].content }}|{% set x = none %}{{ x }}|{{ messages[0].missing }}|{{ 'a' if false }}|"
+             "{# c #}{% macro m(v) %}{{ v }}{% endmacro %}{{ m(none) }}")
+    conv = {"tool_call_null": CONVERSATIONS["tool_call_null"]}
+    got = node_case("template", {"templates": {"probe": {"chat_template": probe, "bos_token": "", "eos_token": ""}},
+                                 "conversations": conv, "settings": SETTINGS[:1], "tools": TOOLS}, tmp_path)["probe"]
+    want = "None|None|||None"
+    assert ChatFormatter({"chat_template": probe}).render(conv["tool_call_null"]) == want
+    assert got["tool_call_null#0"] == {"text": want}
+
+
 def test_vendored_jinja_is_the_pinned_release():
     """wasm/vendor/hfjinja.js carries the version, hash, patches and license of wasm/vendor_jinja.py,
     and so do the third-party notices."""
@@ -549,10 +700,14 @@ def run_worker(site, steps, tmp_path, idb=()):
     """Run the steps of tests/js/worker_check.js against wasm/worker.js serving `site`."""
     req = tmp_path / "worker.json"
     req.write_text(json.dumps({"idb": list(idb), "steps": steps}))
-    r = subprocess.run(["node", str(ROOT / "tests" / "js" / "worker_check.js"), str(site), str(req)],
-                       capture_output=True, text=True, timeout=600)
+    # the result goes to a file, not a pipe: node exits right after writing it, and a pipe
+    # keeps only the first 64 KiB of an unflushed write (a traced chat's events are larger)
+    out = tmp_path / "worker.out"
+    with out.open("w") as f:
+        r = subprocess.run(["node", str(ROOT / "tests" / "js" / "worker_check.js"), str(site), str(req)],
+                           stdout=f, stderr=subprocess.PIPE, text=True, timeout=600)
     assert r.returncode == 0, r.stderr
-    return json.loads(r.stdout)
+    return json.loads(out.read_text())
 
 
 def test_worker_info_and_part_cache(site, tmp_path):
@@ -666,6 +821,60 @@ def test_worker_chat_template_kwargs(site, tmp_path):
         {"type": "error", "message": "'chat_template_kwargs' cannot set 'messages'"},
         {"type": "error", "message": "'chat_template_kwargs' cannot set 'add_generation_prompt'"},
     ]
+
+
+@pytest.fixture(scope="module")
+def site_with_basis(wasm_bin, tmp_path_factory):
+    """As `site`, with a (synthetic) residual basis shipped as basis.json."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("trace_basis", ROOT / "tools" / "trace_basis.py")
+    tb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tb)
+    out = tmp_path_factory.mktemp("site_basis")
+    page = out / "page.html"
+    page.write_text("<!doctype html><title>t</title><script>1</script>")
+    header = make_artifact().read_header(Path(need(Q4)))
+    cfg = header["config"]
+    basis = out / "synthetic.basis.json"
+    basis.write_text(json.dumps(tb.fit_basis(np.random.default_rng(6).standard_normal((40, cfg["n_layers"] + 1, cfg["dim"])))))
+    assert make_artifact().main([need(Q4), str(out), "--page", str(page), "--wasm", str(wasm_bin), "--no-asm",
+                                 "--n-ctx", "1024", "--basis", str(basis)]) == 0
+    return out
+
+
+def test_worker_trace_prompt_and_basis(site, site_with_basis, tmp_path):
+    """trace_prompt gives a prompt_token event per uncached prompt position before the last, with
+    the trace fields (no sampling fields); a basis listed in model.json is loaded (info.basis) and
+    fills the xyz projection; without one xyz is null; a bad flag is an error, as the server's 400."""
+    # the traced chat goes first: a prompt the context already holds is not re-evaluated, so a
+    # repeat of it would trace nothing (n_reused = n_prompt - 1)
+    _, info, traced, plain, bad = run_worker(site_with_basis, [
+        ["init", None],
+        ["info", None],
+        ["chat", {"messages": HI, "max_tokens": 1, "trace_prompt": True}],
+        ["chat", {"messages": HI, "max_tokens": 1}],
+        ["chat", {"messages": HI, "trace_prompt": "yes"}],
+    ], tmp_path)
+    assert info["basis"] is True
+    man = json.loads((site_with_basis / "model.json").read_text())
+    assert man["basis"] == "basis.json" and (site_with_basis / "basis.json").is_file()
+    assert [e["type"] for e in plain] == ["prompt", "token", "done"]
+    n = plain[0]["n_prompt"]
+    pts = [e for e in traced if e["type"] == "prompt_token"]
+    assert [e["type"] for e in traced] == ["prompt_token"] * (n - 1) + ["prompt", "token", "done"]
+    assert [e["pos"] for e in pts] == list(range(n - 1)) and traced[-2]["id"] == plain[1]["id"]
+    for e in pts:
+        assert not {"prob", "entropy", "alternatives", "i", "text", "eos"} & set(e)
+        for k in ("next", "rival", "lens", "norms", "resid", "attn_rows", "attn_eff", "attn_top", "attn_heads",
+                  "head_stats", "attn_entropy", "mlp_top", "decode_ms", "trace_ms"):
+            assert k in e, k
+        assert len(e["resid"]["xyz"]) == 31 and all(len(p) == 3 for p in e["resid"]["xyz"])
+        assert len(e["lens"]) == len(range(0, 31, 3)) and e["lens"][-1]["layer"] == 30
+    assert bad == [{"type": "error", "message": "'trace_prompt' must be true or false"}]
+    _, info, traced = run_worker(site, [["init", None], ["info", None],
+                                        ["chat", {"messages": HI, "max_tokens": 1, "trace_prompt": True}]], tmp_path)
+    assert info["basis"] is False and "basis" not in json.loads((site / "model.json").read_text())
+    assert all(e["resid"]["xyz"] is None for e in traced if e["type"] == "prompt_token")
 
 
 def test_worker_busy_and_bad_requests(site, tmp_path):

@@ -271,8 +271,9 @@ def test_lens_summary_with_ties(pool, tmp_path):
     """borg_ctx_lens_summary on a copy of smollm2-135m-q8_0 whose output rows a - 7, a + 5 and
     a + 9 are made copies of row a, the most likely token after a prompt: four tokens then tie
     for the top logit of the last layer (and tie at some rank in every lens row). The top list
-    orders ties by id, a rank counts strictly greater logits only (ties share it), the chosen
-    logit is the kernel's own value and the log-sum-exp is float64-accurate."""
+    orders ties by id, a rank counts strictly greater logits only (ties share it), a tracked
+    logit is the kernel's own value and the log-sum-exp is float64-accurate. k stays within
+    LENS_MAX_K (256): the per-block top list is kept by insertion."""
     from superborg.convert import read_borg
     src = need(Q8)
     probe = Model(src, pool=pool)
@@ -307,26 +308,128 @@ def test_lens_summary_with_ties(pool, tmp_path):
         ids, rank, lse = _reference_summary(z, k, chosen)
         assert np.array_equal(s["top_ids"], ids)
         assert np.array_equal(s["top_logits"], np.take_along_axis(z, ids, axis=1))
-        assert np.array_equal(s["chosen_rank"], rank) and s["chosen_rank"][-1] == 0
-        assert np.array_equal(s["chosen_logit"], z[:, chosen])
+        assert np.array_equal(s["track_rank"][:, 0], rank) and s["track_rank"][-1, 0] == 0
+        assert np.array_equal(s["track_logit"][:, 0], z[:, chosen])
         assert np.abs(s["lse"] - lse).max() <= 1e-9
         assert s["top_ids"][-1].tolist()[: min(k, 4)] == tied[: min(k, 4)]  # the tie, in id order
-    # rank and top list of a token tied with others in the middle of a row: the same rules
-    s = c.lens_summary(layers, 4, a - 7)
-    assert np.array_equal(s["chosen_rank"], (z > z[:, a - 7][:, None]).sum(axis=1))
-    # every row of the output matrix (vocab_size, here the tokenizer's size) and the errors
+    # a tracked list: the chosen token and one tied with others in the middle of a row, the same rules
+    s = c.lens_summary(layers, 4, [chosen, a - 7])
+    assert s["track_rank"].shape == s["track_logit"].shape == (len(layers), 2)
+    assert np.array_equal(s["track_rank"][:, 1], (z > z[:, a - 7][:, None]).sum(axis=1))
+    assert np.array_equal(s["track_logit"], z[:, [chosen, a - 7]])
+    assert np.array_equal(s["track_rank"][:, 0], _reference_summary(z, 4, chosen)[1])
+    # nothing tracked: the top list, the normalizer and the entropy alone
+    none = c.lens_summary(layers, 4)
+    assert none["track_rank"].shape == (len(layers), 0) and np.array_equal(none["top_ids"], s["top_ids"])
+    assert np.array_equal(none["entropy"], s["entropy"]) and np.array_equal(none["lse"], s["lse"])
+    # every row of the output matrix (vocab_size, here the tokenizer's size), the largest k, and the errors
     assert np.array_equal(c.lens_summary(layers, 4, chosen, n_vocab=0)["top_ids"], s["top_ids"])
-    for kw in ({"k": 0}, {"k": m.n_vocab + 1}, {"chosen": m.n_vocab}, {"chosen": -1}, {"n_vocab": m.vocab_size + 1},
-               {"layers": [m.config["n_layers"] + 1]}):
-        args = dict(layers=layers, k=4, chosen=chosen)
+    assert np.array_equal(c.lens_summary(layers, 256, chosen)["top_ids"], _reference_summary(z, 256, chosen)[0])
+    for kw in ({"k": 0}, {"k": m.n_vocab + 1}, {"k": 257}, {"track": m.n_vocab}, {"track": [chosen, -1]},
+               {"n_vocab": m.vocab_size + 1}, {"layers": [m.config["n_layers"] + 1]}):
+        args = dict(layers=layers, k=4, track=chosen)
         args.update(kw)
         with pytest.raises(ValueError):
             c.lens_summary(**args)
+    with pytest.raises(ValueError, match="at most 256"):
+        c.lens_summary(layers, 257, chosen)
     with pytest.raises(ValueError, match="nothing traced"):
         m.context(n_ctx=16).lens_summary(layers, 4, chosen)
     assert c.lens_summary([], 4, chosen)["top_ids"].shape == (0, 4)
     c.close()
     m.close()
+
+
+def test_lens_summary_entropy_and_thread_independence(pool):
+    """The entropy of every lens row is -sum p log p of the full row (NumPy, float64 from the same
+    float32 logits) within 1e-6; the tracked logits and ranks are those of the full rows; and the
+    whole summary is bit-identical with one thread and with four (the per-block partials are merged
+    in block order)."""
+    m4 = Model(need(Q8), pool=pool)
+    p1 = Pool(1)
+    m1 = Model(need(Q8), pool=p1)
+    toks = m4.tokenize("The capital of France is")
+    layers = list(range(m4.config["n_layers"] + 1))
+    out = []
+    for m in (m4, m1):
+        c = m.context(n_ctx=64)
+        c.enable_trace()
+        logits = c.decode(toks, "last")[: m.n_vocab]
+        track = [int(i) for i in np.argsort(-logits)[:3]]
+        out.append((c.lens(layers)[:, : m.n_vocab], c.lens_summary(layers, 5, track), track))
+        c.close()
+    (z, s, track), (z1, s1, track1) = out
+    z64 = z.astype(np.float64)
+    p = np.exp(z64 - z64.max(axis=1, keepdims=True))
+    p /= p.sum(axis=1, keepdims=True)
+    H = -(p * np.log(np.where(p > 0, p, 1.0))).sum(axis=1)
+    assert np.abs(s["entropy"] - H).max() <= 1e-6 and s["entropy"].dtype == np.float64
+    assert (s["entropy"] >= 0).all() and (s["entropy"] <= np.log(m4.n_vocab)).all()
+    assert np.array_equal(s["track_logit"], z[:, track])
+    assert np.array_equal(s["track_rank"], (z[:, :, None] > z[:, track][:, None, :]).sum(axis=1))
+    assert s["track_rank"][-1].tolist() == [0, 1, 2]  # the three most likely output tokens
+    assert track == track1 and np.array_equal(z, z1)
+    for k in ("top_ids", "top_logits", "track_logit", "track_rank", "lse", "entropy"):
+        assert np.array_equal(s[k], s1[k]), k
+    m1.close()
+    p1.close()
+    m4.close()
+
+
+def test_trace_vnorm(f32, tmp_path):
+    """|v| per layer, kv head and cached position: written with the value while tracing is on (0
+    for positions cached while it was off), equal to the NumPy reference's V rows, carried by the
+    trace, computed from the cache for positions that arrive by copy or from a file, and within
+    half precision with an f16 cache."""
+    from superborg.reference import ReferenceModel
+    cfg = f32.config
+    nl, nkv = cfg["n_layers"], cfg["n_kv_heads"]
+    toks = f32.tokenize("The quick brown fox jumps over the lazy dog.")
+    c = f32.context(n_ctx=64)
+    assert c.trace_vnorm() is None  # not allocated before tracing was first enabled
+    c.decode(toks[:3], None)
+    c.enable_trace()
+    c.decode(toks[3:], "last")
+    vn = c.trace_vnorm()
+    assert vn.shape == (nl, nkv, len(toks)) and (vn[:, :, :3] == 0).all() and (vn[:, :, 3:] > 0).all()
+    ref = ReferenceModel(F32)
+    ref.forward(toks)
+    want = np.stack([np.linalg.norm(v, axis=-1).T for v in ref.v_cache])  # [L, KV, n]
+    assert want.shape == vn.shape
+    assert np.allclose(vn[:, :, 3:], want[:, :, 3:], rtol=1e-4, atol=1e-5)
+    tr = c.trace()
+    assert np.array_equal(tr["vnorm"], vn) and tr["tokens"].tolist() == toks
+    d = f32.context(n_ctx=64)
+    d.enable_trace()
+    d.copy_from(c)
+    assert np.allclose(d.trace_vnorm(), want, rtol=1e-4, atol=1e-5)  # every position, the first three too
+    path = str(tmp_path / "kv.bin")
+    c.save(path)
+    e = f32.context(n_ctx=64)
+    e.enable_trace()
+    e.load(path)
+    assert np.allclose(e.trace_vnorm(), want, rtol=1e-4, atol=1e-5)
+    g = f32.context(n_ctx=64, kv_f16=True)
+    g.enable_trace()
+    g.decode(toks, None)
+    assert np.allclose(g.trace_vnorm(), want, rtol=2e-3, atol=1e-4)
+    # tracing off again: new positions read 0, old ones keep their norms
+    c.enable_trace(False)
+    c.decode(f32.tokenize(" It"), None)
+    vn2 = c.trace_vnorm()
+    assert vn2.shape[-1] == len(toks) + 1 and (vn2[:, :, -1] == 0).all() and np.array_equal(vn2[:, :, :-1], vn)
+    # a slot re-evaluated with tracing off (after a truncate or a reset) reads 0 too, not its old norm
+    c.truncate(2)
+    c.decode(toks[2:], None)
+    vn3 = c.trace_vnorm()
+    assert vn3.shape[-1] == len(toks) and (vn3 == 0).all()
+    c.reset()
+    c.decode(toks, None)
+    assert (c.trace_vnorm() == 0).all()
+    c.enable_trace()
+    c.truncate(3)
+    c.decode(toks[3:], None)
+    assert np.allclose(c.trace_vnorm(), vn, rtol=1e-4, atol=1e-5)  # traced again: the norms are back
 
 
 def test_lens_summary_vocab_restriction(pool):
@@ -342,7 +445,8 @@ def test_lens_summary_vocab_restriction(pool):
     within = c.lens_summary(layers, 3, chosen)
     every = c.lens_summary(layers, 3, chosen, n_vocab=0)
     assert (within["top_ids"] < m.n_vocab).all()
-    assert (every["chosen_rank"] >= within["chosen_rank"]).all() and (every["lse"] >= within["lse"]).all()
-    assert np.array_equal(every["chosen_logit"], within["chosen_logit"])
+    assert (every["track_rank"] >= within["track_rank"]).all() and (every["lse"] >= within["lse"]).all()
+    assert np.array_equal(every["track_logit"], within["track_logit"])
+    assert within["entropy"].shape == (2,) and (within["entropy"] > 0).all()
     c.close()
     m.close()

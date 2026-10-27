@@ -273,12 +273,14 @@
       if (this.b.x.borg_ctx_enable_trace(this.ptr, on ? 1 : 0) !== 0) throw new Error("cannot allocate trace buffers");
     }
 
-    /** Copies of the trace arrays (see borg_ctx_trace_* in engine/borg.h). */
+    /** Copies of the trace arrays (see borg_ctx_trace_* in engine/borg.h): attn [L * H * nPos],
+     *  vnorm [L * nKvHeads * nPos] (|v| of each cached position; 0 for positions cached while
+     *  tracing was off), tokens [nPos] (the context's ids up to the traced position). */
     trace() {
       const b = this.b, x = b.x, c = this.m.config;
       const pos = x.borg_ctx_trace_pos(this.ptr);
       if (pos < 0) return null;
-      const L = c.n_layers, D = c.dim, H = c.n_heads, F = c.hidden_dim;
+      const L = c.n_layers, D = c.dim, H = c.n_heads, KV = c.n_kv_heads, F = c.hidden_dim;
       const f = b.f32;
       const rp = x.borg_ctx_trace_resid(this.ptr, 0) >>> 2;
       const np = x.borg_ctx_trace_norms(this.ptr) >>> 2;
@@ -290,12 +292,17 @@
           const src = ap + (l * H + h) * this.nCtx;
           attn.set(f.subarray(src, src + npos), (l * H + h) * npos);
         }
+      const vp = x.borg_ctx_trace_vnorm(this.ptr, 0, 0) >>> 2;
+      const vnorm = new Float32Array(L * KV * npos);
+      for (let i = 0; i < L * KV; i++) vnorm.set(f.subarray(vp + i * this.nCtx, vp + i * this.nCtx + npos), i * npos);
       const mp = x.borg_ctx_trace_mlp(this.ptr, 0) >>> 2;
+      const tp = x.borg_ctx_tokens(this.ptr) >>> 2;
       return {
         pos, nPos: npos,
+        tokens: Array.from(b.i32.subarray(tp, tp + npos)),
         resid: f.slice(rp, rp + (L + 1) * D),
         norms: f.slice(np, np + L * 3),
-        attn,
+        attn, vnorm,
         mlp: f.slice(mp, mp + L * F),
       };
     }
@@ -314,21 +321,25 @@
 
     /** The logit lens summarized inside the engine (borg_ctx_lens_summary): per listed layer the k
      *  most likely tokens (topIds / topLogits, [n * k], logit descending then id ascending), the
-     *  logit and rank (strictly greater logits) of `chosen`, and the row's log-sum-exp (lse,
-     *  Float64Array), so a probability is exp(logit - lse). Only the first nVocab logits take part
-     *  (default: the tokenizer's vocabulary). The [n, vocab] logits never leave the engine. */
-    lensSummary(layers, k, chosen, nVocab = this.m.nVocab) {
-      const b = this.b, n = layers.length;
-      const lp = b.malloc(n * 4), ids = b.malloc(n * k * 4), vals = b.malloc(n * k * 4);
-      const zc = b.malloc(n * 4), rank = b.malloc(n * 4), lse = b.malloc(n * 8);
+     *  logit and rank (strictly greater logits) of every tracked token (trackLogit / trackRank,
+     *  [n * track.length]; e.g. the chosen token and its rival), the row's log-sum-exp (lse,
+     *  Float64Array), so a probability is exp(logit - lse), and its entropy in nats (entropy,
+     *  Float64Array). Only the first nVocab logits take part (default: the tokenizer's
+     *  vocabulary). k is at most LENS_MAX_K. The [n, vocab] logits never leave the engine. */
+    lensSummary(layers, k, track, nVocab = this.m.nVocab) {
+      const b = this.b, n = layers.length, nt = track.length;
+      const lp = b.malloc(n * 4), tp = b.malloc(Math.max(nt, 1) * 4), ids = b.malloc(n * k * 4), vals = b.malloc(n * k * 4);
+      const zt = b.malloc(Math.max(n * nt, 1) * 4), rank = b.malloc(Math.max(n * nt, 1) * 4);
+      const lse = b.malloc(n * 8), ent = b.malloc(n * 8);
       b.i32.set(layers, lp >>> 2);
-      const rc = b.x.borg_ctx_lens_summary(this.ptr, lp, n, nVocab, k, chosen, ids, vals, zc, rank, lse);
+      b.i32.set(track, tp >>> 2);
+      const rc = b.x.borg_ctx_lens_summary(this.ptr, lp, n, nVocab, k, tp, nt, ids, vals, zt, rank, lse, ent);
       const out = rc === 0 ? {
         topIds: b.i32.slice(ids >>> 2, (ids >>> 2) + n * k), topLogits: b.f32.slice(vals >>> 2, (vals >>> 2) + n * k),
-        chosenLogit: b.f32.slice(zc >>> 2, (zc >>> 2) + n), chosenRank: b.i32.slice(rank >>> 2, (rank >>> 2) + n),
-        lse: b.f64.slice(lse >>> 3, (lse >>> 3) + n),
+        trackLogit: b.f32.slice(zt >>> 2, (zt >>> 2) + n * nt), trackRank: b.i32.slice(rank >>> 2, (rank >>> 2) + n * nt),
+        lse: b.f64.slice(lse >>> 3, (lse >>> 3) + n), entropy: b.f64.slice(ent >>> 3, (ent >>> 3) + n),
       } : null;
-      for (const p of [lp, ids, vals, zc, rank, lse]) b.free(p);
+      for (const p of [lp, tp, ids, vals, zt, rank, lse, ent]) b.free(p);
       if (!out) throw new Error("lens summary failed (" + rc + ")");
       return out;
     }

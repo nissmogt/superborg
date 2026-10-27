@@ -1,6 +1,7 @@
-/* Single-thread matmul microbenchmark: GMAC/s for each weight type and batch size.
+/* Single-thread matmul microbenchmark: GMAC/s for each weight type and batch size, in the plain
+ * layout (the per-row kernels) and the interleaved layout (the batched kernels, as loaded).
  * Reports the best of several repetitions so background load matters less.
- * Build: cc -O3 -march=native -Iengine bench/bench_kernels.c engine/kernels.c -lm */
+ * Build: cc -O3 -march=native -ffp-contract=off -Iengine bench/bench_kernels.c engine/kernels.c -lm */
 #include "internal.h"
 
 #include <stdio.h>
@@ -35,19 +36,30 @@ int main(int argc, char **argv) {
             }
         if (dt == DT_F16) for (size_t i = 0; i < (size_t)rows * cols; i++) ((uint16_t *)w)[i] = fp32_to_fp16(0.01f);
         if (dt == DT_F32) for (size_t i = 0; i < (size_t)rows * cols; i++) ((float *)w)[i] = 0.01f;
-        borg_mat m = {dt, rows, cols, w, rb};
-        for (size_t bi = 0; bi < sizeof batches / sizeof batches[0]; bi++) {
-            const int T = batches[bi];
-            double best = 1e30;
-            for (int rep = 0; rep < 7; rep++) {
-                double t0 = now_ms();
-                mat_mul_rows(&m, 0, rows, T, x, cols, xq, cols / QK, out, rows);
-                double t1 = now_ms();
-                if (t1 - t0 < best) best = t1 - t0;
+        borg_mat m = {dt, rows, cols, w, rb, MAT_PLAIN, NULL};
+        uint8_t *x8 = NULL;
+        for (int layout = MAT_PLAIN; layout <= MAT_X8; layout++) {
+            if (layout == MAT_X8) {
+                if (!mat_wants_q8a(&m)) break;
+                x8 = malloc(mat_x8_bytes(&m));
+                mat_repack_x8(&m, x8);
+                m.data = x8;
+                m.layout = MAT_X8;
             }
-            printf("%-5s T=%-3d %8.3f ms  %7.2f GMAC/s\n", dtype_name(dt), T, best,
-                   (double)rows * cols * T / best / 1e6);
+            for (size_t bi = 0; bi < sizeof batches / sizeof batches[0]; bi++) {
+                const int T = batches[bi];
+                double best = 1e30;
+                for (int rep = 0; rep < 7; rep++) {
+                    double t0 = now_ms();
+                    mat_mul_rows(&m, 0, rows, T, x, cols, xq, cols / QK, out, rows);
+                    double t1 = now_ms();
+                    if (t1 - t0 < best) best = t1 - t0;
+                }
+                printf("%-5s %-6s T=%-3d %8.3f ms  %7.2f GMAC/s\n", dtype_name(dt), layout == MAT_X8 ? "x8" : "plain", T, best,
+                       (double)rows * cols * T / best / 1e6);
+            }
         }
+        free(x8);
         free(w);
     }
     return 0;

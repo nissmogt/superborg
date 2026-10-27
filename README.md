@@ -45,13 +45,22 @@ logs are in `bench/results/`.
 | model | file size | prompt (tok/s) | generation (tok/s) |
 |-------|----------:|---------------:|-------------------:|
 | SmolLM2-135M, q8_0 | 138 MB | 535 | 130 |
-| SmolLM2-135M, q4 | 106 MB | 601 | 154 |
-| Qwen2.5-0.5B, q8_0 | 505 MB | 223 | 45 |
+| SmolLM2-135M, q4 | 106 MB | 843 (was 601) | 108 (was 154) |
+| Qwen2.5-0.5B, q8_0 | 505 MB | 366 (was 223) | 40 (was 45) |
 | Qwen2.5-0.5B, q4 | 400 MB | 212 | 51 |
 | Qwen3-0.6B, q8_0 | 608 MB | 172 | 33 |
 | TinyLlama-1.1B, q8_0 | 1,116 MB | 93 | 23 |
 | Qwen2.5-1.5B, q8_0 | 1,569 MB | 69 | 16 |
-| Qwen2.5-1.5B, q4 | 1,187 MB | 67 | 19 |
+| Qwen2.5-1.5B, q4 | 1,187 MB | 158 (was 67) | 19 |
+
+The three rows marked "was" were re-measured after the interleaved weight layout and its
+batched kernels (`docs/ARCHITECTURE.md`, "Matrix products") on a shared machine, minimum of
+5 runs with other jobs on the cores (load average 4–6; 1 thread, where the runs are clean,
+prompt speed went 3.3–4.6× and generation 1.3–1.5×; `bench/results/prefill_after.txt`).
+The generation numbers in those rows are lower than the idle-machine numbers they replace
+because of that load, not because of the layout. The other rows are the earlier idle-machine
+measurements with the per-row kernels (`BORG_NO_REPACK=1` restores them) and understate
+what the current engine does for prompts.
 
 Compared with llama.cpp (build 59d5fad, Qwen2.5-0.5B-Instruct Q8_0, 128-token prompt,
 3 alternating runs; `bench/compare_llamacpp.sh`):
@@ -62,8 +71,15 @@ Compared with llama.cpp (build 59d5fad, Qwen2.5-0.5B-Instruct Q8_0, 128-token pr
 | | llama.cpp | 299–342 | 41–43 |
 | two other busy processes | borg | 124–130 | 25–27 |
 | | llama.cpp | 57–81 | 7–11 |
+| shared machine, one other busy process (interleaved layout) | borg | 343–365 | 39–40 |
+| | llama.cpp | 162–227 | 31–32 |
+| | borg, `BORG_NO_REPACK=1` | 142–145 | 32–34 |
+| | llama.cpp | 182–227 | 30–33 |
 
-llama.cpp evaluates prompts faster; borg generates about 10% faster on an idle machine
+With the per-row kernels llama.cpp evaluated prompts faster; with the interleaved layout
+borg's prompt speed on the shared machine (343–365 tok/s, minimum-of-3 session, the two
+engines alternating) is past llama.cpp's idle-machine 299–342, though an idle-machine
+re-measurement of both is still owed. borg generates about 10% faster on an idle machine
 and 2–4× faster when other programs compete for the cores. borg's thread pool finishes a
 step when its work items are done instead of waiting for every worker thread to be
 scheduled (see `docs/ARCHITECTURE.md`).

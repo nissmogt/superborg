@@ -4,7 +4,8 @@ const fs = require("fs");
 const path = require("path");
 const root = path.resolve(__dirname, "..", "..");
 const { Borg } = require(path.join(root, "wasm", "borg-runtime.js"));
-const { TraceSession, renderChat, stopStrings, topK } = require(path.join(root, "wasm", "trace-session.js"));
+const { TraceSession, renderChat, stopStrings, topK, attentionReport, residReport, prepareBasis, encodeRow } =
+  require(path.join(root, "wasm", "trace-session.js"));
 
 const create = (wasmPath) => (wasmPath.endsWith(".js")
   ? Borg.create(null, { asm: require(path.resolve(wasmPath)).borgAsmInstantiate, log: () => {} })
@@ -131,32 +132,50 @@ const cases = {
     for (const ev of s.streamChat([{ role: "user", content: req.chat }], { maxTokens: req.max_tokens })) {
       if (ev.type !== "token") continue;
       // the generator is suspended after the yield: the trace still holds this token's pass
-      const layers = s.lensLayers(), chosen = ev.id;
-      const f = ctx.lensSummary(layers, k, chosen);
+      const layers = s.lensLayers(), chosen = ev.id, rival = ev.rival[2];
+      const f = ctx.lensSummary(layers, k, [chosen, rival]);
       const z = ctx.lens(layers);
       const old = layers.map((li, r) => {
-        const row = z.subarray(r * V, r * V + n), zc = row[chosen];
-        let mx = -Infinity, rank = 0;
-        for (let i = 0; i < n; i++) { if (row[i] > mx) mx = row[i]; if (row[i] > zc) rank++; }
+        const row = z.subarray(r * V, r * V + n), zc = row[chosen], zr = row[rival];
+        let mx = -Infinity, rank = 0, rrank = 0;
+        for (let i = 0; i < n; i++) { if (row[i] > mx) mx = row[i]; if (row[i] > zc) rank++; if (row[i] > zr) rrank++; }
         let sum = 0;
         for (let i = 0; i < n; i++) sum += Math.exp(row[i] - mx);
         const lse = mx + Math.log(sum), top = topK(row, k);
-        return { top, p_top: top.map((t) => Math.exp(row[t] - lse)), p: Math.exp(zc - lse), rank, lse };
+        let ent = 0;  // -sum p log p over the whole row
+        for (let i = 0; i < n; i++) { const p = Math.exp(row[i] - lse); if (p > 0) ent -= p * Math.log(p); }
+        return { top, p_top: top.map((t) => Math.exp(row[t] - lse)), p: Math.exp(zc - lse), rank, lse, entropy: ent,
+                 rival_p: Math.exp(zr - lse), rival_rank: rrank };
       });
       s.opt.fusedLens = false;
-      const plainReport = s.lensReport(chosen);
+      const plainReport = s.lensReport(chosen, rival);
       s.opt.fusedLens = true;
       out.push({
-        id: chosen, layers,
-        fused: { top: Array.from(f.topIds), rank: Array.from(f.chosenRank), lse: Array.from(f.lse),
-                 p: Array.from(f.chosenLogit, (v, r) => Math.exp(v - f.lse[r])),
+        id: chosen, rival, layers,
+        fused: { top: Array.from(f.topIds), rank: Array.from(f.trackRank).filter((_, i) => i % 2 === 0),
+                 rival_rank: Array.from(f.trackRank).filter((_, i) => i % 2 === 1), lse: Array.from(f.lse),
+                 entropy: Array.from(f.entropy),
+                 p: layers.map((_, r) => Math.exp(f.trackLogit[2 * r] - f.lse[r])),
+                 rival_p: layers.map((_, r) => Math.exp(f.trackLogit[2 * r + 1] - f.lse[r])),
                  p_top: Array.from(f.topLogits, (v, i) => Math.exp(v - f.lse[Math.floor(i / k)])) },
-        old: { top: old.flatMap((o) => o.top), rank: old.map((o) => o.rank), lse: old.map((o) => o.lse),
-               p: old.map((o) => o.p), p_top: old.flatMap((o) => o.p_top) },
+        old: { top: old.flatMap((o) => o.top), rank: old.map((o) => o.rank), rival_rank: old.map((o) => o.rival_rank),
+               lse: old.map((o) => o.lse), entropy: old.map((o) => o.entropy), p: old.map((o) => o.p),
+               rival_p: old.map((o) => o.rival_p), p_top: old.flatMap((o) => o.p_top) },
         report: ev.lens, plain_report: plainReport,
       });
     }
     return { simd: borg.simd, tokens: out };
+  },
+
+  // the attention and residual summaries (attentionReport, residReport, encodeRow) on given arrays:
+  // tests/test_wasm.py runs superborg/interp.py's functions on the same input and compares
+  async report(req) {
+    const { L, H, KV, D, n, tokens, n_prompt, attn_top, head_top } = req;
+    const out = attentionReport(Float32Array.from(req.attn), Float32Array.from(req.vnorm), L, H, KV, n, tokens, n_prompt,
+                                attn_top, head_top);
+    out.resid = residReport(Float32Array.from(req.resid), L, D, req.basis ? prepareBasis(req.basis, L, D) : null);
+    out.rows = req.rows.map((r) => encodeRow(Float64Array.from(r), r.length));
+    return out;
   },
 
   // per-token milliseconds of decoding, of the old lens path (full logits + JavaScript summary)

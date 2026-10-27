@@ -53,6 +53,9 @@ $(BUILD):
 $(BUILD)/%.o: engine/%.c $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# the interleaved kernels give the same bits on every target, so no fused multiply-add here
+$(BUILD)/kernels.o: CFLAGS += -ffp-contract=off
+
 $(SHLIB): $(LIB_OBJ)
 	$(CC) $(SHFLAGS) -o $@ $^ $(LDLIBS)
 

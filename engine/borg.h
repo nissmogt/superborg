@@ -50,8 +50,11 @@ BORG_API int borg_pool_size(const borg_pool *pool);
 /* Returns NULL on failure and writes a message into err (if err != NULL). */
 BORG_API borg_model *borg_model_load(const char *path, char *err, int errlen);
 /* Load from a buffer holding a whole .borg file (for environments without files, e.g.
- * WebAssembly in a browser). The buffer must stay valid, unchanged and 64-byte aligned
- * until borg_model_free; the model does not take ownership. */
+ * WebAssembly in a browser). The buffer must stay valid and 64-byte aligned until
+ * borg_model_free; the model does not take ownership. Its quantized weight matrices are
+ * rewritten in place into the engine's interleaved layout (see docs/ARCHITECTURE.md), so
+ * the buffer is no longer a .borg image afterwards and cannot be loaded twice; set
+ * BORG_NO_REPACK=1 in the environment to leave it unchanged. */
 BORG_API borg_model *borg_model_load_memory(const void *data, size_t size, char *err, int errlen);
 BORG_API void borg_model_free(borg_model *model);
 BORG_API void borg_model_config(const borg_model *model, borg_config *out);
@@ -114,7 +117,8 @@ BORG_API int borg_ctx_load(borg_ctx *ctx, const char *path);
 /* Activation tracing for interpretability. When enabled, every borg_decode (and every target
  * pass of borg_generate) records the internals of the LAST token it processed: the residual
  * stream after each layer, each head's attention weights, the MLP hidden activations and
- * the sizes of each layer's contributions. Speculative batches trace their last row only. */
+ * the sizes of each layer's contributions. Speculative batches trace their last row only.
+ * The buffers are allocated on the first enable and kept; disabling only stops the recording. */
 BORG_API int borg_ctx_enable_trace(borg_ctx *ctx, int enable);
 /* Position of the traced token, or -1 if nothing has been traced yet. */
 BORG_API int borg_ctx_trace_pos(const borg_ctx *ctx);
@@ -126,25 +130,39 @@ BORG_API const float *borg_ctx_trace_attn(const borg_ctx *ctx, int layer, int he
 BORG_API const float *borg_ctx_trace_mlp(const borg_ctx *ctx, int layer);
 /* n_layers x 3 floats: norm of the attention output, of the MLP output, of the residual after. */
 BORG_API const float *borg_ctx_trace_norms(const borg_ctx *ctx);
+/* |v| of every cached position of a layer and kv head (n_ctx floats; entries past n_past are
+ * stale), for the effective attention alpha_j * |v_j| that ranks the positions a head really
+ * reads from. Written together with the value while tracing is on: positions evaluated before
+ * tracing was enabled (or while it was off) read 0; positions that arrive by borg_ctx_copy or
+ * borg_ctx_load are computed from the cached values. NULL until tracing was first enabled. */
+BORG_API const float *borg_ctx_trace_vnorm(const borg_ctx *ctx, int layer, int kv_head);
 /* Logit lens: apply the final norm and output projection to the traced residual of each
  * listed layer (0..n_layers) and write n * vocab_size logits. Layer n_layers gives the model's
  * own logits. Uses the context's scratch memory and pool; call between decodes. */
 BORG_API int borg_ctx_lens(borg_ctx *ctx, const int *layers, int n, float *logits);
 /* The logit lens summarized inside the engine, so that the n * vocab_size logits are never
  * written out: per listed layer, the k most likely tokens (logit descending, then id ascending),
- * the logit of `chosen` and its rank (the number of strictly greater logits), and the row's
- * log-sum-exp, the normalizer that turns a logit into a probability (p = exp(logit - lse)).
- * Only the first n_vocab logits take part (the tokenizer's vocabulary; 0 = all). Every logit is
- * computed by the kernel of borg_ctx_lens, so the values are identical; the exponentials, their
- * sums and the result are double precision. The output matrix is read once for all layers, in
- * row blocks spread over the pool, and the per-block partials are merged in a fixed order, so
- * the result does not depend on the thread count. Returns 0 on success, -1 with nothing traced,
- * -3 for a layer out of range, -4 for k outside 1..n_vocab, -5 for chosen outside 0..n_vocab-1,
- * -6 for n_vocab above vocab_size and -7 when out of memory. */
-BORG_API int borg_ctx_lens_summary(borg_ctx *ctx, const int *layers, int n, int n_vocab, int k, int32_t chosen,
+ * the logit and rank (the number of strictly greater logits) of each of the n_track tracked
+ * tokens (e.g. the chosen token and its rival), the row's log-sum-exp, the normalizer that
+ * turns a logit into a probability (p = exp(logit - lse)), and the row's Shannon entropy in
+ * nats (entropy may be NULL when not wanted; track, track_logit and track_rank may be NULL when
+ * n_track is 0). Only the first n_vocab logits take part (the tokenizer's vocabulary; 0 = all).
+ * Every logit is computed by the kernel of borg_ctx_lens, so the values are identical; the
+ * exponentials, their sums, the entropy and the result are double precision. The output matrix
+ * is read once for all layers, in row blocks spread over the pool, and the per-block partials
+ * are merged in a fixed order, so the result is bit-identical whatever the thread count.
+ * k is at most BORG_LENS_MAX_K: each block keeps its top list by insertion, quadratic in k.
+ * Returns 0 on success (also for n <= 0, which writes nothing), -1 with nothing traced,
+ * -2 for a NULL output pointer (top_ids, top_logits, lse; track, track_logit or track_rank
+ * with n_track > 0), -3 for a layer out of range, -4 for k outside 1..n_vocab, -5 for n_track
+ * below 0 or a tracked token outside 0..n_vocab-1, -6 for n_vocab above vocab_size, -7 when out
+ * of memory and -8 for k above BORG_LENS_MAX_K. */
+#define BORG_LENS_MAX_K 256
+BORG_API int borg_ctx_lens_summary(borg_ctx *ctx, const int *layers, int n, int n_vocab, int k,
+                                   const int32_t *track, int n_track,
                                    int32_t *top_ids /* [n][k], most likely first */, float *top_logits /* [n][k] */,
-                                   float *chosen_logit /* [n] */, int32_t *chosen_rank /* [n] */,
-                                   double *lse /* [n] */);
+                                   float *track_logit /* [n][n_track] */, int32_t *track_rank /* [n][n_track] */,
+                                   double *lse /* [n] */, double *entropy /* [n] or NULL */);
 
 /* Hidden state after the final norm for the last decoded token (dim floats). */
 BORG_API const float *borg_ctx_embedding(const borg_ctx *ctx);

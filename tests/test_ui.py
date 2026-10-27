@@ -230,7 +230,8 @@ def test_chat_streams_prompt_tokens_done(server, llm):
         assert len(t["attn_entropy"]) == n_layers and all(len(r) == n_heads for r in t["attn_entropy"])
         assert len(t["mlp_top"]) == n_layers
         assert all(len(r) == 6 and all(0 <= n < hidden for n, _ in r) for r in t["mlp_top"])
-        assert len(json.dumps(t)) < 16_000  # compact: about 10-12 KB per token for this model
+        # as streamed (no spaces): about 38 KB per token for this model at this context, see docs/TRACE.md
+        assert len(json.dumps(t, separators=(",", ":"))) < 64_000
     assert done["n_gen"] == sum(not t["eos"] for t in toks)
     assert done["stop_reason"] in ("eos", "length", "stop")
     assert done["text"] == "".join(t["text"] for t in toks)[:len(done["text"])]
@@ -650,7 +651,11 @@ def test_client_that_stops_reading_does_not_keep_the_model(server, llm, monkeypa
         sock.connect((host, port))
         try:
             _raw_chat(sock, dict(COUNT, max_tokens=300))
-            last, since, deadline = -1, time.time(), time.time() + 60
+            deadline = time.time() + 60
+            while not call(server, "GET", "/api/info")[2]["busy"]:  # on a loaded machine the request
+                assert time.time() < deadline, "the chat never started"  # takes a moment to be picked up
+                time.sleep(0.05)
+            last, since = -1, time.time()
             while time.time() - since < 1.0:  # stalled: no forward pass for a second
                 assert time.time() < deadline and call(server, "GET", "/api/info")[2]["busy"]
                 if llm.ctx.n_past != last:
@@ -696,3 +701,34 @@ def test_host_guard_when_bound_to_all_interfaces(llm):
         srv.shutdown()
         srv.server_close()
         th.join(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# chat_template_kwargs: further variables for the model's chat template
+
+def test_chat_template_kwargs(server, llm, monkeypatch):
+    """The chat body's chat_template_kwargs reach the model's chat template in both renders (the
+    400 check and stream_chat's), as superborg/server.py passes them; SmolLM2's template ignores
+    them, so the prompt keeps its length; the enable_thinking field wins over the kwargs' entry;
+    bad values are 400s with the server's messages."""
+    assert wait_idle(server)
+    seen, render = [], llm.formatter.render
+    monkeypatch.setattr(llm.formatter, "render", lambda messages, **kw: (seen.append(kw), render(messages, **kw))[1])
+    st, _, plain = chat(server, {"messages": Q, "max_tokens": 1, "temperature": 0})
+    assert st == 200 and seen and all(kw["enable_thinking"] is False and "date_string" not in kw for kw in seen)
+    seen.clear()
+    st, _, extra = chat(server, {"messages": Q, "max_tokens": 1, "temperature": 0,
+                                 "chat_template_kwargs": {"date_string": "16 Oct 2026", "enable_thinking": True}})
+    assert st == 200 and extra[-1]["type"] == "done" and extra[0]["n_prompt"] == plain[0]["n_prompt"]
+    assert len(seen) == 2 and all(kw["date_string"] == "16 Oct 2026" and kw["enable_thinking"] is True for kw in seen)
+    seen.clear()
+    st, _, _ = chat(server, {"messages": Q, "max_tokens": 1, "enable_thinking": False,
+                             "chat_template_kwargs": {"enable_thinking": True}})
+    assert st == 200 and seen and all(kw["enable_thinking"] is False for kw in seen)
+    for body, needle in [({"chat_template_kwargs": [1]}, "must be an object"),
+                         ({"chat_template_kwargs": {"enable_thinking": "yes"}}, "must be a boolean"),
+                         ({"chat_template_kwargs": {"messages": []}}, "cannot set 'messages'"),
+                         ({"chat_template_kwargs": {"add_generation_prompt": False}},
+                          "cannot set 'add_generation_prompt'")]:
+        st, _, out = call(server, "POST", "/api/chat", dict({"messages": Q}, **body))
+        assert st == 400 and needle in out["error"]["message"], out

@@ -32,7 +32,7 @@ Each piece is checked against the reference implementation, not just eyeballed:
 | incremental decoding | token-by-token vs. batched prefill | bit-identical |
 | batched multi-sequence decoding | vs. single-sequence decoding | bit-identical (f32) |
 | tokenizer | `tokenizers.Tokenizer.from_file` on an adversarial corpus | see `tests/test_tokenizer.py` |
-| kernels | every SIMD path vs. a double-precision reference | `make test-c`, run on AVX-512 VNNI, AVX2, scalar x86, NEON and NEON+dotprod (under QEMU) |
+| kernels | every SIMD path vs. a double-precision reference; the interleaved-layout kernels vs. their scalar contract, bit for bit, for every token count | `make test-c`, run on AVX-512 VNNI, AVX2, AVX-VNNI, scalar x86, NEON and NEON+dotprod (under QEMU), WebAssembly SIMD128 and scalar (under Node) |
 | speculative decoding | greedy output vs. plain greedy | identical tokens |
 
 Speed and memory come from the runtime and from quantization, not from changing the model.
@@ -41,10 +41,21 @@ Speed and memory come from the runtime and from quantization, not from changing 
 
 ### Memory
 
-The `.borg` file is memory-mapped, so loading takes milliseconds, nothing is copied, and
-several processes share one copy of the weights in the page cache. Every tensor starts on
-a 64-byte boundary. The KV cache is allocated per context, in float32 or float16, laid out
-`[layer][kv_head][position][head_dim]` so each attention head reads contiguous memory.
+The `.borg` file is memory-mapped and every tensor starts on a 64-byte boundary. Float
+tensors are used in place. Quantized matrices are repacked at load time into the
+interleaved layout of the batched kernels (below): a mapped file gets a malloc'ed copy and
+the mapped pages are released with `madvise(MADV_DONTNEED)`, so resident memory stays one
+model size (547 MB after loading and decoding with Qwen2.5-0.5B q8_0, against 546 MB
+without the repack); a buffer the engine read itself, or the caller's buffer given to
+`borg_model_load_memory` (the WebAssembly path), is converted in place through a one-group
+scratch, so that buffer is modified and must not be read back as a `.borg` file. Loading
+therefore reads and converts every quantized tensor instead of mapping the file lazily:
+about 0.55 s for the 525 MB Qwen2.5-0.5B q8_0 file and 1.2 s for the 1.24 GB Qwen2.5-1.5B q4
+file from the page cache (`bench/results/prefill_after.txt`; the conversion itself runs at
+2–3.6 GB/s, the rest is first-touch page faults of the new copy), against 25–40 ms before.
+`BORG_NO_REPACK=1` keeps the plain layout and the per-row kernels. The KV cache is
+allocated per context, in float32 or float16, laid out `[layer][kv_head][position][head_dim]`
+so each attention head reads contiguous memory.
 
 ### Quantization
 
@@ -84,13 +95,54 @@ finished dispatch. Idle workers spin briefly, then yield, then sleep.
 
 ### Forward pass
 
-Prompt tokens are processed in chunks (64 by default). Matrix products work on tiles of
-16 weight rows by 4 tokens, so the rows stay in L1 while each group of activations is read
-once per tile, and dedicated kernels unpack each weight block once for the four tokens.
-These kernels add up in the same order as the single-token kernels, so a token's logits do
-not depend on how it was batched (`tests/c/test_kernels.c` checks this bit for bit). The
-same batched path serves speculative verification and multi-sequence decoding: each row of
-a chunk carries its own KV cache and position, so rows may belong to different sequences.
+Prompt tokens are processed in chunks (64 by default). The same batched path serves
+speculative verification and multi-sequence decoding: each row of a chunk carries its own
+KV cache and position, so rows may belong to different sequences.
+
+**Matrix products.** Quantized matrices are stored in groups of 8 rows: per 32-element
+block, the 8 rows' fp16 scales (and offsets for q4_1), then the rows' quant bytes
+interleaved 4 bytes at a time, so one 32-byte load is 8 columns × 4 elements and a token's
+4 activation bytes are broadcast against it (`vpbroadcastd`, `vdupq_lane`); q8_0 bytes are
+stored as `w + 127` so the unsigned-by-signed dot instructions apply, and the offset comes
+out as `127 × Σx` in integer arithmetic (ik_llama.cpp's `_R8` recipe, oneDNN's s8s8
+compensation). A micro-kernel computes a tile of columns × tokens: 16 × 8 on AVX-512
+(two groups per zmm, 8 int32 and 8 fp32 accumulators), 8 × 4 on AVX2 (`vpdpbusd` with
+AVX-VNNI or AVX-512 VL, otherwise `maddubs` on sign-corrected weights), 8 × 4 on NEON
+(`sdot` by lane, or widening multiplies) and 8 × 4 on WebAssembly SIMD128 (`i32x4.dot_i16x8`
+on widened chunks). Per block it accumulates the exact int32 dot and then does one convert,
+one multiply and one add per token for the whole tile, instead of one per (row, token). The
+token loop is unrolled with macros so the accumulators stay in registers (left to the
+optimizer, the same kernel ran 3× slower). An 8 × 8 AVX2 tile was measured against 8 × 4
+on the benchmark machine with the 16-column path disabled: with `vpdpbusd` it spills (16
+ymm registers) and runs q8_0 at 41–43 GMAC/s against 70–71 for 8 × 4, and with `maddubs`
+the two are within noise of each other, so AVX2 keeps 8 × 4. Larger forward chunks were
+measured too (`bench/bench_nbatch.py`): a 256-token prompt in chunks of 32/64/128/256
+tokens ran at 337/335/340/382 tok/s for Qwen2.5-0.5B q8_0 and 506/610/667/712 tok/s for
+SmolLM2-135M q4 on 4 threads, so the activation panel of a chunk does not fall out of cache
+at these sizes and no token-panel blocking is needed (a larger default `n_batch` would gain
+10–15%; it stays at 64 here).
+
+The numerical contract is the same for every kernel and every token count: exact int32 per
+block, then `acc = acc + (d_w · d_x) · float(dot)` (plus `m_w · s_x` for q4_1) in block
+order, each operation rounded to float and never fused (WebAssembly has no FMA, and the
+scalar, AVX2, AVX-512, NEON and WebAssembly kernels must agree bit for bit; kernels.c is
+compiled with `-ffp-contract=off`). A token's logits therefore do not depend on how it was
+batched, which speculative decoding relies on, and the same instantiations serve decoding
+(one token), small batches and prefill. `tests/c/test_kernels.c` checks every kernel against
+the scalar contract for T ∈ {1, 2, 3, 4, 5, 8, 16, 17, 64} on every build, and
+`tests/test_engine.py` checks whole-model logits across chunk sizes.
+
+On the benchmark machine (Emerald Rapids, AVX-512 VNNI; shared with other jobs, minimum of
+7 runs) the q8_0 kernel runs at 82/110/93 GMAC/s per core for T = 4/16/64 and 24 GMAC/s at
+T = 1, against 20/17/18 and 13 for the previous per-row tiles (`bench/bench_kernels.c`,
+2048 × 2048); a 64-token prefill of Qwen2.5-0.5B q8_0 on one thread went from 1084 to 388 ms,
+with the matrix products now 79% of it instead of 95% and the activation function,
+attention and activation quantization the next largest phases (`bench/results/prefill_after.txt`).
+The next step on this class of machine would be an AMX tile kernel (`tdpbusd`, 16×16×64 per
+instruction, about 5× the VNNI peak per core) for T ≥ 32, keeping the VNNI kernels for
+decoding and for machines without AMX; it is not done here. The chunking of `matmul()` in
+`forward.c` hands out row ranges that are not multiples of 16, so the partial groups at the
+ends of a range are computed in full and stored in part.
 
 ### Generation
 

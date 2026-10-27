@@ -14,6 +14,7 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
+LENS_MAX_K = 256  # BORG_LENS_MAX_K: top tokens per lens row (the engine keeps them by insertion)
 
 
 def _lib_names() -> list[str]:
@@ -113,10 +114,11 @@ def lib():
         "borg_ctx_trace_attn": (fp, [vp, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]),
         "borg_ctx_trace_mlp": (fp, [vp, ctypes.c_int]),
         "borg_ctx_trace_norms": (fp, [vp]),
+        "borg_ctx_trace_vnorm": (fp, [vp, ctypes.c_int, ctypes.c_int]),
         "borg_ctx_lens": (ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.c_int, fp]),
         "borg_ctx_lens_summary": (ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,
-                                                 ctypes.c_int, ctypes.c_int32, i32p, fp, fp, i32p,
-                                                 ctypes.POINTER(ctypes.c_double)]),
+                                                 ctypes.c_int, i32p, ctypes.c_int, i32p, fp, fp, i32p,
+                                                 ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]),
         "borg_ctx_save": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_ctx_load": (ctypes.c_int, [vp, ctypes.c_char_p]),
         "borg_generate_multi": (ctypes.c_int, [ctypes.POINTER(vp), ctypes.c_int, i32p, ctypes.c_int,
@@ -411,26 +413,44 @@ class Context:
     def trace(self, attention: bool = True, mlp: bool = True) -> dict | None:
         """Internals of the last traced token as NumPy arrays (copies), or None.
 
-        pos: its position; resid [n_layers + 1, dim]: embeddings then each layer's output;
+        pos: its position; tokens [pos + 1]: the context's token ids up to it;
+        resid [n_layers + 1, dim]: embeddings then each layer's output;
         norms [n_layers, 3]: |attention output|, |MLP output|, |residual after|;
-        attn [n_layers, n_heads, pos + 1]: attention weights; mlp [n_layers, hidden_dim]."""
+        attn [n_layers, n_heads, pos + 1]: attention weights; vnorm [n_layers, n_kv_heads, pos + 1]:
+        |v| of each cached position (0 for positions cached while tracing was off);
+        mlp [n_layers, hidden_dim]."""
         L = lib()
         pos = L.borg_ctx_trace_pos(self._c)
         if pos < 0:
             return None
         cfg = self.model.config
-        nl, d, nh, f = cfg["n_layers"], cfg["dim"], cfg["n_heads"], cfg["hidden_dim"]
+        nl, d, nh, nkv, f = cfg["n_layers"], cfg["dim"], cfg["n_heads"], cfg["n_kv_heads"], cfg["hidden_dim"]
         resid = np.ctypeslib.as_array(L.borg_ctx_trace_resid(self._c, 0), shape=((nl + 1) * d,))
         out = {"pos": pos, "resid": resid.reshape(nl + 1, d).copy(),
+               "tokens": np.ctypeslib.as_array(L.borg_ctx_tokens(self._c), shape=(pos + 1,)).copy(),
                "norms": np.ctypeslib.as_array(L.borg_ctx_trace_norms(self._c), shape=(nl * 3,)).reshape(nl, 3).copy()}
         if attention:
             n = ctypes.c_int(0)
             base = L.borg_ctx_trace_attn(self._c, 0, 0, ctypes.byref(n))
             full = np.ctypeslib.as_array(base, shape=(nl * nh * self.n_ctx,)).reshape(nl, nh, self.n_ctx)
             out["attn"] = full[:, :, : n.value].copy()
+            vn = np.ctypeslib.as_array(L.borg_ctx_trace_vnorm(self._c, 0, 0), shape=(nl * nkv * self.n_ctx,))
+            out["vnorm"] = vn.reshape(nl, nkv, self.n_ctx)[:, :, : n.value].copy()
         if mlp:
             out["mlp"] = np.ctypeslib.as_array(L.borg_ctx_trace_mlp(self._c, 0), shape=(nl * f,)).reshape(nl, f).copy()
         return out
+
+    def trace_vnorm(self) -> np.ndarray | None:
+        """|v| of every cached position, [n_layers, n_kv_heads, n_past] (a copy), or None before
+        tracing was first enabled. Positions cached while tracing was off read 0."""
+        L = lib()
+        p = L.borg_ctx_trace_vnorm(self._c, 0, 0)
+        if not p:
+            return None
+        cfg = self.model.config
+        nl, nkv = cfg["n_layers"], cfg["n_kv_heads"]
+        full = np.ctypeslib.as_array(p, shape=(nl * nkv * self.n_ctx,)).reshape(nl, nkv, self.n_ctx)
+        return full[:, :, : self.n_past].copy()
 
     def lens(self, layers: Sequence[int]) -> np.ndarray:
         """Logit lens of the traced token: final norm + output projection applied to the
@@ -446,35 +466,42 @@ class Context:
                               -3: "layer out of range"}.get(rc, f"lens failed ({rc})"))
         return out
 
-    def lens_summary(self, layers: Sequence[int], k: int, chosen: int, n_vocab: int | None = None) -> dict:
+    def lens_summary(self, layers: Sequence[int], k: int, track: int | Sequence[int] = (),
+                     n_vocab: int | None = None) -> dict:
         """The logit lens of the traced token summarized inside the engine (borg_ctx_lens_summary),
         without the [n_lens, vocab] logits ever leaving C. Per listed layer: the k most likely
         tokens (top_ids [n, k], logit descending then id ascending, and their top_logits), the
-        logit of `chosen` (chosen_logit [n]), its rank (chosen_rank [n]: the number of strictly
-        greater logits) and the row's log-sum-exp (lse [n], float64), so that a probability is
-        exp(logit - lse). Only the first n_vocab logits take part (None: the tokenizer's
-        vocabulary; 0: every row of the output matrix)."""
+        logit and rank (the number of strictly greater logits) of every tracked token
+        (track_logit and track_rank, [n, n_track]; `track` is one id or a sequence, e.g. the
+        chosen token and its rival), the row's log-sum-exp (lse [n], float64), so that a
+        probability is exp(logit - lse), and the row's Shannon entropy in nats (entropy [n],
+        float64). Only the first n_vocab logits take part (None: the tokenizer's vocabulary;
+        0: every row of the output matrix). k is at most LENS_MAX_K."""
         layers = list(layers)
-        n = len(layers)
+        track = [int(track)] if isinstance(track, (int, np.integer)) else [int(t) for t in track]
+        n, nt = len(layers), len(track)
         nv = self.model.n_vocab if n_vocab is None else int(n_vocab)
         top_ids = np.empty((n, k), dtype=np.int32)
         top_logits = np.empty((n, k), dtype=np.float32)
-        chosen_logit = np.empty(n, dtype=np.float32)
-        chosen_rank = np.empty(n, dtype=np.int32)
+        track_logit = np.empty((n, nt), dtype=np.float32)
+        track_rank = np.empty((n, nt), dtype=np.int32)
         lse = np.empty(n, dtype=np.float64)
+        entropy = np.empty(n, dtype=np.float64)
         if n:
             arr = (ctypes.c_int * n)(*layers)
-            i32p, fp = ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float)
-            rc = lib().borg_ctx_lens_summary(self._c, arr, n, nv, int(k), int(chosen), top_ids.ctypes.data_as(i32p),
-                                             top_logits.ctypes.data_as(fp), chosen_logit.ctypes.data_as(fp),
-                                             chosen_rank.ctypes.data_as(i32p),
-                                             lse.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+            tr = (ctypes.c_int32 * max(nt, 1))(*track)
+            i32p, fp, dp = ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_double)
+            rc = lib().borg_ctx_lens_summary(self._c, arr, n, nv, int(k), tr, nt, top_ids.ctypes.data_as(i32p),
+                                             top_logits.ctypes.data_as(fp), track_logit.ctypes.data_as(fp),
+                                             track_rank.ctypes.data_as(i32p), lse.ctypes.data_as(dp),
+                                             entropy.ctypes.data_as(dp))
             if rc != 0:
                 raise ValueError({-1: "nothing traced yet (enable_trace, then decode)", -3: "layer out of range",
-                                  -4: "k must be between 1 and n_vocab", -5: "chosen token out of range",
-                                  -6: "n_vocab out of range", -7: "out of memory"}.get(rc, f"lens failed ({rc})"))
-        return {"top_ids": top_ids, "top_logits": top_logits, "chosen_logit": chosen_logit,
-                "chosen_rank": chosen_rank, "lse": lse}
+                                  -4: "k must be between 1 and n_vocab", -5: "tracked token out of range",
+                                  -6: "n_vocab out of range", -7: "out of memory",
+                                  -8: f"k must be at most {LENS_MAX_K}"}.get(rc, f"lens failed ({rc})"))
+        return {"top_ids": top_ids, "top_logits": top_logits, "track_logit": track_logit, "track_rank": track_rank,
+                "lse": lse, "entropy": entropy}
 
     def embedding(self) -> np.ndarray:
         p = lib().borg_ctx_embedding(self._c)

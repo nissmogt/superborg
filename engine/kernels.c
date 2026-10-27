@@ -1,4 +1,5 @@
-/* Numeric kernels: float16 conversion, activation quantization, dot products.
+/* Numeric kernels: float16 conversion, activation quantization, dot products and the matrix
+ * products on the interleaved weight layout.
  *
  * Each kernel has a portable scalar version. SIMD versions are compiled in when the
  * target supports them: AVX2 (+FMA, F16C), AVX-512 VNNI on x86, NEON (+dotprod) on ARM.
@@ -6,7 +7,17 @@
 #include "internal.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* The interleaved-layout kernels promise the same float result on every target; WebAssembly has
+ * no fused multiply-add, so their products and sums must not be contracted into one here either
+ * (gcc fuses mul + add intrinsics by default; the Makefile also passes -ffp-contract=off). */
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#elif defined(__GNUC__)
+#pragma GCC optimize("fp-contract=off")
+#endif
 
 #if defined(__AVX2__) && defined(__FMA__)
 #define BORG_AVX2 1
@@ -159,6 +170,7 @@ void quantize_row_q8a(const float *x, block_q8a *y, int n) {
         }
 #endif
         y[i].s = d * (float)sum;
+        y[i].sum = sum;
     }
 }
 
@@ -488,10 +500,651 @@ static float vec_dot_q4_1_q8a(const block_q4_1 *w, const block_q8a *x, int nb) {
     return sum;
 }
 
+/* ---- interleaved weight layout (MAT_X8) ----------------------------------
+ * The batched kernels read quantized matrices in groups of 8 rows (mat_repack_x8, applied when a
+ * model is loaded). Per 32-element block a group stores the 8 rows' scales (8 fp16 d, then 8 fp16
+ * m for q4_1) followed by the rows' quant bytes interleaved 4 bytes at a time: chunk j holds
+ * bytes 4j..4j+3 of row 0, then of row 1, ... of row 7, so one 32-byte load is 8 columns x 4
+ * elements and a token's 4 activation bytes are broadcast against it. q8_0 bytes are stored as
+ * w + 127 (unsigned, for the u8 x s8 dot instructions); q4 nibbles stay unsigned. A group takes
+ * the 8 * row_bytes bytes its rows took; rows past the end of a matrix (rows % 8 != 0) are zero.
+ *
+ * Numerical contract, the same for every kernel and token count: per (column, token) and block,
+ * the exact int32 dot of the codes (the weight offsets 127 and 8 come out as 127 * sum(x) and
+ * 8 * sum(x), also in int32), then acc = acc + (d_w * d_x) * float(dot) and, for q4_1,
+ * acc = acc + m_w * s_x, in block order, each operation rounded to float. Single-token and
+ * batched evaluation therefore agree bit for bit, and so do the scalar, AVX2, AVX-512, NEON and
+ * WebAssembly kernels (tests/c/test_kernels.c checks both). */
+static int x8_hdr(borg_dtype dt) { return dt == DT_Q4_1 ? 32 : 16; }    /* scale bytes per group block */
+static int x8_qb(borg_dtype dt) { return dt == DT_Q8_0 ? QK : QK / 2; } /* quant bytes per row and block */
+static int x8_comp(borg_dtype dt) { return dt == DT_Q8_0 ? 127 : dt == DT_Q4_0 ? 8 : 0; } /* weight offset */
+
+static inline uint16_t x8_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+#if defined(BORG_AVX2)
+static inline int32_t x8_dword(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return v; }
+#endif
+
+size_t mat_x8_bytes(const borg_mat *m) { return (size_t)((m->rows + 7) / 8) * 8 * m->row_bytes; }
+
+int mat_repack_x8(const borg_mat *m, void *dst) {
+    const borg_dtype dt = m->dtype;
+    const int nb = m->cols / QK, hdr = x8_hdr(dt), qb = x8_qb(dt), gb = hdr + 8 * qb;
+    const int bb = (int)(m->row_bytes / (size_t)nb); /* bytes of a plain block */
+    const int ng = (m->rows + 7) / 8;
+    const size_t gbytes = 8 * m->row_bytes;
+    const int in_place = dst == m->data;
+    uint8_t *tmp = NULL;
+    if (in_place && !(tmp = (uint8_t *)malloc(gbytes))) return -1;
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *src = (const uint8_t *)m->data + (size_t)g * gbytes;
+        uint8_t *out = (uint8_t *)dst + (size_t)g * gbytes;
+        if (in_place) { /* the group's rows are overwritten by its own output */
+            memcpy(tmp, src, gbytes);
+            src = tmp;
+        }
+        if (g * 8 + 8 > m->rows) memset(out, 0, gbytes);
+        for (int r = 0; r < 8 && g * 8 + r < m->rows; r++) {
+            const uint8_t *row = src + (size_t)r * m->row_bytes;
+            for (int b = 0; b < nb; b++) {
+                const uint8_t *blk = row + (size_t)b * bb;
+                uint8_t *ob = out + (size_t)b * gb;
+                memcpy(ob + 2 * r, blk, 2);
+                if (dt == DT_Q4_1) memcpy(ob + 16 + 2 * r, blk + 2, 2);
+                const uint8_t *q = blk + (dt == DT_Q4_1 ? 4 : 2);
+                uint8_t *oq = ob + hdr + 4 * r;
+                for (int j = 0; j < qb / 4; j++) {
+                    uint32_t v;
+                    memcpy(&v, q + 4 * j, 4);
+                    /* q8_0: 127 added to each byte modulo 256, with no carry between bytes */
+                    if (dt == DT_Q8_0) v = ((v & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) ^ (v & 0x80808080u);
+                    memcpy(oq + 32 * j, &v, 4);
+                }
+            }
+        }
+    }
+    free(tmp);
+    return 0;
+}
+
+/* Dequantize row r of an interleaved matrix (the same arithmetic as the plain layout). */
+static void x8_get_row(const borg_mat *m, int r, float *out) {
+    const borg_dtype dt = m->dtype;
+    const int nb = m->cols / QK, hdr = x8_hdr(dt), gb = hdr + 8 * x8_qb(dt), lane = r % 8;
+    const uint8_t *grp = (const uint8_t *)m->data + (size_t)(r / 8) * 8 * m->row_bytes;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = grp + (size_t)b * gb, *q = p + hdr + 4 * lane;
+        const float d = fp16_to_fp32(x8_u16(p + 2 * lane));
+        float *o = out + b * QK;
+        if (dt == DT_Q8_0) {
+            for (int j = 0; j < 8; j++)
+                for (int k = 0; k < 4; k++) o[4 * j + k] = d * (float)((int)q[32 * j + k] - 127);
+        } else if (dt == DT_Q4_0) {
+            for (int j = 0; j < 4; j++)
+                for (int k = 0; k < 4; k++) {
+                    o[4 * j + k] = d * (float)((int)(q[32 * j + k] & 0x0F) - 8);
+                    o[16 + 4 * j + k] = d * (float)((int)(q[32 * j + k] >> 4) - 8);
+                }
+        } else {
+            const float mn = fp16_to_fp32(x8_u16(p + 16 + 2 * lane));
+            for (int j = 0; j < 4; j++)
+                for (int k = 0; k < 4; k++) {
+                    o[4 * j + k] = d * (float)(q[32 * j + k] & 0x0F) + mn;
+                    o[16 + 4 * j + k] = d * (float)(q[32 * j + k] >> 4) + mn;
+                }
+        }
+    }
+}
+
+/* The contract spelled out: the reference for the SIMD kernels and the kernel of builds without
+ * SIMD. The product and the sum are separate statements so that no compiler fuses them. */
+void mat_mul_rows_scalar(const borg_mat *m, int r0, int r1, int T, const block_q8a *xq, int ldxq, float *out, int ldo,
+                         int ro) {
+    const borg_dtype dt = m->dtype;
+    const int nb = m->cols / QK, hdr = x8_hdr(dt), gb = hdr + 8 * x8_qb(dt), comp = x8_comp(dt);
+    for (int r = r0; r < r1; r++) {
+        const uint8_t *grp = (const uint8_t *)m->data + (size_t)(r / 8) * 8 * m->row_bytes;
+        const int lane = r % 8;
+        for (int t = 0; t < T; t++) {
+            const block_q8a *x = xq + (size_t)t * ldxq;
+            float acc = 0.0f;
+            for (int b = 0; b < nb; b++) {
+                const uint8_t *p = grp + (size_t)b * gb, *q = p + hdr + 4 * lane;
+                int32_t dot = 0;
+                if (dt == DT_Q8_0) {
+                    for (int j = 0; j < 8; j++)
+                        for (int k = 0; k < 4; k++) dot += (int)q[32 * j + k] * x[b].qs[4 * j + k];
+                } else {
+                    for (int j = 0; j < 4; j++)
+                        for (int k = 0; k < 4; k++) {
+                            dot += (int)(q[32 * j + k] & 0x0F) * x[b].qs[4 * j + k];
+                            dot += (int)(q[32 * j + k] >> 4) * x[b].qs[16 + 4 * j + k];
+                        }
+                }
+                dot -= comp * x[b].sum;
+                const float s = fp16_to_fp32(x8_u16(p + 2 * lane)) * x[b].d;
+                const float prod = s * (float)dot;
+                acc = acc + prod;
+                if (dt == DT_Q4_1) {
+                    const float mterm = fp16_to_fp32(x8_u16(p + 16 + 2 * lane)) * x[b].s;
+                    acc = acc + mterm;
+                }
+            }
+            out[(size_t)t * ldo + (size_t)(r - ro)] = acc;
+        }
+    }
+}
+
+/* X8_EACH(N, M) expands M(0) ... M(N-1): the SIMD kernels unroll their token loops this way so
+ * that every accumulator is a register (left to the optimizer, a rolled loop keeps them in memory
+ * and runs about 3x slower). */
+#define X8_T1(M) M(0)
+#define X8_T2(M) X8_T1(M) M(1)
+#define X8_T3(M) X8_T2(M) M(2)
+#define X8_T4(M) X8_T3(M) M(3)
+#define X8_T5(M) X8_T4(M) M(4)
+#define X8_T6(M) X8_T5(M) M(5)
+#define X8_T7(M) X8_T6(M) M(6)
+#define X8_T8(M) X8_T7(M) M(7)
+#define X8_EACH_(N, M) X8_T##N(M)
+#define X8_EACH(N, M) X8_EACH_(N, M)
+
+/* A SIMD kernel computes 8 columns of row group g0 (16 on AVX-512: groups g0 and g1) against the
+ * tokens xs[0..NT-1] and stores lanes [lo, hi) of each token's result at out + t * ldo. */
+typedef void (*x8_kernel)(const uint8_t *g0, const uint8_t *g1, int nb, const block_q8a *const *xs, float *out,
+                          int ldo, int lo, int hi);
+
+#if defined(BORG_VNNI)
+/* AVX-512: 16 columns x up to 8 tokens. The two groups' chunks share one zmm (8 columns x 4
+ * elements each) and each token's 4 activation bytes are a broadcast dword, 8 dpbusd per token
+ * and block into an int32 vector, then one convert, multiply and add. With 4 tokens or fewer
+ * the even and odd chunks use separate int32 accumulators (ia, ib) so the dot chains are
+ * shorter; the sum is the same. */
+static inline __m512i z_load2(const uint8_t *a, const uint8_t *b) {
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)a)),
+                              _mm256_loadu_si256((const __m256i *)b), 1);
+}
+static inline __m512 z_scales(const uint8_t *a, const uint8_t *b) {
+    return _mm512_cvtph_ps(_mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)a)),
+                                                   _mm_loadu_si128((const __m128i *)b), 1));
+}
+static inline void z_store(float *o, int lo, int hi, __m512 v) {
+    if (lo == 0 && hi == 16) _mm512_storeu_ps(o, v);
+    else _mm512_mask_compressstoreu_ps(o, (__mmask16)(((1u << hi) - 1) & ~((1u << lo) - 1)), v);
+}
+#define Z_DECL(t)                                                                          \
+    const block_q8a *x##t = xs[t];                                                         \
+    __m512i ia##t = _mm512_setzero_si512(), ib##t = _mm512_setzero_si512();                \
+    __m512 acc##t = _mm512_setzero_ps();
+#define Z_ZERO(t) ia##t = _mm512_setzero_si512(); ib##t = _mm512_setzero_si512();
+#define Z_DOTA(t) ia##t = _mm512_dpbusd_epi32(ia##t, w, _mm512_set1_epi32(x8_dword(x##t[b].qs + xo)));
+#define Z_DOTB(t) ib##t = _mm512_dpbusd_epi32(ib##t, w, _mm512_set1_epi32(x8_dword(x##t[b].qs + xo)));
+#define Z_FIN(t)                                                                                          \
+    {                                                                                                     \
+        const __m512i d = _mm512_sub_epi32(_mm512_add_epi32(ia##t, ib##t), _mm512_set1_epi32(comp * x##t[b].sum)); \
+        acc##t = _mm512_add_ps(acc##t, _mm512_mul_ps(_mm512_mul_ps(dw, _mm512_set1_ps(x##t[b].d)), _mm512_cvtepi32_ps(d))); \
+    }
+#define Z_FIN41(t) acc##t = _mm512_add_ps(acc##t, _mm512_mul_ps(mw, _mm512_set1_ps(x##t[b].s)));
+#define Z_STORE(t) z_store(out + (size_t)t * ldo, lo, hi, acc##t);
+#define Z_BLOCK_Q8(NT, ODD)                                                                                    \
+    for (int j = 0; j < 8; j += 2) {                                                                           \
+        { const __m512i w = z_load2(p0 + 16 + 32 * j, p1 + 16 + 32 * j); const int xo = 4 * j; X8_EACH(NT, Z_DOTA) } \
+        { const __m512i w = z_load2(p0 + 48 + 32 * j, p1 + 48 + 32 * j); const int xo = 4 * j + 4; X8_EACH(NT, ODD) } \
+    }
+/* low nibbles of chunk j pair with activation bytes 4j.., high nibbles with 16 + 4j.. */
+#define Z_BLOCK_Q4(NT, ODD)                                                                                    \
+    for (int j = 0; j < 4; j++) {                                                                              \
+        const __m512i raw = z_load2(p0 + hdr + 32 * j, p1 + hdr + 32 * j);                                     \
+        { const __m512i w = _mm512_and_si512(raw, m4); const int xo = 4 * j; X8_EACH(NT, Z_DOTA) }            \
+        { const __m512i w = _mm512_and_si512(_mm512_srli_epi16(raw, 4), m4); const int xo = 16 + 4 * j; X8_EACH(NT, ODD) } \
+    }
+#define Z_M41(NT) { const __m512 mw = z_scales(p0 + 16, p1 + 16); X8_EACH(NT, Z_FIN41) }
+#define Z_KERNEL(NAME, NT, ODD, BLOCK, HDR, GB, COMP, M41)                                                    \
+    static void NAME(const uint8_t *g0, const uint8_t *g1, int nb, const block_q8a *const *xs, float *out, int ldo, \
+                     int lo, int hi) {                                                                         \
+        const int hdr = HDR, comp = COMP;                                                                      \
+        const __m512i m4 = _mm512_set1_epi8(0x0F);                                                             \
+        (void)hdr; (void)m4;                                                                                   \
+        X8_EACH(NT, Z_DECL)                                                                                    \
+        for (int b = 0; b < nb; b++) {                                                                         \
+            const uint8_t *p0 = g0 + (size_t)b * GB, *p1 = g1 + (size_t)b * GB;                                \
+            X8_EACH(NT, Z_ZERO)                                                                                \
+            BLOCK(NT, ODD)                                                                                     \
+            const __m512 dw = z_scales(p0, p1);                                                                \
+            X8_EACH(NT, Z_FIN)                                                                                 \
+            M41                                                                                                \
+        }                                                                                                      \
+        X8_EACH(NT, Z_STORE)                                                                                   \
+    }
+Z_KERNEL(z_q8_0_t1, 1, Z_DOTB, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t2, 2, Z_DOTB, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t3, 3, Z_DOTB, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t4, 4, Z_DOTB, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t5, 5, Z_DOTA, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t6, 6, Z_DOTA, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t7, 7, Z_DOTA, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q8_0_t8, 8, Z_DOTA, Z_BLOCK_Q8, 16, 272, 127, )
+Z_KERNEL(z_q4_0_t1, 1, Z_DOTB, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t2, 2, Z_DOTB, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t3, 3, Z_DOTB, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t4, 4, Z_DOTB, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t5, 5, Z_DOTA, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t6, 6, Z_DOTA, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t7, 7, Z_DOTA, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_0_t8, 8, Z_DOTA, Z_BLOCK_Q4, 16, 144, 8, )
+Z_KERNEL(z_q4_1_t1, 1, Z_DOTB, Z_BLOCK_Q4, 32, 160, 0, Z_M41(1))
+Z_KERNEL(z_q4_1_t2, 2, Z_DOTB, Z_BLOCK_Q4, 32, 160, 0, Z_M41(2))
+Z_KERNEL(z_q4_1_t3, 3, Z_DOTB, Z_BLOCK_Q4, 32, 160, 0, Z_M41(3))
+Z_KERNEL(z_q4_1_t4, 4, Z_DOTB, Z_BLOCK_Q4, 32, 160, 0, Z_M41(4))
+Z_KERNEL(z_q4_1_t5, 5, Z_DOTA, Z_BLOCK_Q4, 32, 160, 0, Z_M41(5))
+Z_KERNEL(z_q4_1_t6, 6, Z_DOTA, Z_BLOCK_Q4, 32, 160, 0, Z_M41(6))
+Z_KERNEL(z_q4_1_t7, 7, Z_DOTA, Z_BLOCK_Q4, 32, 160, 0, Z_M41(7))
+Z_KERNEL(z_q4_1_t8, 8, Z_DOTA, Z_BLOCK_Q4, 32, 160, 0, Z_M41(8))
+static const x8_kernel z_kernels[3][9] = {
+    {NULL, z_q8_0_t1, z_q8_0_t2, z_q8_0_t3, z_q8_0_t4, z_q8_0_t5, z_q8_0_t6, z_q8_0_t7, z_q8_0_t8},
+    {NULL, z_q4_0_t1, z_q4_0_t2, z_q4_0_t3, z_q4_0_t4, z_q4_0_t5, z_q4_0_t6, z_q4_0_t7, z_q4_0_t8},
+    {NULL, z_q4_1_t1, z_q4_1_t2, z_q4_1_t3, z_q4_1_t4, z_q4_1_t5, z_q4_1_t6, z_q4_1_t7, z_q4_1_t8},
+};
+#endif /* BORG_VNNI */
+
+#if defined(BORG_AVX2)
+/* AVX2: 8 columns x up to 4 tokens in ymm registers (on AVX-512 machines these serve a group
+ * without a partner). With a u8 x s8 dot instruction (AVX-512 VL or AVX-VNNI) the weight bytes
+ * are used as stored. The maddubs fallback saturates its int16 pairs, so there q8_0 goes
+ * through signed weights, |w| * sign(x, w), whose pairs stay below 2^15 and need no offset
+ * correction; q4 nibbles are small enough as they are. */
+#if defined(BORG_VNNI) || defined(__AVXVNNI__)
+#define Y_U8 1
+#define Y_Q8_COMP 127
+static inline __m256i y_dpbusd(__m256i acc, __m256i w, __m256i x) {
+#if defined(BORG_VNNI)
+    return _mm256_dpbusd_epi32(acc, w, x);
+#else
+    return _mm256_dpbusd_avx_epi32(acc, w, x);
+#endif
+}
+#else
+#define Y_U8 0
+#define Y_Q8_COMP 0
+static inline __m256i y_dpbusd(__m256i acc, __m256i w, __m256i x) {
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), _mm256_set1_epi16(1)));
+}
+#endif
+static inline __m256 y_scales(const uint8_t *p) {
+#if defined(__F16C__)
+    return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+#else
+    float f[8];
+    for (int i = 0; i < 8; i++) f[i] = fp16_to_fp32(x8_u16(p + 2 * i));
+    return _mm256_loadu_ps(f);
+#endif
+}
+static inline void y_store(float *o, int lo, int hi, __m256 v) {
+    if (lo == 0 && hi == 8) {
+        _mm256_storeu_ps(o, v);
+    } else {
+        float tmp[8];
+        _mm256_storeu_ps(tmp, v);
+        memcpy(o, tmp + lo, (size_t)(hi - lo) * sizeof(float));
+    }
+}
+#define Y_DECL(t)                                                                          \
+    const block_q8a *x##t = xs[t];                                                         \
+    __m256i ia##t = _mm256_setzero_si256(), ib##t = _mm256_setzero_si256();                \
+    __m256 acc##t = _mm256_setzero_ps();
+#define Y_ZERO(t) ia##t = _mm256_setzero_si256(); ib##t = _mm256_setzero_si256();
+#define Y_DOTA(t) ia##t = y_dpbusd(ia##t, w, _mm256_set1_epi32(x8_dword(x##t[b].qs + xo)));
+#define Y_DOTB(t) ib##t = y_dpbusd(ib##t, w, _mm256_set1_epi32(x8_dword(x##t[b].qs + xo)));
+#define Y_DOTSA(t) ia##t = y_dpbusd(ia##t, w, _mm256_sign_epi8(_mm256_set1_epi32(x8_dword(x##t[b].qs + xo)), ws));
+#define Y_DOTSB(t) ib##t = y_dpbusd(ib##t, w, _mm256_sign_epi8(_mm256_set1_epi32(x8_dword(x##t[b].qs + xo)), ws));
+#define Y_FIN(t)                                                                                          \
+    {                                                                                                     \
+        const __m256i d = _mm256_sub_epi32(_mm256_add_epi32(ia##t, ib##t), _mm256_set1_epi32(comp * x##t[b].sum)); \
+        acc##t = _mm256_add_ps(acc##t, _mm256_mul_ps(_mm256_mul_ps(dw, _mm256_set1_ps(x##t[b].d)), _mm256_cvtepi32_ps(d))); \
+    }
+#define Y_FIN41(t) acc##t = _mm256_add_ps(acc##t, _mm256_mul_ps(mw, _mm256_set1_ps(x##t[b].s)));
+#define Y_STORE(t) y_store(out + (size_t)t * ldo, lo, hi, acc##t);
+#if Y_U8
+#define Y_BLOCK_Q8(NT, ODD)                                                                                    \
+    for (int j = 0; j < 8; j += 2) {                                                                           \
+        { const __m256i w = _mm256_loadu_si256((const __m256i *)(p0 + 16 + 32 * j)); const int xo = 4 * j; X8_EACH(NT, Y_DOTA) } \
+        { const __m256i w = _mm256_loadu_si256((const __m256i *)(p0 + 48 + 32 * j)); const int xo = 4 * j + 4; X8_EACH(NT, ODD) } \
+    }
+#else
+#define Y_BLOCK_Q8(NT, ODD)                                                                                    \
+    for (int j = 0; j < 8; j += 2) {                                                                           \
+        { const __m256i ws = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(p0 + 16 + 32 * j)), _mm256_set1_epi8(127)); \
+          const __m256i w = _mm256_sign_epi8(ws, ws); const int xo = 4 * j; X8_EACH(NT, Y_DOTSA) }            \
+        { const __m256i ws = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(p0 + 48 + 32 * j)), _mm256_set1_epi8(127)); \
+          const __m256i w = _mm256_sign_epi8(ws, ws); const int xo = 4 * j + 4; X8_EACH(NT, Y_DOTSB) }        \
+    }
+#endif
+#define Y_BLOCK_Q4(NT, ODD)                                                                                    \
+    for (int j = 0; j < 4; j++) {                                                                              \
+        const __m256i raw = _mm256_loadu_si256((const __m256i *)(p0 + hdr + 32 * j));                          \
+        { const __m256i w = _mm256_and_si256(raw, m4); const int xo = 4 * j; X8_EACH(NT, Y_DOTA) }            \
+        { const __m256i w = _mm256_and_si256(_mm256_srli_epi16(raw, 4), m4); const int xo = 16 + 4 * j; X8_EACH(NT, ODD) } \
+    }
+#define Y_M41(NT) { const __m256 mw = y_scales(p0 + 16); X8_EACH(NT, Y_FIN41) }
+#define Y_KERNEL(NAME, NT, ODD, BLOCK, HDR, GB, COMP, M41)                                                    \
+    static void NAME(const uint8_t *g0, const uint8_t *g1, int nb, const block_q8a *const *xs, float *out, int ldo, \
+                     int lo, int hi) {                                                                         \
+        const int hdr = HDR, comp = COMP;                                                                      \
+        const __m256i m4 = _mm256_set1_epi8(0x0F);                                                             \
+        (void)g1; (void)hdr; (void)m4;                                                                         \
+        X8_EACH(NT, Y_DECL)                                                                                    \
+        for (int b = 0; b < nb; b++) {                                                                         \
+            const uint8_t *p0 = g0 + (size_t)b * GB;                                                           \
+            X8_EACH(NT, Y_ZERO)                                                                                \
+            BLOCK(NT, ODD)                                                                                     \
+            const __m256 dw = y_scales(p0);                                                                    \
+            X8_EACH(NT, Y_FIN)                                                                                 \
+            M41                                                                                                \
+        }                                                                                                      \
+        X8_EACH(NT, Y_STORE)                                                                                   \
+    }
+Y_KERNEL(y_q8_0_t1, 1, Y_DOTB, Y_BLOCK_Q8, 16, 272, Y_Q8_COMP, )
+Y_KERNEL(y_q8_0_t2, 2, Y_DOTB, Y_BLOCK_Q8, 16, 272, Y_Q8_COMP, )
+Y_KERNEL(y_q8_0_t3, 3, Y_DOTB, Y_BLOCK_Q8, 16, 272, Y_Q8_COMP, )
+Y_KERNEL(y_q8_0_t4, 4, Y_DOTB, Y_BLOCK_Q8, 16, 272, Y_Q8_COMP, )
+Y_KERNEL(y_q4_0_t1, 1, Y_DOTB, Y_BLOCK_Q4, 16, 144, 8, )
+Y_KERNEL(y_q4_0_t2, 2, Y_DOTB, Y_BLOCK_Q4, 16, 144, 8, )
+Y_KERNEL(y_q4_0_t3, 3, Y_DOTB, Y_BLOCK_Q4, 16, 144, 8, )
+Y_KERNEL(y_q4_0_t4, 4, Y_DOTB, Y_BLOCK_Q4, 16, 144, 8, )
+Y_KERNEL(y_q4_1_t1, 1, Y_DOTB, Y_BLOCK_Q4, 32, 160, 0, Y_M41(1))
+Y_KERNEL(y_q4_1_t2, 2, Y_DOTB, Y_BLOCK_Q4, 32, 160, 0, Y_M41(2))
+Y_KERNEL(y_q4_1_t3, 3, Y_DOTB, Y_BLOCK_Q4, 32, 160, 0, Y_M41(3))
+Y_KERNEL(y_q4_1_t4, 4, Y_DOTB, Y_BLOCK_Q4, 32, 160, 0, Y_M41(4))
+#define X8_NT8 4
+static const x8_kernel x8_kernels8[3][5] = {
+    {NULL, y_q8_0_t1, y_q8_0_t2, y_q8_0_t3, y_q8_0_t4},
+    {NULL, y_q4_0_t1, y_q4_0_t2, y_q4_0_t3, y_q4_0_t4},
+    {NULL, y_q4_1_t1, y_q4_1_t2, y_q4_1_t3, y_q4_1_t4},
+};
+#endif /* BORG_AVX2 */
+
+#if defined(BORG_NEON)
+/* NEON: 8 columns x up to 4 tokens; a 16-byte chunk load is 4 columns x 4 elements. With dotprod,
+ * vdot against lane j of the token's 16 activation bytes; without it, widening multiplies whose
+ * pair sums are accumulated and folded to column sums once per block (exact integer arithmetic
+ * either way). q8_0 bytes are made signed again (w + 127 - 127) for the signed-by-signed
+ * instructions, so no offset is subtracted; q4 nibbles are used as they are. */
+static inline int8x16_t n_signed(const uint8_t *p) { return vreinterpretq_s8_u8(vsubq_u8(vld1q_u8(p), vdupq_n_u8(127))); }
+static inline float32x4_t n_scales(const uint8_t *p) {
+#if defined(__ARM_FP16_FORMAT_IEEE)
+    uint16x4_t h = vld1_u16((const uint16_t *)(const void *)p);
+    return vcvt_f32_f16(vreinterpret_f16_u16(h));
+#else
+    float f[4];
+    for (int i = 0; i < 4; i++) f[i] = fp16_to_fp32(x8_u16(p + 2 * i));
+    return vld1q_f32(f);
+#endif
+}
+static inline int32x4_t n_pairsum(int32x4_t a, int32x4_t b) { /* [a0+a1, a2+a3, b0+b1, b2+b3] */
+#if defined(__aarch64__)
+    return vpaddq_s32(a, b);
+#else
+    return vcombine_s32(vpadd_s32(vget_low_s32(a), vget_high_s32(a)), vpadd_s32(vget_low_s32(b), vget_high_s32(b)));
+#endif
+}
+static inline void n_store(float *o, int lo, int hi, float32x4_t a, float32x4_t b) {
+    if (lo == 0 && hi == 8) {
+        vst1q_f32(o, a);
+        vst1q_f32(o + 4, b);
+    } else {
+        float tmp[8];
+        vst1q_f32(tmp, a);
+        vst1q_f32(tmp + 4, b);
+        memcpy(o, tmp + lo, (size_t)(hi - lo) * sizeof(float));
+    }
+}
+#if defined(__ARM_FEATURE_DOTPROD)
+#define N_DECL(t)                                                                          \
+    const block_q8a *x##t = xs[t];                                                         \
+    int32x4_t ia##t = vdupq_n_s32(0), ib##t = vdupq_n_s32(0);                              \
+    float32x4_t acc##t = vdupq_n_f32(0), acd##t = vdupq_n_f32(0);                          \
+    int8x16_t xa##t, xb##t;
+#define N_ZERO(t) ia##t = vdupq_n_s32(0); ib##t = vdupq_n_s32(0); xa##t = vld1q_s8(x##t[b].qs); xb##t = vld1q_s8(x##t[b].qs + 16);
+#define N_DOT(t, XV, L) ia##t = vdotq_laneq_s32(ia##t, w0, XV##t, L); ib##t = vdotq_laneq_s32(ib##t, w1, XV##t, L);
+#define N_FOLD(t)
+#else
+#define N_DECL(t)                                                                          \
+    const block_q8a *x##t = xs[t];                                                         \
+    int32x4_t ia##t, ib##t, pa##t = vdupq_n_s32(0), pb##t = vdupq_n_s32(0), pc##t = vdupq_n_s32(0), pd##t = vdupq_n_s32(0); \
+    float32x4_t acc##t = vdupq_n_f32(0), acd##t = vdupq_n_f32(0);                          \
+    int8x16_t xa##t, xb##t;
+#define N_ZERO(t) pa##t = pb##t = pc##t = pd##t = vdupq_n_s32(0); xa##t = vld1q_s8(x##t[b].qs); xb##t = vld1q_s8(x##t[b].qs + 16);
+#define N_DOT(t, XV, L)                                                                                     \
+    {                                                                                                       \
+        const int8x16_t xr = vreinterpretq_s8_s32(vdupq_n_s32(vgetq_lane_s32(vreinterpretq_s32_s8(XV##t), L))); \
+        pa##t = vpadalq_s16(pa##t, vmull_s8(vget_low_s8(w0), vget_low_s8(xr)));                                 \
+        pb##t = vpadalq_s16(pb##t, vmull_s8(vget_high_s8(w0), vget_high_s8(xr)));                               \
+        pc##t = vpadalq_s16(pc##t, vmull_s8(vget_low_s8(w1), vget_low_s8(xr)));                                 \
+        pd##t = vpadalq_s16(pd##t, vmull_s8(vget_high_s8(w1), vget_high_s8(xr)));                               \
+    }
+#define N_FOLD(t) ia##t = n_pairsum(pa##t, pb##t); ib##t = n_pairsum(pc##t, pd##t);
+#endif
+#define N_DA0(t) N_DOT(t, xa, 0)
+#define N_DA1(t) N_DOT(t, xa, 1)
+#define N_DA2(t) N_DOT(t, xa, 2)
+#define N_DA3(t) N_DOT(t, xa, 3)
+#define N_DB0(t) N_DOT(t, xb, 0)
+#define N_DB1(t) N_DOT(t, xb, 1)
+#define N_DB2(t) N_DOT(t, xb, 2)
+#define N_DB3(t) N_DOT(t, xb, 3)
+#define N_FIN(t)                                                                                          \
+    {                                                                                                     \
+        N_FOLD(t)                                                                                         \
+        const int32x4_t c = vdupq_n_s32(comp * x##t[b].sum);                                              \
+        const float32x4_t s0 = vmulq_n_f32(dw0, x##t[b].d), s1 = vmulq_n_f32(dw1, x##t[b].d);              \
+        acc##t = vaddq_f32(acc##t, vmulq_f32(s0, vcvtq_f32_s32(vsubq_s32(ia##t, c))));                     \
+        acd##t = vaddq_f32(acd##t, vmulq_f32(s1, vcvtq_f32_s32(vsubq_s32(ib##t, c))));                     \
+    }
+#define N_FIN41(t) acc##t = vaddq_f32(acc##t, vmulq_n_f32(mw0, x##t[b].s)); acd##t = vaddq_f32(acd##t, vmulq_n_f32(mw1, x##t[b].s));
+#define N_STORE(t) n_store(out + (size_t)t * ldo, lo, hi, acc##t, acd##t);
+#define N_Q8_STEP(NT, J, D) { const int8x16_t w0 = n_signed(p0 + 16 + 32 * (J)), w1 = n_signed(p0 + 32 + 32 * (J)); X8_EACH(NT, D) }
+#define N_BLOCK_Q8(NT, ODD)                                                                                    \
+    N_Q8_STEP(NT, 0, N_DA0) N_Q8_STEP(NT, 1, N_DA1) N_Q8_STEP(NT, 2, N_DA2) N_Q8_STEP(NT, 3, N_DA3)            \
+    N_Q8_STEP(NT, 4, N_DB0) N_Q8_STEP(NT, 5, N_DB1) N_Q8_STEP(NT, 6, N_DB2) N_Q8_STEP(NT, 7, N_DB3)
+#define N_Q4_STEP(NT, J, DLO, DHI)                                                                             \
+    {                                                                                                          \
+        const uint8x16_t raw0 = vld1q_u8(p0 + hdr + 32 * (J)), raw1 = vld1q_u8(p0 + hdr + 16 + 32 * (J));      \
+        { const int8x16_t w0 = vreinterpretq_s8_u8(vandq_u8(raw0, m4)), w1 = vreinterpretq_s8_u8(vandq_u8(raw1, m4)); X8_EACH(NT, DLO) } \
+        { const int8x16_t w0 = vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4)), w1 = vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4)); X8_EACH(NT, DHI) } \
+    }
+#define N_BLOCK_Q4(NT, ODD)                                                                                    \
+    N_Q4_STEP(NT, 0, N_DA0, N_DB0) N_Q4_STEP(NT, 1, N_DA1, N_DB1) N_Q4_STEP(NT, 2, N_DA2, N_DB2) N_Q4_STEP(NT, 3, N_DA3, N_DB3)
+#define N_M41(NT) { const float32x4_t mw0 = n_scales(p0 + 16), mw1 = n_scales(p0 + 24); X8_EACH(NT, N_FIN41) }
+#define N_KERNEL(NAME, NT, ODD, BLOCK, HDR, GB, COMP, M41)                                                    \
+    static void NAME(const uint8_t *g0, const uint8_t *g1, int nb, const block_q8a *const *xs, float *out, int ldo, \
+                     int lo, int hi) {                                                                         \
+        const int hdr = HDR, comp = COMP;                                                                      \
+        const uint8x16_t m4 = vdupq_n_u8(0x0F);                                                                \
+        (void)g1; (void)hdr; (void)m4;                                                                         \
+        X8_EACH(NT, N_DECL)                                                                                    \
+        for (int b = 0; b < nb; b++) {                                                                         \
+            const uint8_t *p0 = g0 + (size_t)b * GB;                                                           \
+            X8_EACH(NT, N_ZERO)                                                                                \
+            BLOCK(NT, ODD)                                                                                     \
+            const float32x4_t dw0 = n_scales(p0), dw1 = n_scales(p0 + 8);                                      \
+            X8_EACH(NT, N_FIN)                                                                                 \
+            M41                                                                                                \
+        }                                                                                                      \
+        X8_EACH(NT, N_STORE)                                                                                   \
+    }
+N_KERNEL(n_q8_0_t1, 1, 0, N_BLOCK_Q8, 16, 272, 0, )
+N_KERNEL(n_q8_0_t2, 2, 0, N_BLOCK_Q8, 16, 272, 0, )
+N_KERNEL(n_q8_0_t3, 3, 0, N_BLOCK_Q8, 16, 272, 0, )
+N_KERNEL(n_q8_0_t4, 4, 0, N_BLOCK_Q8, 16, 272, 0, )
+N_KERNEL(n_q4_0_t1, 1, 0, N_BLOCK_Q4, 16, 144, 8, )
+N_KERNEL(n_q4_0_t2, 2, 0, N_BLOCK_Q4, 16, 144, 8, )
+N_KERNEL(n_q4_0_t3, 3, 0, N_BLOCK_Q4, 16, 144, 8, )
+N_KERNEL(n_q4_0_t4, 4, 0, N_BLOCK_Q4, 16, 144, 8, )
+N_KERNEL(n_q4_1_t1, 1, 0, N_BLOCK_Q4, 32, 160, 0, N_M41(1))
+N_KERNEL(n_q4_1_t2, 2, 0, N_BLOCK_Q4, 32, 160, 0, N_M41(2))
+N_KERNEL(n_q4_1_t3, 3, 0, N_BLOCK_Q4, 32, 160, 0, N_M41(3))
+N_KERNEL(n_q4_1_t4, 4, 0, N_BLOCK_Q4, 32, 160, 0, N_M41(4))
+#define X8_NT8 4
+static const x8_kernel x8_kernels8[3][5] = {
+    {NULL, n_q8_0_t1, n_q8_0_t2, n_q8_0_t3, n_q8_0_t4},
+    {NULL, n_q4_0_t1, n_q4_0_t2, n_q4_0_t3, n_q4_0_t4},
+    {NULL, n_q4_1_t1, n_q4_1_t2, n_q4_1_t3, n_q4_1_t4},
+};
+#endif /* BORG_NEON */
+
+#if defined(BORG_WASM)
+/* WebAssembly SIMD128: 8 columns x up to 4 tokens. There is no byte dot product, so each chunk
+ * is widened to int16 once (4 columns x 4 elements per vector), a token's 4 activation bytes
+ * are splat and widened, and i32x4.dot_i16x8 leaves two partial sums per column that are
+ * accumulated over the chunks and folded to column sums once per block (exact integers). */
+static inline v128_t w_scales(const uint8_t *p) {
+    return wasm_f32x4_make(fp16_to_fp32(x8_u16(p)), fp16_to_fp32(x8_u16(p + 2)), fp16_to_fp32(x8_u16(p + 4)),
+                           fp16_to_fp32(x8_u16(p + 6)));
+}
+static inline v128_t w_fold(v128_t a, v128_t b) { /* [a0+a1, a2+a3, b0+b1, b2+b3] */
+    return wasm_i32x4_add(wasm_i32x4_shuffle(a, b, 0, 2, 4, 6), wasm_i32x4_shuffle(a, b, 1, 3, 5, 7));
+}
+static inline void w_store(float *o, int lo, int hi, v128_t a, v128_t b) {
+    if (lo == 0 && hi == 8) {
+        wasm_v128_store(o, a);
+        wasm_v128_store(o + 4, b);
+    } else {
+        float tmp[8];
+        wasm_v128_store(tmp, a);
+        wasm_v128_store(tmp + 4, b);
+        memcpy(o, tmp + lo, (size_t)(hi - lo) * sizeof(float));
+    }
+}
+#define W_DECL(t)                                                                          \
+    const block_q8a *x##t = xs[t];                                                         \
+    v128_t pa##t = wasm_i32x4_splat(0), pb##t = wasm_i32x4_splat(0), pc##t = wasm_i32x4_splat(0), pd##t = wasm_i32x4_splat(0); \
+    v128_t acc##t = wasm_f32x4_splat(0.0f), acd##t = wasm_f32x4_splat(0.0f);
+#define W_ZERO(t) pa##t = pb##t = pc##t = pd##t = wasm_i32x4_splat(0);
+#define W_DOT(t)                                                                                          \
+    {                                                                                                     \
+        const v128_t xw = wasm_i16x8_extend_low_i8x16(wasm_v128_load32_splat(x##t[b].qs + xo));           \
+        pa##t = wasm_i32x4_add(pa##t, wasm_i32x4_dot_i16x8(w0l, xw));                                     \
+        pb##t = wasm_i32x4_add(pb##t, wasm_i32x4_dot_i16x8(w0h, xw));                                     \
+        pc##t = wasm_i32x4_add(pc##t, wasm_i32x4_dot_i16x8(w1l, xw));                                     \
+        pd##t = wasm_i32x4_add(pd##t, wasm_i32x4_dot_i16x8(w1h, xw));                                     \
+    }
+#define W_FIN(t)                                                                                          \
+    {                                                                                                     \
+        const v128_t c = wasm_i32x4_splat(comp * x##t[b].sum);                                            \
+        const v128_t ia = wasm_i32x4_sub(w_fold(pa##t, pb##t), c), ib = wasm_i32x4_sub(w_fold(pc##t, pd##t), c); \
+        const v128_t xd = wasm_f32x4_splat(x##t[b].d);                                                    \
+        acc##t = wasm_f32x4_add(acc##t, wasm_f32x4_mul(wasm_f32x4_mul(dw0, xd), wasm_f32x4_convert_i32x4(ia))); \
+        acd##t = wasm_f32x4_add(acd##t, wasm_f32x4_mul(wasm_f32x4_mul(dw1, xd), wasm_f32x4_convert_i32x4(ib))); \
+    }
+#define W_FIN41(t)                                                                                        \
+    acc##t = wasm_f32x4_add(acc##t, wasm_f32x4_mul(mw0, wasm_f32x4_splat(x##t[b].s)));                    \
+    acd##t = wasm_f32x4_add(acd##t, wasm_f32x4_mul(mw1, wasm_f32x4_splat(x##t[b].s)));
+#define W_STORE(t) w_store(out + (size_t)t * ldo, lo, hi, acc##t, acd##t);
+/* the chunk widened: w0l/w0h are columns 0,1 / 2,3 and w1l/w1h columns 4,5 / 6,7 */
+#define W_WIDEN(c0, c1)                                                                                   \
+    const v128_t w0l = wasm_u16x8_extend_low_u8x16(c0), w0h = wasm_u16x8_extend_high_u8x16(c0);           \
+    const v128_t w1l = wasm_u16x8_extend_low_u8x16(c1), w1h = wasm_u16x8_extend_high_u8x16(c1);
+#define W_BLOCK_Q8(NT, ODD)                                                                               \
+    for (int j = 0; j < 8; j++) {                                                                         \
+        W_WIDEN(wasm_v128_load(p0 + 16 + 32 * j), wasm_v128_load(p0 + 32 + 32 * j))                       \
+        const int xo = 4 * j;                                                                             \
+        X8_EACH(NT, W_DOT)                                                                                \
+    }
+#define W_BLOCK_Q4(NT, ODD)                                                                               \
+    for (int j = 0; j < 4; j++) {                                                                         \
+        const v128_t raw0 = wasm_v128_load(p0 + hdr + 32 * j), raw1 = wasm_v128_load(p0 + hdr + 16 + 32 * j); \
+        { W_WIDEN(wasm_v128_and(raw0, m4), wasm_v128_and(raw1, m4)) const int xo = 4 * j; X8_EACH(NT, W_DOT) } \
+        { W_WIDEN(wasm_u8x16_shr(raw0, 4), wasm_u8x16_shr(raw1, 4)) const int xo = 16 + 4 * j; X8_EACH(NT, W_DOT) } \
+    }
+#define W_M41(NT) { const v128_t mw0 = w_scales(p0 + 16), mw1 = w_scales(p0 + 24); X8_EACH(NT, W_FIN41) }
+#define W_KERNEL(NAME, NT, ODD, BLOCK, HDR, GB, COMP, M41)                                                    \
+    static void NAME(const uint8_t *g0, const uint8_t *g1, int nb, const block_q8a *const *xs, float *out, int ldo, \
+                     int lo, int hi) {                                                                         \
+        const int hdr = HDR, comp = COMP;                                                                      \
+        const v128_t m4 = wasm_i8x16_splat(0x0F);                                                              \
+        (void)g1; (void)hdr; (void)m4;                                                                         \
+        X8_EACH(NT, W_DECL)                                                                                    \
+        for (int b = 0; b < nb; b++) {                                                                         \
+            const uint8_t *p0 = g0 + (size_t)b * GB;                                                           \
+            X8_EACH(NT, W_ZERO)                                                                                \
+            BLOCK(NT, ODD)                                                                                     \
+            const v128_t dw0 = w_scales(p0), dw1 = w_scales(p0 + 8);                                           \
+            X8_EACH(NT, W_FIN)                                                                                 \
+            M41                                                                                                \
+        }                                                                                                      \
+        X8_EACH(NT, W_STORE)                                                                                   \
+    }
+W_KERNEL(w_q8_0_t1, 1, 0, W_BLOCK_Q8, 16, 272, 127, )
+W_KERNEL(w_q8_0_t2, 2, 0, W_BLOCK_Q8, 16, 272, 127, )
+W_KERNEL(w_q8_0_t3, 3, 0, W_BLOCK_Q8, 16, 272, 127, )
+W_KERNEL(w_q8_0_t4, 4, 0, W_BLOCK_Q8, 16, 272, 127, )
+W_KERNEL(w_q4_0_t1, 1, 0, W_BLOCK_Q4, 16, 144, 8, )
+W_KERNEL(w_q4_0_t2, 2, 0, W_BLOCK_Q4, 16, 144, 8, )
+W_KERNEL(w_q4_0_t3, 3, 0, W_BLOCK_Q4, 16, 144, 8, )
+W_KERNEL(w_q4_0_t4, 4, 0, W_BLOCK_Q4, 16, 144, 8, )
+W_KERNEL(w_q4_1_t1, 1, 0, W_BLOCK_Q4, 32, 160, 0, W_M41(1))
+W_KERNEL(w_q4_1_t2, 2, 0, W_BLOCK_Q4, 32, 160, 0, W_M41(2))
+W_KERNEL(w_q4_1_t3, 3, 0, W_BLOCK_Q4, 32, 160, 0, W_M41(3))
+W_KERNEL(w_q4_1_t4, 4, 0, W_BLOCK_Q4, 32, 160, 0, W_M41(4))
+#define X8_NT8 4
+static const x8_kernel x8_kernels8[3][5] = {
+    {NULL, w_q8_0_t1, w_q8_0_t2, w_q8_0_t3, w_q8_0_t4},
+    {NULL, w_q4_0_t1, w_q4_0_t2, w_q4_0_t3, w_q4_0_t4},
+    {NULL, w_q4_1_t1, w_q4_1_t2, w_q4_1_t3, w_q4_1_t4},
+};
+#endif /* BORG_WASM */
+
+#if defined(X8_NT8)
+/* Run a kernel set over the tokens in tiles of nt_max. */
+static void x8_run(const x8_kernel *k, int nt_max, const uint8_t *g0, const uint8_t *g1, int nb, int T,
+                   const block_q8a *xq, int ldxq, float *o, int ldo, int lo, int hi) {
+    for (int t0 = 0; t0 < T; t0 += nt_max) {
+        const int nt = T - t0 < nt_max ? T - t0 : nt_max;
+        const block_q8a *xs[8];
+        for (int t = 0; t < nt; t++) xs[t] = xq + (size_t)(t0 + t) * ldxq;
+        k[nt](g0, g1, nb, xs, o + (size_t)t0 * ldo, ldo, lo, hi);
+    }
+}
+#endif
+
+/* mat_mul_rows_off for an interleaved matrix: whole row groups go through the kernels and only
+ * the lanes inside [r0, r1) are stored, so any row range works (the partial groups at the ends
+ * of a range cost a full group each). Groups are the outer loop so that a group's weights stay
+ * in cache while the activations of all tokens stream past. */
+static void x8_mul(const borg_mat *m, int r0, int r1, int T, const block_q8a *xq, int ldxq, float *out, int ldo, int ro) {
+#if defined(X8_NT8)
+    const int nb = m->cols / QK, ng = (m->rows + 7) / 8, k = m->dtype - DT_Q8_0;
+    const size_t gbytes = 8 * m->row_bytes;
+    for (int c0 = r0 & ~7; c0 < r1;) {
+        const int g = c0 / 8;
+        const uint8_t *g0 = (const uint8_t *)m->data + (size_t)g * gbytes;
+        int cols = 8;
+#if defined(BORG_VNNI)
+        if (g + 1 < ng && c0 + 8 < r1) cols = 16; /* a pair of groups for the 16-column kernels */
+#else
+        (void)ng;
+#endif
+        const int lo = (r0 > c0 ? r0 : c0) - c0, hi = (r1 < c0 + cols ? r1 : c0 + cols) - c0;
+        float *o = out + (size_t)(c0 + lo - ro);
+#if defined(BORG_VNNI)
+        if (cols == 16) x8_run(z_kernels[k], 8, g0, g0 + gbytes, nb, T, xq, ldxq, o, ldo, lo, hi);
+        else
+#endif
+            x8_run(x8_kernels8[k], X8_NT8, g0, g0, nb, T, xq, ldxq, o, ldo, lo, hi);
+        c0 += cols;
+    }
+#else
+    mat_mul_rows_scalar(m, r0, r1, T, xq, ldxq, out, ldo, ro);
+#endif
+}
+
 /* ---- matrix helpers ------------------------------------------------------- */
 int mat_wants_q8a(const borg_mat *m) { return m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0 || m->dtype == DT_Q4_1; }
 
 void mat_get_row(const borg_mat *m, int r, float *out) {
+    if (m->layout == MAT_X8) {
+        x8_get_row(m, r, out);
+        return;
+    }
     const uint8_t *row = (const uint8_t *)m->data + (size_t)r * m->row_bytes;
     const int n = m->cols;
     switch (m->dtype) {
@@ -533,6 +1186,11 @@ void mat_get_row(const borg_mat *m, int r, float *out) {
 }
 
 float mat_dot_row(const borg_mat *m, int r, const float *xf, const block_q8a *xq) {
+    if (m->layout == MAT_X8) { /* the batched kernel on one row, so the number is the same */
+        float v;
+        x8_mul(m, r, r + 1, 1, xq, 0, &v, 1, r);
+        return v;
+    }
     const uint8_t *row = (const uint8_t *)m->data + (size_t)r * m->row_bytes;
     switch (m->dtype) {
     case DT_F32: return vec_dot_f32((const float *)row, xf, m->cols);
@@ -682,13 +1340,18 @@ static void dot_q4_1_q8a_x4(const block_q4_1 *w, const block_q8a *const x[4], in
 }
 #endif
 
-void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
-                  int ldxq, float *out, int ldo) {
+void mat_mul_rows_off(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
+                      int ldxq, float *out, int ldo, int ro) {
+    if (r0 >= r1 || T <= 0) return;
+    if (m->layout == MAT_X8) {
+        x8_mul(m, r0, r1, T, xq, ldxq, out, ldo, ro);
+        return;
+    }
 #if defined(BORG_AVX2) || defined(BORG_WASM)
     if ((m->dtype == DT_Q8_0 || m->dtype == DT_Q4_0 || m->dtype == DT_Q4_1) && T >= 4) {
-        /* Tile 16 weight rows x 4 tokens: the rows stay in L1 while every group of 4 activation
-         * rows is read once per tile instead of once per weight row (which made prefill
-         * L2-bandwidth bound). Each dot product is computed exactly as before. */
+        /* Plain layout (BORG_NO_REPACK=1): tile 16 weight rows x 4 tokens, so the rows stay in L1
+         * while every group of 4 activation rows is read once per tile instead of once per weight
+         * row. Each dot product is computed exactly as by mat_dot_row. */
         enum { RB = 16 };
         const int nb = m->cols / QK;
         for (int rb = r0; rb < r1; rb += RB) {
@@ -703,16 +1366,23 @@ void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int 
                     if (m->dtype == DT_Q8_0) dot_q8_0_q8a_x4((const block_q8_0 *)row, xs, nb, o);
                     else if (m->dtype == DT_Q4_0) dot_q4_0_q8a_x4((const block_q4_0 *)row, xs, nb, o);
                     else dot_q4_1_q8a_x4((const block_q4_1 *)row, xs, nb, o);
-                    for (int c = 0; c < 4; c++) out[(size_t)(t + c) * ldo + r] = o[c];
+                    for (int c = 0; c < 4; c++) out[(size_t)(t + c) * ldo + (size_t)(r - ro)] = o[c];
                 }
             }
             for (; t < T; t++)
-                for (int r = rb; r < re; r++) out[(size_t)t * ldo + r] = mat_dot_row(m, r, NULL, xq + (size_t)t * ldxq);
+                for (int r = rb; r < re; r++)
+                    out[(size_t)t * ldo + (size_t)(r - ro)] = mat_dot_row(m, r, NULL, xq + (size_t)t * ldxq);
         }
         return;
     }
 #endif
     for (int r = r0; r < r1; r++)
         for (int t = 0; t < T; t++)
-            out[(size_t)t * ldo + r] = mat_dot_row(m, r, x ? x + (size_t)t * ldx : NULL, xq ? xq + (size_t)t * ldxq : NULL);
+            out[(size_t)t * ldo + (size_t)(r - ro)] =
+                mat_dot_row(m, r, x ? x + (size_t)t * ldx : NULL, xq ? xq + (size_t)t * ldxq : NULL);
+}
+
+void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
+                  int ldxq, float *out, int ldo) {
+    mat_mul_rows_off(m, r0, r1, T, x, ldx, xq, ldxq, out, ldo, 0);
 }
