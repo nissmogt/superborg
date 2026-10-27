@@ -4,8 +4,9 @@ BORG_TRANSPORT: the event contract it shares with superborg/interp.py and wasm/t
 settings it sends, and the flow view (the word map: sprites and the pigment via window.__superborg.flowStats, the
 no-map fallback, reduced motion, the strip's wrapping at phone width, the scrubber's keys, the first-run cards, the cards
 following a sweep, the layer table and Step button, readable region landmarks, the follow-live queue policy, the Canvas2D
-fallback, ?replay= of a trace; SUPERBORG_TRACE=<path to a recorded .jsonl> replays a real recording too). Skipped without node,
-Playwright for node, or a browser it can launch. test_vocab_map_routes covers the UI server's GET /api/vocab_map.json and
+fallback, ?replay= of a synthetic trace and of a real recording: tests/fixtures/qwen2.5-0.5b-q8_0-insects.jsonl, or the trace
+SUPERBORG_TRACE=<path to a recorded .jsonl> names in its place; that case is a pytest skip when neither is at hand). Skipped
+without node, Playwright for node, or a browser it can launch. test_vocab_map_routes covers the UI server's GET /api/vocab_map.json and
 .bin, where the page fetches its word map over HTTP (skipped without the engine and a model, like tests/test_ui.py)."""
 from __future__ import annotations
 
@@ -18,6 +19,9 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX = os.path.join(ROOT, "superborg", "web", "index.html")
+# a complete recording (request, prompt, four tokens, done) of Qwen2.5-0.5B answering "What is the single word for a
+# person who studies insects?" with the full trace of every token, 170 KB; SUPERBORG_TRACE=<path> replays another instead
+RECORDED_TRACE = os.path.join(ROOT, "tests", "fixtures", "qwen2.5-0.5b-q8_0-insects.jsonl")
 
 # A transport whose chat() plays one plan of window.__plans per call. A step is an event, {wait: ms}
 # or {untilStop: true} (until stop() is called with this chat's request_id). Stops are logged.
@@ -78,6 +82,7 @@ DRIVER = r"""
 const { chromium } = require("playwright");
 const fs = require("fs"), http = require("http"), url = require("url");
 const [PAGE, transport] = [process.argv[2], fs.readFileSync(process.argv[3], "utf8")];
+const RECORDED = process.argv[4] ? fs.readFileSync(process.argv[4]) : null;  // a recorded .jsonl trace for flow_replay_recorded, or none
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = {};
 const check = (name, ok, info) => { results[name] = { ok: !!ok, info }; };
@@ -466,14 +471,23 @@ const cases = {
       && back.sel === 2 && /w2$/.test(back.cur) && back.pigment === 24, { r, strip, back });  // the strip shows the leading space as a glyph
   },
   async flow_replay_recorded(page) {
-    // a real recording (SUPERBORG_TRACE), when one is at hand: it streams to "done" with no console errors
-    if (!process.env.SUPERBORG_TRACE) { check("flow_replay_recorded", true, "skipped: SUPERBORG_TRACE is not set"); return; }
+    // a real recording (RECORDED: the fixture, or SUPERBORG_TRACE): the recorded question is sent, every recorded token
+    // arrives with its story and the turn ends with the recorded stop reason, no console errors
+    if (!RECORDED) { results.flow_replay_recorded = { ok: false, skipped: "no recorded trace: SUPERBORG_TRACE is not set and tests/fixtures has none" }; return; }
+    const evs = RECORDED.toString("utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const want = { toks: evs.filter((e) => e.type === "token").length, stop: evs.find((e) => e.type === "done").stop_reason,
+                   question: evs[0].body.messages.slice(-1)[0].content, nL: evs.find((e) => e.type === "token").lens.length - 1 };
     await page.waitForFunction(() => window.__superborg.turns.length && window.__superborg.turns[0].done, null, { timeout: 120000 });
-    await page.waitForFunction(() => !window.__superborg.flowStats.animating, null, { timeout: 30000 });
+    // the stories play one after another (a frame apart, so "not animating" alone is also the gap between two): wait for the last
+    // word's story to land and its narration to be written
+    await page.waitForFunction((n) => { const S = window.__superborg; return S.sel === n - 1 && !S.flowStats.animating && !document.getElementById("fnarr").classList.contains("dim"); },
+                               want.toks, { timeout: 60000 });
     await sleep(400);
     const r = await flowState(page);
-    const t = await page.evaluate(() => { const S = window.__superborg; return { stop: S.turns[0].done.stop_reason, toks: S.toks.length, nL: S.nL }; });
-    check("flow_replay_recorded", t.toks > 0 && t.stop && r.particles > 0 && /of the reply/.test(r.narr) && !realErrors(page).length, Object.assign(t, { conErrs: page.conErrs, flow: r }));
+    const t = await page.evaluate(() => { const S = window.__superborg; return { stop: S.turns[0].done.stop_reason, toks: S.toks.length, nL: S.nL,
+      question: document.querySelector(".msg.user .bubble").textContent, stories: document.querySelectorAll("#freply .fw:not(.nostory)").length }; });
+    check("flow_replay_recorded", t.toks === want.toks && t.stop === want.stop && t.question === want.question && t.nL === want.nL && t.stories === want.toks
+      && r.particles > 0 && new RegExp(`Word ${want.toks} of the reply`).test(r.narr) && !realErrors(page).length, Object.assign(t, { want, conErrs: page.conErrs, flow: r }));
   },
 };
 const setup = {
@@ -499,12 +513,12 @@ const setup = {
   let browser;
   try { browser = await chromium.launch(); } catch (e) { console.log("LAUNCH-FAILED " + e.message.split("\n")[0]); return; }
   const files = { "/index.html": { type: "text/html; charset=utf-8", body: fs.readFileSync(url.fileURLToPath(PAGE)) }, "/trace.jsonl": { type: "application/x-ndjson", body: syntheticTrace() } };
-  if (process.env.SUPERBORG_TRACE) files["/recorded.jsonl"] = { type: "application/x-ndjson", body: fs.readFileSync(process.env.SUPERBORG_TRACE) };
+  if (RECORDED) files["/recorded.jsonl"] = { type: "application/x-ndjson", body: RECORDED };
   const srv = await serveFiles(files), port = srv.address().port;
   for (const [name, fn] of Object.entries(cases)) {
     const [info, saved, opts] = setup[name] || [];
     const o = Object.assign({}, opts || {});
-    if (o.replay) { if (name === "flow_replay_recorded" && !process.env.SUPERBORG_TRACE) { await fn(null); continue; } o.url = `http://127.0.0.1:${port}/index.html?replay=${o.replay}&replay_speed=0`; }
+    if (o.replay) { if (name === "flow_replay_recorded" && !RECORDED) { await fn(null); continue; } o.url = `http://127.0.0.1:${port}/index.html?replay=${o.replay}&replay_speed=0`; }
     const { ctx, page } = await open(browser, info, saved, o);
     try { await fn(page); } catch (e) { check(name, false, "threw: " + e.message.split("\n")[0]); }
     if (page.errs.length) check(name, false, { pageErrors: page.errs });
@@ -544,8 +558,9 @@ def results(tmp_path_factory):
     d = tmp_path_factory.mktemp("page")
     (d / "transport.js").write_text(TRANSPORT, encoding="utf-8")
     (d / "driver.js").write_text(DRIVER, encoding="utf-8")
-    r = subprocess.run([node, str(d / "driver.js"), "file://" + INDEX, str(d / "transport.js")], env=env,
-                       capture_output=True, text=True, timeout=300)
+    recorded = os.environ.get("SUPERBORG_TRACE") or (RECORDED_TRACE if os.path.isfile(RECORDED_TRACE) else "")
+    r = subprocess.run([node, str(d / "driver.js"), "file://" + INDEX, str(d / "transport.js")] + ([recorded] if recorded else []),
+                       env=env, capture_output=True, text=True, timeout=300)
     if "LAUNCH-FAILED" in r.stdout:
         pytest.skip("no browser for Playwright: " + r.stdout.strip())
     lines = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULTS ")]
@@ -557,6 +572,8 @@ def results(tmp_path_factory):
 def test_page(results, case):
     res = results.get(case)
     assert res is not None, f"{case} did not run"
+    if res.get("skipped"):
+        pytest.skip(res["skipped"])
     assert res["ok"], json.dumps(res["info"], ensure_ascii=False)
 
 

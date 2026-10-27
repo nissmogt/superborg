@@ -20,12 +20,22 @@ tokens. This tool computes that map offline, once per model:
   7. --clusters (24) KMeans clusters of the 2D points, each labelled by its three most
      frequent-looking tokens: the lowest ids among its printable normal tokens, since BPE ids
      follow merge order, which tracks frequency
+  8. a readable landmark per cluster, for the viewer's region labels: up to three whole words
+     among its members (word-initial pieces, alphabetic, 3-12 letters, not stop words, standing
+     alone rather than being the start of the vocabulary's longer pieces, see word_share(), and
+     held by the vocabulary in both cases, see whole_words()), the lowest ids among those in the
+     cluster's inner half around its density peak; a cluster without words (punctuation, digits,
+     code, word fragments) is named by the kind of piece it is made of
 
 Written next to the model (or in --out-dir):
   <stem>.vocab_map.bin   n x 2 float16, little-endian, row i = (x, y) of token i
-  <stem>.vocab_map.json  {"n", "stability_knn15", "seed", "clusters": [{"label", "x", "y", "n",
-                          "tokens"}...], "knn15_preserved" (high-dim 15-NN kept on the map),
-                          "extent", the parameters and the per-seed overlaps}
+  <stem>.vocab_map.json  {"n", "stability_knn15", "seed", "clusters": [{"label", "landmark",
+                          "landmark_tokens", "x", "y", "n", "tokens"}...], "knn15_preserved"
+                          (high-dim 15-NN kept on the map), "extent", "landmark_rule", the
+                          parameters and the per-seed overlaps}
+
+--relabel keeps an existing .bin and recomputes only the clusters and landmarks into the .json
+(seconds, no UMAP), for maps made before the landmark rule or with other cluster settings.
 
 It also prints the 5 nearest map neighbours of a few probe tokens (and, for comparison, their
 nearest neighbours in the PCA space by cosine) so a human can judge whether neighbourhoods
@@ -40,11 +50,13 @@ about 19 minutes with --n-jobs 2 on a shared 4-core machine.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import resource
 import sys
 import time
+from collections import Counter
 
 import numpy as np
 
@@ -271,9 +283,140 @@ def _label_text(t: str) -> str:
     return s if s else repr(t)
 
 
+# ---- landmarks ----------------------------------------------------------------------------
+# Function words a region is never named after: the lowest ids of any region of words are these.
+STOP_WORDS = frozenset("""
+a about above after again against all along also although am among an and another any are around as at away
+be became because become been before being below between both but by came can cannot come could did do does
+doing done down during each either else enough ever every few for from further had has have having he hence her
+here hers herself him himself his how however i if in into is it its itself just least less let many may me
+might more most much must my myself neither never no nor not nothing now of off often on once one only onto or
+other others otherwise ought our ours ourselves out over own per rather same shall she should since so some
+something still such than that the their theirs them themselves then there therefore these they this those
+though through thus to too toward towards under until unto up upon us very was we were what whatever when
+whenever where whereas wherever whether which whichever while who whoever whom whose why will with within
+without would yes yet you your yours yourself yourselves
+""".split())
+WORD_SHARE_MIN = 0.1      # a piece standing alone for less than a tenth of its weight is a fragment of longer pieces
+WORD_FRACTION_MIN = 0.05  # a region is named by its words only when at least one member in twenty is a word
+LANDMARK_RULE = ("up to three whole words (word-initial, alphabetic, 3-12 letters, no stop word, word_share >= 0.1, held in both "
+                 "cases), the lowest ids among those in the inner half around the density peak; else the kind of piece the region is made of")
+
+
+def readable_word(text: str) -> str | None:
+    """The word a token spells when it is readable: word-initial (the tokenizer's space marker first),
+    alphabetic after it, lowercase or Capitalized (no ALL CAPS, no camelCase), 3-12 letters long and
+    not a stop word. Else None."""
+    w = text[1:] if text[:1] == " " else ""
+    if not w.isalpha() or not 3 <= len(w) <= 12 or not w[1:].islower() or w.lower() in STOP_WORDS:
+        return None
+    return w
+
+
+def word_share(texts: list[str], ids) -> dict[int, float]:
+    """For each token id in ids, the share of its weight that stands alone: 1 - (id + 1) * the sum of
+    1 / (j + 1) over the tokens j that extend it with letters (" includ": " include", " included",
+    " includes", " including"). BPE ids follow merge order, so 1 / (id + 1) is a Zipf-like proxy of a
+    piece's frequency and the sum stands for the occurrences merged on into longer pieces: a fragment,
+    nearly always continued, comes out near or below 0 (" includ": -0.6 in SmolLM2's vocabulary,
+    " stud": -0.9, " toget": 0.0), a whole word, extended only by its rarer derivations, well above
+    (" water": 0.44 with " watered", " waterfall"...; " people": 0.91; " energy": 1.0)."""
+    order = sorted(range(len(texts)), key=texts.__getitem__)
+    stexts = [texts[i] for i in order]
+    out = {}
+    for i in ids:
+        t = texts[i]
+        j = bisect.bisect_right(stexts, t)
+        s = 0.0
+        while j < len(stexts) and stexts[j].startswith(t):
+            if stexts[j][len(t):].isalpha():
+                s += 1.0 / (order[j] + 1)
+            j += 1
+        out[int(i)] = 1.0 - (int(i) + 1) * s
+    return out
+
+
+def whole_words(texts: list[str], types) -> dict[int, float]:
+    """{id: word_share()} of the vocabulary's whole words: the readable_word() candidates among the
+    normal tokens whose share is at least WORD_SHARE_MIN and which the vocabulary also holds in the
+    other case. A lowercase word has a capitalized token from sentence starts (" water" and " Water");
+    a fragment rarely has one (" appet", " inadequ"), even when the share gate lets it through because
+    most of its continuations are separate tokens. A capitalized candidate passes when its lowercase
+    form is absent (a name: " Europe") or is itself a word (" Muslim"), not when that form is a
+    fragment (" Anthrop": " anthrop", " anthropology")."""
+    types = np.asarray(types)
+    cands = [i for i in range(len(texts)) if types[i] == TOKEN_NORMAL and readable_word(texts[i])]
+    share = word_share(texts, cands)
+    ids = {}
+    for i in cands:
+        ids.setdefault(texts[i], i)
+    have = set(texts)
+    out = {}
+    for i in cands:
+        if share[i] < WORD_SHARE_MIN:
+            continue
+        w = texts[i][1:]
+        if w[0].isupper():
+            j = ids.get(" " + w.lower())
+            ok = (" " + w.lower()) not in have if j is None else share[j] >= WORD_SHARE_MIN
+        else:
+            ok = (" " + w[0].upper() + w[1:]) in have
+        if ok:
+            out[i] = share[i]
+    return out
+
+
+def piece_kind(text: str) -> str:
+    """What a token is made of: "numbers" (digits), "punctuation" (no letter or digit), "fragments"
+    (letters only, with or without the space marker) or "code" (anything mixed, whitespace runs, bytes)."""
+    s = text.strip()
+    if not s:
+        return "code"
+    if s.isdigit():
+        return "numbers"
+    if s.isalpha():
+        return "fragments"
+    if not any(ch.isalnum() for ch in s):
+        return "punctuation"
+    return "code"
+
+
+def density_peak(pts: np.ndarray, k: int = 30) -> np.ndarray:
+    """The point of pts whose k nearest other points are closest on average: the mode of the cloud."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 2:
+        return pts[0] if len(pts) else np.zeros(2)
+    idx = knn2d(pts, min(k, len(pts) - 1))
+    return pts[int(np.argmin(np.linalg.norm(pts[idx] - pts[:, None, :], axis=2).mean(axis=1)))]
+
+
+def landmark(xy: np.ndarray, members, texts: list[str], words: dict[int, float]) -> tuple[str, list]:
+    """A readable name for a region of the map: up to three of its whole words (words: whole_words()
+    of the vocabulary), the lowest ids among those in the region's inner half (closer to its density
+    peak than the median member), or among all of its words when fewer than three sit there. A region
+    whose words are fewer than WORD_FRACTION_MIN of its members is named by the kind of piece it is
+    made of instead (piece_kind(), the commonest): the few words of a region of fragments are mostly
+    fragments the gates let through (" gamb", " hed": the SmolLM2 region of " stud", " bec", " includ"
+    has 4% "words"; its regions of words have 11-61%). Returns (name, [[text, id], ...]); the list is
+    empty for a kind name."""
+    members = np.asarray(members)
+    words = [int(i) for i in members if int(i) in words]
+    if words and len(words) >= WORD_FRACTION_MIN * len(members):
+        pts = np.asarray(xy[members], dtype=np.float64)
+        peak = density_peak(pts)
+        inner = np.linalg.norm(xy[words] - peak, axis=1) <= np.median(np.linalg.norm(pts - peak, axis=1))
+        near = [i for i, ok in zip(words, inner) if ok]
+        pick = sorted(near if len(near) >= 3 else words)[:3]
+        return " · ".join(texts[i].strip() for i in pick), [[texts[i], i] for i in pick]
+    kinds = Counter(piece_kind(texts[i]) for i in members)
+    return max(kinds, key=kinds.get), []
+
+
 def cluster_summary(xy: np.ndarray, texts: list[str], types: np.ndarray, n_clusters: int = 24,
                     seed: int = 0) -> list[dict]:
-    """KMeans clusters of the 2D points, each labelled by its 3 lowest-id printable normal tokens."""
+    """KMeans clusters of the 2D points, each with a "label" (its 3 lowest-id printable normal tokens,
+    a frequency proxy, kept for older pages) and a "landmark" (landmark(): its whole words nearest its
+    density peak, or the kind of piece it is made of)."""
     from sklearn.cluster import KMeans
 
     n = len(xy)
@@ -281,6 +424,7 @@ def cluster_summary(xy: np.ndarray, texts: list[str], types: np.ndarray, n_clust
     km = KMeans(n_clusters=k, n_init=4, random_state=seed).fit(xy)
     labels = km.labels_
     types = np.asarray(types)
+    words = whole_words(texts, types)
     clusters = []
     for c in range(k):
         members = np.flatnonzero(labels == c)
@@ -289,13 +433,18 @@ def cluster_summary(xy: np.ndarray, texts: list[str], types: np.ndarray, n_clust
         good = [i for i in members if types[i] in (TOKEN_NORMAL, TOKEN_BYTE) and _printable(texts[i])]
         pick = (good if len(good) >= 3 else list(members))[:3]  # members are id-sorted already
         centre = xy[members].mean(axis=0)
+        name, picked = landmark(xy, members, texts, words)
         clusters.append({
-            "label": " ".join(_label_text(texts[i]) for i in pick),
+            "label": " ".join(_label_text(texts[i]) for i in pick), "landmark": name, "landmark_tokens": picked,
             "x": round(float(centre[0]), 4), "y": round(float(centre[1]), 4), "n": len(members),
             "tokens": [[texts[i], int(i)] for i in pick],
         })
     clusters.sort(key=lambda c: -c["n"])
     return clusters
+
+
+def format_clusters(clusters: list[dict]) -> str:
+    return "\n".join(f"  n={c['n']:6d} at ({c['x']:+.2f}, {c['y']:+.2f}): {c['landmark']}  [{c['label']}]" for c in clusters)
 
 
 def find_token(texts: list[str], text: str, types=None) -> int | None:
@@ -366,11 +515,35 @@ def write_map(stem: str, xy: np.ndarray, meta: dict) -> tuple[str, str]:
     bin_path, json_path = stem + ".vocab_map.bin", stem + ".vocab_map.json"
     with open(bin_path, "wb") as f:
         f.write(np.ascontiguousarray(xy, dtype="<f2").tobytes())
-    meta = dict(meta, format=FORMAT, n=int(len(xy)), bin=os.path.basename(bin_path))
+    write_meta(json_path, dict(meta, format=FORMAT, n=int(len(xy)), bin=os.path.basename(bin_path)))
+    return bin_path, json_path
+
+
+def write_meta(json_path: str, meta: dict) -> None:
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
         f.write("\n")
-    return bin_path, json_path
+
+
+def relabel(model: str, stem: str, n_clusters: int = 24, log=print) -> dict:
+    """Recompute the clusters and landmarks of the existing map <stem>.vocab_map.bin/.json from the
+    .bin and the model's vocabulary, rewrite the .json (the .bin is kept) and return the new meta."""
+    from superborg.convert import read_borg
+
+    header, mm, data_start = read_borg(model)
+    texts, types = token_texts(header, mm, data_start)
+    xy = read_map(stem + ".vocab_map.bin")
+    if len(xy) != len(texts):
+        raise ValueError(f"{stem}.vocab_map.bin has {len(xy)} rows, the model {len(texts)} tokens")
+    with open(stem + ".vocab_map.json", encoding="utf-8") as f:
+        meta = json.load(f)
+    t0 = time.perf_counter()
+    meta["clusters"] = cluster_summary(xy, texts, types, n_clusters)
+    meta["landmark_rule"] = LANDMARK_RULE
+    write_meta(stem + ".vocab_map.json", meta)
+    log(f"relabelled {stem}.vocab_map.json: {len(meta['clusters'])} clusters in {time.perf_counter() - t0:.1f}s")
+    log(format_clusters(meta["clusters"]))
+    return meta
 
 
 def read_map(bin_path: str) -> np.ndarray:
@@ -434,7 +607,7 @@ def layout_map(y: np.ndarray, texts: list[str], types: np.ndarray, seeds: list[i
         "pca_explained": round(explained, 4), "n_neighbors": n_neighbors, "min_dist": min_dist,
         "metric": "cosine", "standardized": True,
         "extent": [round(float(v), 4) for v in (xy[:, 0].min(), xy[:, 0].max(), xy[:, 1].min(), xy[:, 1].max())],
-        "clusters": clusters,
+        "landmark_rule": LANDMARK_RULE, "clusters": clusters,
     }
     return {"xy": xy, "meta": meta, "probes": rows, "layouts": {s: layouts[s][0] for s in seeds}}
 
@@ -451,16 +624,21 @@ def main(argv=None) -> int:
     ap.add_argument("--min-dist", type=float, default=0.1)
     ap.add_argument("--clusters", type=int, default=24, help="KMeans clusters to label (default 24)")
     ap.add_argument("--probes", default=None, help="comma-separated probe tokens (default: a built-in list)")
+    ap.add_argument("--relabel", action="store_true",
+                    help="keep the existing .bin and recompute only the clusters and landmarks into the .json (no UMAP)")
     a = ap.parse_args(argv)
 
+    stem = os.path.splitext(os.path.basename(a.model))[0]
+    out_dir = a.out_dir or os.path.dirname(os.path.abspath(a.model))
+    if a.relabel:
+        relabel(a.model, os.path.join(out_dir, stem), a.clusters)
+        return 0
     try:
         from threadpoolctl import threadpool_limits
         threadpool_limits(max(1, a.n_jobs))  # BLAS threads of the PCA
     except ImportError:
         pass
     probes = [p for p in a.probes.split(",")] if a.probes else PROBES
-    stem = os.path.splitext(os.path.basename(a.model))[0]
-    out_dir = a.out_dir or os.path.dirname(os.path.abspath(a.model))
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.perf_counter()
     w, texts, types, header = load_unembedding(a.model)
@@ -480,9 +658,8 @@ def main(argv=None) -> int:
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     rss_children = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
     print(f"wrote {bin_path} ({os.path.getsize(bin_path)} bytes) and {json_path}")
-    print(f"clusters ({len(meta['clusters'])}):")
-    for c in meta["clusters"]:
-        print(f"  n={c['n']:6d} at ({c['x']:+.2f}, {c['y']:+.2f}): {c['label']}")
+    print(f"clusters ({len(meta['clusters'])}), landmark [label]:")
+    print(format_clusters(meta["clusters"]))
     print("probe neighbourhoods (map: 5 nearest on the 2D map; pca: 5 nearest by cosine in the PCA space):")
     print(format_probes(res["probes"]))
     print(f"total {time.perf_counter() - t0:.1f}s, peak RSS {rss:.0f} MB (largest worker {rss_children:.0f} MB)")

@@ -18,11 +18,15 @@ The right-hand side has a view switch (top right of the panel bar).
   from* carry an aqua wash whose strength is the effective attention weight (`attn_eff`, the
   head-mean row weighted by each position's value norm). At rest (the output layer) the wash is
   the mean over all blocks, "what did this word read overall"; while scrubbing it is the single
-  block's row. Position 0 (the attention sink) is stated in words and never washed; a position
-  whose residual spike (`resid.spike`) exceeds 100x *and* stands 5x above the median of the traced
-  positions at that layer is marked as sink-like (dotted underline), named in the narration and
-  left out of the wash scaling the same way. (The absolute rule alone would flag ordinary words:
-  in the recordings many reach 110-150x at layer 1 or 2, where every position spikes.)
+  block's row. Position 0 is always the attention sink: stated in words, never washed. Any other
+  traced position gets the dotted underline (and is named in the narration and left out of the
+  wash scaling the same way) when, at some layer from the third on (index 2), its residual spike
+  (`resid.spike`: the largest |dimension| over the median |dimension|) is above 100x *and* above
+  5x the median spike of the traced positions at that layer (`SINK_SPIKE`, `SINK_RATIO`; with
+  fewer than four traced positions, above 300x instead, since a median of so few says little). The
+  absolute rule alone would flag ordinary words: in the recordings many reach 110-150x at layer 1
+  or 2, where every position spikes; the positions that act as sinks sit 14-50x above the rest for
+  a run of layers. The flags are recomputed as more positions arrive, since the medians move.
 * **The field** ("word space"). Every word piece of the vocabulary is a dim dot at its position on
   the vocabulary map (`tools/vocab_map.py`: a UMAP of the standardized, PCA-64 unembedding rows,
   framed to its 0.5..99.5 percentile box). Nothing else is drawn until a word is picked. Then, for
@@ -42,10 +46,12 @@ The right-hand side has a view switch (top right of the panel bar).
   skipped by the pacing rule still deposits.
   The header line states the map's honesty: how many pieces, how many sit off-frame on the border,
   and the map's neighbourhood stability across seeds (`stability_knn15`). The region labels are the
-  map json's readable landmarks when it carries them (`clusters[i].landmark`: the region's commonest
-  whole words in a reference text, the `--label-text` rule of `tools/vocab_map.py`), else the
-  region's three commonest pieces joined with middle dots (`stud · bec · includ`), so the reader
-  sees that regions are made of word pieces. The nine largest regions are labelled (five when the
+  map json's readable landmarks when it carries them (`clusters[i].landmark`, written by
+  `tools/vocab_map.py`: up to three whole words of the region, `water · light · energy`, the
+  commonest by token id among those in the region's inner half around its density peak, or, for a
+  region without words, the kind of piece it is made of: `fragments`, `punctuation`, `numbers`,
+  `code`), else the region's three commonest pieces joined with middle dots (`stud · bec · includ`),
+  so the reader sees that regions are made of word pieces. The nine largest regions are labelled (five when the
   stage is under 420 px wide, as on a phone), each label kept inside the stage by its measured width,
   in muted ink at 60% on paper and 45% in the dark theme (`--region-alpha`). A label beside a mark
   (the chosen word's, the top guess's, the runner-up's) is kept between the header line and the
@@ -151,6 +157,15 @@ at 1.6–1.7 ms for a layer step, 1.9–2.3 ms for a landing and 1.6–2.3 ms fo
 
 `tools/vocab_map.py MODEL.borg` writes `<model stem>.vocab_map.bin` (n × 2 float16) and
 `.vocab_map.json` (the parameters, the stability metrics and 24 labelled regions) next to the model.
+Each region carries a `label` (its three lowest-id printable pieces, kept for older pages) and a
+`landmark`: whole words are the word-initial, alphabetic pieces of 3-12 letters that are not stop
+words, that stand alone rather than being the start of the vocabulary's longer pieces (a fragment
+such as ` includ` is outweighed by ` include`, ` included`, ` includes` and ` including`, measured on
+the ids as a frequency proxy, since BPE merges are ordered by frequency) and that the vocabulary
+holds in both cases (` water` and ` Water`); a region whose words are fewer than one piece in twenty
+is named by its kind instead (SmolLM2's regions of fragments have up to 5% "words", mostly fragments
+the gates let through; its regions of words 11-61%). `--relabel` recomputes the regions and
+landmarks of an existing map from its `.bin` in a few seconds, without the UMAP.
 The UI server serves them at `GET /api/vocab_map.json` and `GET /api/vocab_map.bin` (404 without
 them) and reports `"vocab_map": true` in `/api/info`; `wasm/make_artifact.py` copies them into the
 site as `vocab_map.json` and `vocab_map.bin` and lists them in `model.json` (`"vocab_map"`), which
@@ -181,7 +196,9 @@ contract, the settings, and the flow view (sprites and pigment deposits via `flo
 no-map ladder, reduced motion, the strip's wrapping at phone width, the scrubber's keys, the
 first-run cards, the cards following a sweep while the narration waits, the layer table and the
 Step button, readable region landmarks, the follow-live queue policy, `?replay=` of a synthetic
-trace, and of a real recording when `SUPERBORG_TRACE=<path>` is set); its `test_vocab_map_routes`
+trace, and of a real recording: `tests/fixtures/qwen2.5-0.5b-q8_0-insects.jsonl`, a complete
+four-token recording with every token's trace, or the one `SUPERBORG_TRACE=<path>` names in its
+place; without either the case is a pytest skip); its `test_vocab_map_routes`
 checks the server's `/api/vocab_map.json` and `.bin` routes and the `vocab_map` flag of
 `/api/info` with and without the two files. `tests/test_ui.py` covers the server, including
 that the page is one file whose only `fetch()` calls are in the transport section.

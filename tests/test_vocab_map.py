@@ -136,6 +136,113 @@ def test_find_token_and_probe_formatting(vm):
     assert "' Paris' (id 1)" in text and "not a single token" in text
 
 
+# ---- landmarks -------------------------------------------------------------------------------
+def test_readable_word_and_piece_kind(vm):
+    assert vm.readable_word(" Paris") == "Paris" and vm.readable_word(" city") == "city"
+    assert vm.readable_word("Paris") is None                                  # not word-initial: no space marker
+    assert vm.readable_word(" the") is None and vm.readable_word(" The") is None and vm.readable_word(" would") is None
+    assert vm.readable_word(" ab") is None and vm.readable_word(" " + "a" * 13) is None   # 3-12 letters
+    assert vm.readable_word(" " + "a" * 12) == "a" * 12 and vm.readable_word(" abc") == "abc"
+    assert vm.readable_word(" don't") is None and vm.readable_word(" 123") is None and vm.readable_word(" x1") is None
+    assert vm.readable_word(" LGBT") is None and vm.readable_word(" QtWidgets") is None and vm.readable_word(" iPhone") is None
+    assert vm.readable_word("") is None and vm.readable_word(" ") is None and vm.readable_word("  abc") is None
+    assert vm.piece_kind("12") == "numbers" == vm.piece_kind(" 12")
+    assert vm.piece_kind("!") == "punctuation" == vm.piece_kind("--") == vm.piece_kind(" ...")
+    assert vm.piece_kind("ing") == "fragments" == vm.piece_kind(" stud")
+    assert vm.piece_kind("foo_bar") == "code" == vm.piece_kind("    ") == vm.piece_kind("x1") == vm.piece_kind("<div>") == vm.piece_kind("\n")
+
+
+def test_word_share_separates_words_from_fragments(vm):
+    # ids follow merge order: a fragment's extensions come right after it, a word's derivations much later
+    texts = [" includ", " include", " included", " includes", " water", " city"] + [f"f{i}" for i in range(40)] + [" watered", " citywide", "waterfall"]
+    share = vm.word_share(texts, range(len(texts)))
+    assert share[0] < 0                                            # " includ": 1 - 1 * (1/2 + 1/3 + 1/4)
+    assert np.isclose(share[0], 1 - (1 / 2 + 1 / 3 + 1 / 4))
+    assert share[1] < vm.WORD_SHARE_MIN                             # " include" is followed at once by " included", " includes"
+    assert share[2] == 1.0 and share[3] == 1.0                      # nothing extends them
+    assert np.isclose(share[4], 1 - 5 / 47) and share[4] > vm.WORD_SHARE_MIN   # " water": " watered" at id 46; "waterfall" (no space) is not an extension
+    assert np.isclose(share[5], 1 - 6 / 48)
+    assert set(share) == set(range(len(texts)))
+    assert vm.word_share(texts, []) == {}
+
+
+def _synthetic_vocabulary():
+    """Six tight regions on the map: words (with stop words, a fragment and its extensions, an added token,
+    a far-off word, a name, a lowercase word without a capitalized twin and a capitalized fragment), a
+    second word region with one word outside the inner half, and regions of digits, punctuation, code
+    and word fragments. Returns (texts, types, xy, {region name: centre})."""
+    rng = np.random.default_rng(7)
+    texts, types, xy = [], [], []
+    centres = {"words": (0.6, 0.6), "numbers": (-0.6, 0.6), "punctuation": (-0.6, -0.6), "code": (0.6, -0.6),
+               "fragments": (0.0, 0.0), "words2": (0.0, 0.8)}
+
+    def put(region, pieces, kind=0, offset=(0.0, 0.0), spread=0.0):
+        for t in pieces:
+            texts.append(t)
+            types.append(kind)
+            xy.append(np.array(centres[region]) + offset + rng.normal(scale=spread, size=2))
+
+    put("words", [" the", " and"])                     # ids 0, 1: stop words, never a landmark
+    put("words", [" Special"], kind=3)                 # id 2: an added token, not a candidate
+    put("words", [" qwerty"])                          # id 3: lowercase without " Qwerty" in the vocabulary: not a word
+    put("words", [" zebra"], offset=(0.25, 0.0))       # id 4: a word, but outside the region's inner half
+    put("words", [" paris", " city", " france"])       # ids 5-7: the landmark
+    put("words", [" includ", " include", " included", " includes", " water"])   # ids 8-12: fragment, near-fragment, words
+    put("words2", [" alpha", " beta"])                 # ids 13, 14
+    put("words2", [" gamma"], offset=(0.0, -0.25))     # id 15: outside the inner half, but fewer than three words sit inside
+    put("words", [" Europe"])                          # id 16: a name, no lowercase form: a word
+    put("words", [" Anthrop", " anthrop", " anthropology"])   # ids 17-19: a capitalized fragment whose lowercase form is one
+    put("words", [" QtWidgets", " LGBT"])              # ids 20, 21: not readable
+    put("words", [f"wa{i}" for i in range(40)], spread=0.02)
+    put("numbers", [str(d) for d in range(10)] + [" 10", " 2024", "100"], spread=0.02)
+    put("punctuation", ["!", "?", ",", ".", ";", ":", "--", "(", ")", "...", '"', "'"], spread=0.02)
+    put("code", ["foo_bar", "x1", "    ", "<div>", "self.", "();", "__init__", "arr[0]", "\n", "\t"], spread=0.02)
+    put("fragments", ["ing", "tion", "ness", "ment", "able", "ous", "ly", "ed"], spread=0.02)
+    put("words2", [f"wb{i}" for i in range(20)], spread=0.02)
+    put("words", [" Zebra", " Paris", " City", " France", " Included", " Water", " Alpha", " Beta", " Gamma"])   # the capitalized twins, at high ids
+    return texts, np.array(types, dtype=np.uint8), np.array(xy, dtype=np.float32), centres
+
+
+def test_landmark_rule_on_a_synthetic_vocabulary(vm):
+    texts, types, xy, centres = _synthetic_vocabulary()
+    cands = [i for i in range(len(texts)) if types[i] == vm.TOKEN_NORMAL and vm.readable_word(texts[i])]
+    assert 2 not in cands and 0 not in cands and 5 in cands and 20 not in cands and 21 not in cands
+    share = vm.word_share(texts, cands)
+    assert share[8] < vm.WORD_SHARE_MIN and share[10] >= vm.WORD_SHARE_MIN   # " includ" is a fragment, " included" a word
+    assert share[18] < vm.WORD_SHARE_MIN                                      # " anthrop": " anthropology" follows at once
+    words = vm.whole_words(texts, types)
+    twins = [i for i, t in enumerate(texts) if t in (" Zebra", " Paris", " City", " France", " Included", " Water", " Alpha", " Beta", " Gamma")]
+    assert set(words) == {4, 5, 6, 7, 10, 12, 13, 14, 15, 16} | set(twins)
+    assert all(v >= vm.WORD_SHARE_MIN for v in words.values())
+    region = lambda name: [i for i in range(len(texts)) if np.linalg.norm(xy[i] - centres[name]) < 0.3]
+    assert vm.landmark(xy, region("words"), texts, words) == ("paris · city · france", [[" paris", 5], [" city", 6], [" france", 7]])
+    assert vm.landmark(xy, region("words2"), texts, words) == ("alpha · beta · gamma", [[" alpha", 13], [" beta", 14], [" gamma", 15]])
+    for name in ("numbers", "punctuation", "code", "fragments"):
+        assert vm.landmark(xy, region(name), texts, words) == (name, [])
+    # a lone word among many pieces does not name the region: fewer than one member in twenty
+    many = region("numbers") + region("fragments") + region("code") + [5]
+    assert vm.landmark(xy, many, texts, words) == ("numbers", [])
+    assert vm.landmark(xy, region("code") + [5, 6, 7], texts, words)[0] == "paris · city · france"   # 3 of 13: words
+    peak = vm.density_peak(xy[region("words")])
+    assert np.linalg.norm(peak - centres["words"]) < 0.05 and vm.density_peak(np.zeros((1, 2))).tolist() == [0, 0]
+
+
+def test_cluster_summary_carries_landmarks(vm):
+    pytest.importorskip("sklearn")
+    texts, types, xy, centres = _synthetic_vocabulary()
+    clusters = vm.cluster_summary(xy, texts, types, n_clusters=len(centres))
+    assert len(clusters) == len(centres) and sum(c["n"] for c in clusters) == len(texts)
+    by_region = {min(centres, key=lambda k: np.hypot(c["x"] - centres[k][0], c["y"] - centres[k][1])): c for c in clusters}
+    assert set(by_region) == set(centres)
+    assert by_region["words"]["landmark"] == "paris · city · france" and by_region["words"]["landmark_tokens"] == [[" paris", 5], [" city", 6], [" france", 7]]
+    assert by_region["words2"]["landmark"] == "alpha · beta · gamma"
+    for name in ("numbers", "punctuation", "code", "fragments"):
+        assert by_region[name]["landmark"] == name and by_region[name]["landmark_tokens"] == []
+    for c in clusters:  # the compatibility label is still the three lowest printable ids
+        assert c["label"] == " ".join(vm._label_text(t) for t, _ in c["tokens"]) and len(c["tokens"]) == 3
+    assert by_region["words"]["label"] == "the and qwerty"   # the added token " Special" is skipped, as before
+
+
 # ---- the UMAP + KMeans pipeline on a tiny matrix --------------------------------------------
 def test_build_map_on_synthetic_clusters(vm):
     pytest.importorskip("umap")
@@ -157,9 +264,11 @@ def test_build_map_on_synthetic_clusters(vm):
     assert len(meta["extent"]) == 4
     assert len(meta["clusters"]) == k and sum(c["n"] for c in meta["clusters"]) == n
     for c in meta["clusters"]:
-        assert set(c) >= {"label", "x", "y", "n", "tokens"} and len(c["tokens"]) == 3
+        assert set(c) >= {"label", "landmark", "landmark_tokens", "x", "y", "n", "tokens"} and len(c["tokens"]) == 3
         assert -1 <= c["x"] <= 1 and -1 <= c["y"] <= 1
         assert c["label"] == " ".join(t for t, _ in c["tokens"])
+        assert c["landmark"] == "code" and c["landmark_tokens"] == []   # "tokN" pieces (letters and digits): no whole word anywhere
+    assert meta["landmark_rule"] == vm.LANDMARK_RULE
     # the three blobs stay apart on the map: each token's 5 map neighbours come from its own blob
     blob = np.arange(n) // n_per
     near = vm.knn2d(xy, k=5)
