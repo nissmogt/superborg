@@ -29,13 +29,15 @@ typedef struct {
     uint8_t qs[QK / 2];
 } block_q4_1; /* 20 bytes: x = d * q + m, q in 0..15 */
 
-/* Activations quantized to 8 bits for integer dot products: scale as float plus the
- * block sum (d * sum(qs)) used by formats with an offset. */
+/* Activations quantized to 8 bits for integer dot products: scale as float, the block sum
+ * d * sum(qs) used by formats with an offset, and the integer code sum sum(qs) that the
+ * interleaved kernels subtract (times the weight offset) from their unsigned dot products. */
 typedef struct {
     float d;
     float s;
+    int32_t sum;
     int8_t qs[QK];
-} block_q8a; /* 40 bytes */
+} block_q8a; /* 44 bytes */
 
 typedef struct {
     const char *name;
@@ -46,12 +48,19 @@ typedef struct {
     size_t nbytes;
 } borg_tensor;
 
-/* A weight matrix [rows, cols] in any storage type. */
+/* Storage layouts of a quantized matrix: rows one after another as in the file, or groups of
+ * 8 rows interleaved for the batched kernels (see "interleaved weight layout" in kernels.c). */
+enum { MAT_PLAIN = 0, MAT_X8 = 1 };
+
+/* A weight matrix [rows, cols] in any storage type. row_bytes is the size of one plain row; in
+ * the MAT_X8 layout a group of 8 rows occupies 8 * row_bytes bytes. */
 typedef struct {
     borg_dtype dtype;
     int rows, cols;
     const void *data;
     size_t row_bytes;
+    int layout;
+    void *owned; /* malloc'ed storage of a repacked copy, freed with the model (NULL otherwise) */
 } borg_mat;
 
 /* ---- tokenizer ------------------------------------------------------------ */
@@ -142,6 +151,8 @@ struct borg_ctx {
     float *tr_attn;      /* [n_layers][n_heads][n_ctx]: attention weights over positions */
     float *tr_mlp;       /* [n_layers][hidden_dim]: act(gate) * up */
     float *tr_norms;     /* [n_layers][3]: |attention output|, |MLP output|, |residual after| */
+    float *tr_vnorm;     /* [n_layers][n_kv_heads][n_ctx]: |v| of each cached position, written with the
+                            value itself while tracing is on (0 for positions cached while it was off) */
     int64_t stats_tokens;
     int max_cols;        /* columns of xq rows */
 };
@@ -190,10 +201,25 @@ void quantize_row_q8a(const float *x, block_q8a *y, int n);
 void mat_get_row(const borg_mat *m, int r, float *out);
 /* Dot product of matrix row r with an activation vector given in both float and q8a form. */
 float mat_dot_row(const borg_mat *m, int r, const float *xf, const block_q8a *xq);
-/* out[t * ldo + r] = dot(W[r], x[t]) for r in [r0, r1) and t in [0, T). */
+/* out[t * ldo + r - ro] = dot(W[r], x[t]) for r in [r0, r1) and t in [0, T); ro <= r0 is the
+ * matrix row stored in column 0 of out. */
+void mat_mul_rows_off(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
+                      int ldxq, float *out, int ldo, int ro);
+/* out[t * ldo + r] = dot(W[r], x[t]) for r in [r0, r1) and t in [0, T): mat_mul_rows_off with ro = 0. */
 void mat_mul_rows(const borg_mat *m, int r0, int r1, int T, const float *x, int ldx, const block_q8a *xq,
                   int ldxq, float *out, int ldo);
 int mat_wants_q8a(const borg_mat *m); /* does this matrix consume q8a activations? */
+
+/* Interleaved layout of q8_0 / q4_0 / q4_1 matrices (MAT_X8). mat_x8_bytes is the size of the
+ * repacked copy of a plain matrix; mat_repack_x8 writes it to dst, which may be m->data itself
+ * when rows % 8 == 0 (returns -1 only if the in-place conversion cannot allocate its scratch).
+ * The caller sets m->data / m->layout afterwards. mat_mul_rows_scalar is the portable kernel for
+ * MAT_X8 matrices that every SIMD kernel must match bit for bit (same arguments as
+ * mat_mul_rows_off, q8a activations only). */
+size_t mat_x8_bytes(const borg_mat *m);
+int mat_repack_x8(const borg_mat *m, void *dst);
+void mat_mul_rows_scalar(const borg_mat *m, int r0, int r1, int T, const block_q8a *xq, int ldxq, float *out, int ldo,
+                         int ro);
 
 float vec_dot_f32(const float *a, const float *b, int n);
 void vec_axpy_f32(float *y, float a, const float *x, int n); /* y += a * x */

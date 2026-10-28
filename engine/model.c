@@ -170,6 +170,8 @@ static int get_mat(borg_model *m, const char *name, int rows, int cols, borg_mat
     out->cols = cols;
     out->data = t->data;
     out->row_bytes = dtype_row_bytes(t->dtype, cols);
+    out->layout = MAT_PLAIN; /* repack_model may convert it (and then own the storage) */
+    out->owned = NULL;
     return 0;
 }
 
@@ -264,10 +266,72 @@ static int load_tokenizer(borg_model *m, const json_value *tj, char *err, int er
     return tokenizer_init(t, err, errlen);
 }
 
+/* ---- interleaved weight layout ------------------------------------------- */
+/* Convert a quantized matrix to the layout of the batched kernels (see kernels.c). A matrix in a
+ * mapped file gets a malloc'ed copy and the mapped pages are released, so resident memory does
+ * not double; a buffer the engine read itself, or the caller's buffer of borg_model_load_memory
+ * (which is therefore modified: the engine keeps using it and it must not be read back as a
+ * .borg file), is converted in place through a one-group scratch when its row count is a
+ * multiple of 8, and copied into padded storage otherwise. BORG_NO_REPACK=1 keeps the plain
+ * layout and the per-row kernels, for comparison and debugging. */
+static int repack_mat(borg_model *m, borg_mat *mat, char *err, int errlen) {
+    if (mat->layout != MAT_PLAIN || !(mat->dtype == DT_Q8_0 || mat->dtype == DT_Q4_0 || mat->dtype == DT_Q4_1)) return 0;
+    if (m->map_is_malloc && mat->rows % 8 == 0 && mat_repack_x8(mat, (void *)mat->data) == 0) {
+        mat->layout = MAT_X8;
+        return 0;
+    }
+    void *dst = malloc(mat_x8_bytes(mat));
+    if (!dst) { borg_set_err(err, errlen, "out of memory"); return -1; }
+    mat_repack_x8(mat, dst);
+    const uint8_t *old = (const uint8_t *)mat->data;
+    const size_t old_bytes = (size_t)mat->rows * mat->row_bytes;
+    mat->data = dst;
+    mat->owned = dst;
+    mat->layout = MAT_X8;
+#if !defined(_WIN32) && !defined(BORG_NO_MMAP) && defined(MADV_DONTNEED)
+    if (!m->map_is_malloc) { /* drop the plain copy's pages (whole pages inside the tensor only) */
+        const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+        const uintptr_t a = ((uintptr_t)old + page - 1) / page * page, e = ((uintptr_t)old + old_bytes) / page * page;
+        if (e > a) madvise((void *)a, e - a, MADV_DONTNEED);
+    }
+#endif
+    return 0;
+}
+
+static int repack_model(borg_model *m, char *err, int errlen) {
+#if !defined(__wasi__) /* no environment in the browser, and the runtime provides no environ_get */
+    const char *e = getenv("BORG_NO_REPACK");
+    if (e && *e && strcmp(e, "0")) return 0;
+#endif
+    if (repack_mat(m, &m->tok_embd, err, errlen)) return -1;
+    if (m->cfg.tie_embeddings) m->output = m->tok_embd; /* the same storage, now converted */
+    else if (repack_mat(m, &m->output, err, errlen)) return -1;
+    for (int l = 0; l < m->cfg.n_layers; l++) {
+        borg_layer *L = &m->layers[l];
+        borg_mat *mats[7] = {&L->wq, &L->wk, &L->wv, &L->wo, &L->w_gate, &L->w_up, &L->w_down};
+        for (int i = 0; i < 7; i++)
+            if (repack_mat(m, mats[i], err, errlen)) return -1;
+    }
+    return 0;
+}
+
 void borg_model_free(borg_model *m) {
     if (!m) return;
     tokenizer_free(&m->tok);
     free(m->tok.added);
+    free(m->tok_embd.owned);
+    if (!m->cfg.tie_embeddings) free(m->output.owned); /* tied: the same buffer as tok_embd */
+    if (m->layers)
+        for (int l = 0; l < m->cfg.n_layers; l++) {
+            borg_layer *L = &m->layers[l];
+            free(L->wq.owned);
+            free(L->wk.owned);
+            free(L->wv.owned);
+            free(L->wo.owned);
+            free(L->w_gate.owned);
+            free(L->w_up.owned);
+            free(L->w_down.owned);
+        }
     free(m->layers);
     if (m->tensors)
         for (int i = 0; i < m->n_tensors; i++) free((void *)m->tensors[i].name);
@@ -420,6 +484,7 @@ static borg_model *load_mapped(borg_model *m, const char *path, char *err, int e
     }
     for (int i = 0; i < m->n_tensors; i++)
         if (strncmp(m->tensors[i].name, "tokenizer.", 10)) c->weight_bytes += m->tensors[i].nbytes;
+    if (repack_model(m, err, errlen)) goto fail;
 
     /* tokenizer */
     const json_value *tj = json_get(root, "tokenizer");

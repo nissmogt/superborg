@@ -135,17 +135,187 @@
   const r5 = (x) => Math.round(x * 1e5) / 1e5;
   const r3 = (x) => Math.round(x * 1e3) / 1e3;
 
+  const TRACE_PROMPT_MAX = 256;  // prompt positions traced one per pass with tracePrompt (interp.TRACE_PROMPT_MAX)
+
+  // ---- attention rows and statistics (the same arithmetic as superborg/interp.py) -------------
+  // An attention row over positions 0..n-1 as {scale, sink, pos, w}: the mass on position 0 (the
+  // sink) kept apart as a float, the rest quantized to 8 bits relative to the row's maximum
+  // excluding position 0 (scale; an entry is w * scale / 255), and sparse: entries below 1/(2n) and
+  // entries that would quantize to 0 are dropped. Positions ascending.
+  function encodeRow(row, n) {
+    const out = { scale: 0, sink: r4(row[0]), pos: [], w: [] };
+    if (n < 2) return out;
+    let m = 0;
+    for (let j = 1; j < n; j++) if (row[j] > m) m = row[j];
+    if (m <= 0) return out;
+    const thr = 1 / (2 * n);
+    for (let j = 1; j < n; j++) {
+      const a = row[j], q = Math.floor(a * 255 / m + 0.5);
+      if (a >= thr && q >= 1) { out.pos.push(j); out.w.push(q); }
+    }
+    out.scale = Math.round(m * 1e6) / 1e6;
+    return out;
+  }
+
+  // the dense row an encodeRow result stands for
+  function decodeRow(enc, n) {
+    const row = new Float64Array(n);
+    row[0] = enc.sink;
+    enc.pos.forEach((p, i) => { row[p] = enc.w[i] * enc.scale / 255; });
+    return row;
+  }
+
+  // The effective attention of each layer, Float64Array [L * n]: mean over heads of
+  // alpha_hj * |v_{kv(h), j}|, normalized to sum 1 over positions (Kobayashi et al. 2020).
+  function effectiveRows(attn, vnorm, L, H, KV, n) {
+    const g = H / KV, out = new Float64Array(L * n);
+    for (let l = 0; l < L; l++) {
+      const row = out.subarray(l * n, (l + 1) * n);
+      for (let h = 0; h < H; h++) {
+        const a = (l * H + h) * n, v = (l * KV + Math.floor(h / g)) * n;
+        for (let j = 0; j < n; j++) row[j] += attn[a + j] * vnorm[v + j];
+      }
+      let s = 0;
+      for (let j = 0; j < n; j++) { row[j] /= H; s += row[j]; }
+      if (s > 0) for (let j = 0; j < n; j++) row[j] /= s;
+    }
+    return out;
+  }
+
+  // Per-head scalars of one query, [L][H] (3 decimals): sink (mass on position 0), entropy_norm
+  // (entropy / log(n)), prev (weight on q - 1), self (weight on q), lookback (mass on the prompt
+  // positions / total) and induction (the weights on j + 1 over the earlier positions j whose
+  // token equals the query's; HeadVis's definition). tokens: the context's ids up to q = n - 1.
+  function headStats(attn, L, H, n, tokens, nPrompt) {
+    const q = n - 1, logn = n > 1 ? Math.log(n) : 0, np = Math.max(0, Math.min(nPrompt, n));
+    const out = { sink: [], entropy_norm: [], prev: [], self: [], lookback: [], induction: [] };
+    const match = [];
+    for (let j = 0; j < q; j++) if (tokens[j] === tokens[q]) match.push(j + 1);
+    for (let l = 0; l < L; l++) {
+      const S = { sink: [], entropy_norm: [], prev: [], self: [], lookback: [], induction: [] };
+      for (let h = 0; h < H; h++) {
+        const b = (l * H + h) * n;
+        let tot = 0, e = 0, look = 0, ind = 0;
+        for (let j = 0; j < n; j++) {
+          const a = attn[b + j];
+          tot += a;
+          if (a > 0) e -= a * Math.log(a);
+          if (j < np) look += a;
+        }
+        for (const j of match) ind += attn[b + j];
+        S.sink.push(r3(attn[b]));
+        S.entropy_norm.push(r3(n > 1 ? e / logn : 0));
+        S.prev.push(r3(q >= 1 ? attn[b + q - 1] : 0));
+        S.self.push(r3(attn[b + q]));
+        S.lookback.push(r3(look / (tot > 0 ? tot : 1)));
+        S.induction.push(r3(ind));
+      }
+      for (const k of Object.keys(S)) out[k].push(S[k]);
+    }
+    return out;
+  }
+
+  // The attention fields of a token event (attention_report in superborg/interp.py): attn_rows
+  // (the head-mean row per layer), attn_eff (the effective row), attn_top (its largest entries,
+  // position 0 excluded, [[pos, w]...]), attn_heads (per head the largest raw weights, position 0
+  // excluded), head_stats and attn_entropy ([L][H] nats, 3 decimals).
+  function attentionReport(attn, vnorm, L, H, KV, n, tokens, nPrompt, attnTop, headTop) {
+    const mean = new Float64Array(n), rows = [], effRows = [], top = [], heads = [], ent = [];
+    const eff = effectiveRows(attn, vnorm, L, H, KV, n);
+    for (let l = 0; l < L; l++) {
+      mean.fill(0);
+      for (let h = 0; h < H; h++) {
+        const b = (l * H + h) * n;
+        for (let j = 0; j < n; j++) mean[j] += attn[b + j];
+      }
+      for (let j = 0; j < n; j++) mean[j] /= H;
+      rows.push(encodeRow(mean, n));
+      const er = eff.subarray(l * n, (l + 1) * n);
+      effRows.push(encodeRow(er, n));
+      top.push(topK(er.subarray(1), attnTop).map((j) => [j + 1, r4(er[j + 1])]));
+      const hl = [], el = [];
+      for (let h = 0; h < H; h++) {
+        const row = attn.subarray((l * H + h) * n, (l * H + h + 1) * n);
+        hl.push(topK(row.subarray(1), headTop).map((j) => [j + 1, r4(row[j + 1])]));
+        let e = 0;
+        for (let j = 0; j < n; j++) if (row[j] > 0) e -= row[j] * Math.log(row[j]);
+        el.push(r3(e));
+      }
+      heads.push(hl);
+      ent.push(el);
+    }
+    return { attn_rows: rows, attn_eff: effRows, attn_top: top, attn_heads: heads,
+             head_stats: headStats(attn, L, H, n, tokens, nPrompt), attn_entropy: ent };
+  }
+
+  // ---- residual stream ----------------------------------------------------------------------
+  // A <model>.basis.json (tools/trace_basis.py) checked against the model: {layers: [{mean,
+  // components, clip_dims, clip_to}]}. Throws when the shapes do not fit.
+  function prepareBasis(basis, L, D) {
+    const layers = basis && basis.layers;
+    if (!Array.isArray(layers) || layers.length !== L + 1)
+      throw new Error(`the basis has ${Array.isArray(layers) ? layers.length : "no"} layers; the model needs ${L + 1}`);
+    for (const b of layers)
+      if (!b.mean || b.mean.length !== D || !b.components || b.components.length !== 3 || b.components.some((c) => c.length !== D))
+        throw new Error(`the basis is for dim ${b.mean ? b.mean.length : "?"}; the model has ${D}`);
+    return { layers: layers.map((b) => ({ mean: b.mean, components: b.components, clip_dims: b.clip_dims || [],
+                                          clip_to: b.clip_to == null ? Infinity : b.clip_to })) };
+  }
+
+  // Per-layer diagnostics of the residual stream [(L + 1) * D] (resid_report in interp.py): norm,
+  // spike (max |dim| / median |dim|) and xyz, the projection onto the basis (massive dims
+  // clipped, RMS-normalized, centered, 3 components; null without a basis).
+  function residReport(resid, L, D, basis) {
+    const norm = [], spike = [], xyz = basis ? [] : null, ab = new Float64Array(D);
+    for (let l = 0; l <= L; l++) {
+      const r = resid.subarray(l * D, (l + 1) * D);
+      let ss = 0, mx = 0;
+      for (let i = 0; i < D; i++) {
+        const v = r[i], a = Math.abs(v);
+        ss += v * v;
+        ab[i] = a;
+        if (a > mx) mx = a;
+      }
+      norm.push(r3(Math.sqrt(ss)));
+      const sorted = Float64Array.from(ab).sort();
+      const med = D % 2 ? sorted[(D - 1) / 2] : (sorted[D / 2 - 1] + sorted[D / 2]) / 2;
+      spike.push(r3(mx / (med > 0 ? med : 1)));
+      if (basis) {
+        const x = Float64Array.from(r), b = basis.layers[l], p = [];
+        for (const d of b.clip_dims) x[d] = Math.max(-b.clip_to, Math.min(b.clip_to, x[d]));
+        let s2 = 0;
+        for (let i = 0; i < D; i++) s2 += x[i] * x[i];
+        const rms = Math.sqrt(s2 / D);
+        if (rms > 0) for (let i = 0; i < D; i++) x[i] /= rms;
+        for (let k = 0; k < 3; k++) {
+          const c = b.components[k];
+          let s = 0;
+          for (let i = 0; i < D; i++) s += c[i] * (x[i] - b.mean[i]);
+          p.push(r3(s));
+        }
+        xyz.push(p);
+      }
+    }
+    return { norm, spike, xyz };
+  }
+
   class TraceSession {
-    constructor(model, ctx, options = {}) {
+    constructor(model, ctx, options = {}, basis = null) {
       this.model = model;
       this.ctx = ctx;
       // fusedLens: the lens summarized inside the engine (borg_ctx_lens_summary); false reads the
       // full per-layer logits and summarizes them here (the same tokens and ranks, p within 1e-6)
-      this.opt = Object.assign({ lensStride: 1, lensTop: 3, attnTop: 8, mlpTop: 6, finalTop: 5, fusedLens: true },
+      this.opt = Object.assign({ lensStride: 1, lensTop: 3, attnTop: 8, headTop: 3, mlpTop: 6, finalTop: 5, fusedLens: true },
                                options);
       this.cfg = model.config;
+      this.basis = null;
+      this.nPrompt = 0;  // prompt positions of the current generation (head_stats' lookback)
+      this.setBasis(basis);
       ctx.enableTrace(true);
     }
+
+    /** Use a <model>.basis.json (tools/trace_basis.py) for the "xyz" residual projection, or none. */
+    setBasis(basis) { this.basis = basis ? prepareBasis(basis, this.cfg.n_layers, this.cfg.dim) : null; }
 
     lensLayers(stride = this.opt.lensStride) {
       const n = this.cfg.n_layers, s = Math.max(1, stride | 0), out = [];
@@ -159,7 +329,7 @@
       return {
         model: m.name, arch: m.header.arch, quant: m.header.quant, n_layers: c.n_layers, n_heads: c.n_heads,
         n_kv_heads: c.n_kv_heads, dim: c.dim, hidden_dim: c.hidden_dim, vocab: m.vocabSize, n_ctx: this.ctx.nCtx,
-        chat_format: m.tokenizerInfo.chat_format, threads: 1, lens_layers: this.lensLayers(),
+        chat_format: m.tokenizerInfo.chat_format, threads: 1, lens_layers: this.lensLayers(), basis: this.basis !== null,
         lens_stride: Math.min(Math.max(1, this.opt.lensStride | 0), c.n_layers), backend: "wasm (" + m.b.simd + ")",
       };
     }
@@ -213,43 +383,74 @@
       return cand;
     }
 
+    /** The most probable token of the output distribution other than `chosen` (its rival, as in
+     *  a logit difference), or null when the vocabulary has one token. */
+    rivalOf(chosen, probs) {
+      const n = Math.min(probs.length, this.model.nVocab);
+      if (n < 2) return null;
+      const t = topK(n < probs.length ? probs.subarray(0, n) : probs, 2);
+      return t[0] !== chosen ? t[0] : t[1];
+    }
+
     /** The logit lens rows of the report (as lens_report in superborg/interp.py): per lens layer
-     *  the top tokens as [text, p, id], and the probability and rank of `chosen`. */
-    lensReport(chosen) {
+     *  the top tokens as [text, p, id], the probability and rank of `chosen`, the row's entropy
+     *  (nats) and the probability and rank of `rival`. */
+    lensReport(chosen, rival = null) {
       const o = this.opt, m = this.model, n = m.nVocab, k = Math.max(1, Math.min(o.lensTop, n));
-      const layers = this.lensLayers();
+      const layers = this.lensLayers(), track = rival === null ? [chosen] : [chosen, rival], nt = track.length;
       if (o.fusedLens) {
-        const s = this.ctx.lensSummary(layers, k, chosen, n);
+        const s = this.ctx.lensSummary(layers, k, track, n);
         return layers.map((li, r) => {
           const lse = s.lse[r], top = [];
           for (let i = 0; i < k; i++) {
             const t = s.topIds[r * k + i];
             top.push([m.tokenText(t), r4(Math.exp(s.topLogits[r * k + i] - lse)), t]);
           }
-          return { layer: li, top, p: r5(Math.exp(s.chosenLogit[r] - lse)), rank: s.chosenRank[r] };
+          return { layer: li, top, p: r5(Math.exp(s.trackLogit[r * nt] - lse)), rank: s.trackRank[r * nt],
+                   entropy: r4(s.entropy[r]),
+                   rival_p: rival === null ? null : r5(Math.exp(s.trackLogit[r * nt + 1] - lse)),
+                   rival_rank: rival === null ? null : s.trackRank[r * nt + 1] };
         });
       }
       // the full per-layer logits, then per row: log-sum-exp for the normalizer, ranks and top
-      // tokens from the logits, so no full softmax is materialized
+      // tokens from the logits, so no full softmax is materialized; H = log S - E[z - max]
       const V = m.vocabSize, lensLogits = this.ctx.lens(layers);
       return layers.map((li, r) => {
         const z = lensLogits.subarray(r * V, r * V + n);
-        const zc = z[chosen];
-        let mx = -Infinity, rank = 0;
-        for (let i = 0; i < n; i++) { const v = z[i]; if (v > mx) mx = v; if (v > zc) rank++; }
-        let s = 0;
-        for (let i = 0; i < n; i++) s += Math.exp(z[i] - mx);
+        const zc = z[chosen], zr = rival === null ? Infinity : z[rival];
+        let mx = -Infinity, rank = 0, rrank = 0;
+        for (let i = 0; i < n; i++) { const v = z[i]; if (v > mx) mx = v; if (v > zc) rank++; if (v > zr) rrank++; }
+        let s = 0, w = 0;
+        for (let i = 0; i < n; i++) { const e = Math.exp(z[i] - mx); s += e; w += (z[i] - mx) * e; }
         const lse = mx + Math.log(s);
         return { layer: li, top: topK(z, k).map((t) => [m.tokenText(t), r4(Math.exp(z[t] - lse)), t]),
-                 p: r5(Math.exp(zc - lse)), rank };
+                 p: r5(Math.exp(zc - lse)), rank, entropy: r4(Math.log(s) - w / s),
+                 rival_p: rival === null ? null : r5(Math.exp(zr - lse)), rival_rank: rival === null ? null : rrank };
       });
     }
 
-    tokenReport(chosen, probs) {
+    /** Everything the trace says about the step whose output distribution is `probs` and whose
+     *  token of interest is `chosen` (the sampled token, or the actual next token of a traced
+     *  prompt position). nPrompt: prompt positions for head_stats' lookback (null: the current
+     *  generation's). sampling=false leaves out prob, entropy and alternatives, as prompt_token
+     *  events do. The fields are those of interp.py's token_report (docs/TRACE.md). */
+    tokenReport(chosen, probs, nPrompt = null, sampling = true) {
       const o = this.opt, m = this.model, c = this.cfg;
-      const L = c.n_layers, H = c.n_heads, F = c.hidden_dim, D = c.dim;
+      const L = c.n_layers, H = c.n_heads, KV = c.n_kv_heads, F = c.hidden_dim, D = c.dim;
       const tr = this.ctx.trace();
-      const lens = this.lensReport(chosen);
+      const rival = this.rivalOf(chosen, probs);
+      const lens = this.lensReport(chosen, rival);
+      if (nPrompt === null) nPrompt = this.nPrompt || tr.nPos;
+      const rep = { pos: tr.pos };
+      if (sampling) {
+        let entropy = 0;
+        for (let i = 0; i < probs.length; i++) if (probs[i] > 0) entropy -= probs[i] * Math.log(probs[i]);
+        rep.prob = r5(probs[chosen]);
+        rep.entropy = r4(entropy);
+        rep.alternatives = topK(probs, o.finalTop).map((t) => [m.tokenText(t), r4(probs[t]), t]);
+      }
+      rep.rival = rival === null ? null : [m.tokenText(rival), r4(probs[rival]), rival];
+      rep.lens = lens;
       const attnN = [], mlpN = [], resid = [];
       for (let l = 0; l < L; l++) { attnN.push(r3(tr.norms[l * 3])); mlpN.push(r3(tr.norms[l * 3 + 1])); }
       for (let l = 0; l <= L; l++) {
@@ -257,42 +458,27 @@
         for (let i = 0; i < D; i++) { const v = tr.resid[l * D + i]; s += v * v; }
         resid.push(r3(Math.sqrt(s)));
       }
-      const np = tr.nPos, k = Math.min(o.attnTop, np);
-      const attnTop = [], attnEnt = [];
-      for (let l = 0; l < L; l++) {
-        const mean = new Float64Array(np), ent = [];
-        for (let h = 0; h < H; h++) {
-          let e = 0;
-          const base = (l * H + h) * np;
-          for (let j = 0; j < np; j++) {
-            const a = tr.attn[base + j];
-            mean[j] += a / H;
-            if (a > 0) e -= a * Math.log(a);
-          }
-          ent.push(r3(e));
-        }
-        attnTop.push(topK(mean, k).map((j) => [j, r4(mean[j])]));
-        attnEnt.push(ent);
-      }
+      rep.norms = { attn: attnN, mlp: mlpN, resid };
+      rep.resid = residReport(tr.resid, L, D, this.basis);
+      Object.assign(rep, attentionReport(tr.attn, tr.vnorm, L, H, KV, tr.nPos, tr.tokens, nPrompt, o.attnTop, o.headTop));
       const mlpTop = [];
       for (let l = 0; l < L; l++) {
         const row = tr.mlp.subarray(l * F, (l + 1) * F);
         const abs = Float32Array.from(row, Math.abs);
         mlpTop.push(topK(abs, Math.min(o.mlpTop, F)).map((i) => [i, r3(row[i])]));
       }
-      let entropy = 0;
-      for (let i = 0; i < probs.length; i++) if (probs[i] > 0) entropy -= probs[i] * Math.log(probs[i]);
-      return {
-        pos: tr.pos, prob: r5(probs[chosen]), entropy: r4(entropy),
-        alternatives: topK(probs, o.finalTop).map((t) => [m.tokenText(t), r4(probs[t]), t]),
-        lens, norms: { attn: attnN, mlp: mlpN, resid }, attn_top: attnTop, attn_entropy: attnEnt, mlp_top: mlpTop,
-      };
+      rep.mlp_top = mlpTop;
+      return rep;
     }
 
     /** Generator of events; `shouldStop()` is polled before each chunk of `prefillChunk` prompt tokens
-     *  (a "prefill" event follows every chunk but the last) and between tokens. */
+     *  (a "prefill" event follows every chunk but the last), before each traced prompt token and
+     *  between tokens. tracePrompt: the last TRACE_PROMPT_MAX uncached prompt positions before the
+     *  final one are evaluated one per pass, each followed by a "prompt_token" event (the trace
+     *  fields of a token event, no sampling fields; "id" the token at "pos", "next" the one after
+     *  it, which the lens tracks); each costs a one-token pass plus the trace, as a generated token. */
     * streamChat(messages, { maxTokens = 256, temperature = 0, topP = 1, topK: topKN = 0, seed = 0, enableThinking = null,
-                             chatTemplateKwargs = null, shouldStop, prefillChunk = 64 } = {}) {
+                             chatTemplateKwargs = null, tracePrompt = false, shouldStop, prefillChunk = 64 } = {}) {
       const m = this.model, ctx = this.ctx, info = chatInfo(m);
       const text = renderChat(info, messages, true, enableThinking, chatTemplateKwargs);
       const prompt = m.tokenize(text, false, true);
@@ -311,22 +497,34 @@
       while (reused < cached.length && reused < n - 1 && cached[reused] === prompt[reused]) reused++;
       ctx.truncate(reused);
       const total = n - reused;
+      this.nPrompt = n;
+      // prompt positions evaluated one per pass and traced: [firstTraced, n - 1)
+      const firstTraced = tracePrompt ? Math.max(reused, n - 1 - TRACE_PROMPT_MAX) : n - 1;
       const promptEvent = () => ({ type: "prompt", tokens: prompt.map((t) => m.tokenText(t)), n_prompt: n,
                                    n_reused: reused, prompt_ms: Math.round(now() - t0) });
+      const cancelled = () => ({ type: "done", text: "", n_gen: 0, stop_reason: "cancelled", seconds: 0, tok_per_s: 0 });
       let logits, tDecode;  // decode_ms: the forward pass that produced the token's logits
       for (let s = reused; s < n; s += prefillChunk) {
         if (s > reused) yield { type: "prefill", done: s - reused, total };
-        if (shouldStop && shouldStop()) {
-          yield promptEvent();
-          yield { type: "done", text: "", n_gen: 0, stop_reason: "cancelled", seconds: 0, tok_per_s: 0 };
-          return;
-        }
+        if (shouldStop && shouldStop()) { yield promptEvent(); yield cancelled(); return; }
         const e = Math.min(s + prefillChunk, n);
-        if (e < n) { ctx.decode(prompt.slice(s, e), null); continue; }
-        if (e - 1 > s) ctx.decode(prompt.slice(s, e - 1), null);
-        const tLast = now();  // the last token alone: its pass gives the first reply token's decode_ms
-        logits = ctx.decode([prompt[n - 1]], "last");
-        tDecode = now() - tLast;
+        const last = e === n ? e - 1 : e;  // the final prompt token goes alone (its logits are needed)
+        const plainEnd = Math.min(last, Math.max(firstTraced, s));
+        if (plainEnd > s) ctx.decode(prompt.slice(s, plainEnd), null);
+        for (let q = Math.max(plainEnd, s); q < last; q++) {  // traced prompt positions, one per pass
+          if (shouldStop && shouldStop()) { yield promptEvent(); yield cancelled(); return; }
+          const t1 = now();
+          const lg = ctx.decode([prompt[q]], "last");
+          const t2 = now();
+          const report = this.tokenReport(prompt[q + 1], softmaxRow(lg, 0, lg.length, m.nVocab), n, false);
+          yield Object.assign({ type: "prompt_token", pos: q, id: prompt[q], next: prompt[q + 1],
+                                decode_ms: Math.round(t2 - t1), trace_ms: Math.round(now() - t2) }, report);
+        }
+        if (e === n) {
+          const tLast = now();  // the last token alone: its pass gives the first reply token's decode_ms
+          logits = ctx.decode([prompt[n - 1]], "last");
+          tDecode = now() - tLast;
+        }
       }
       yield promptEvent();
       const rand = mulberry32(seed);
@@ -337,7 +535,7 @@
       for (let i = 0; i < maxTokens; i++) {
         const { tok, probs } = this.sample(logits, rand, temperature, topP, topKN);
         const t1 = now();
-        const report = this.tokenReport(tok, probs);
+        const report = this.tokenReport(tok, probs, n);
         const traceMs = Math.round(now() - t1);
         if (m.isEog(tok)) {
           stop = "eos";
@@ -367,5 +565,6 @@
   root.TraceSession = TraceSession;
   root.renderChat = renderChat;
   if (typeof module !== "undefined" && module.exports)
-    module.exports = { TraceSession, renderChat, stopStrings, chatInfo, topK };
+    module.exports = { TraceSession, renderChat, stopStrings, chatInfo, topK, encodeRow, decodeRow, effectiveRows,
+                       headStats, attentionReport, prepareBasis, residReport };
 })(typeof self !== "undefined" ? self : globalThis);

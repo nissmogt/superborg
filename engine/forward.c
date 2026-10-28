@@ -88,6 +88,7 @@ void borg_ctx_free(borg_ctx *c) {
     free(c->tr_attn);
     free(c->tr_mlp);
     free(c->tr_norms);
+    free(c->tr_vnorm);
     free(c);
 }
 
@@ -192,18 +193,46 @@ int borg_ctx_enable_trace(borg_ctx *c, int enable) {
         c->tr_attn = (float *)calloc2((uint64_t)cfg->n_layers * cfg->n_heads, c->n_ctx, sizeof(float));
         c->tr_mlp = (float *)calloc2(cfg->n_layers, cfg->hidden_dim, sizeof(float));
         c->tr_norms = (float *)calloc((size_t)cfg->n_layers * 3, sizeof(float));
-        if (!c->tr_resid || !c->tr_attn || !c->tr_mlp || !c->tr_norms) {
+        c->tr_vnorm = (float *)calloc2((uint64_t)cfg->n_layers * cfg->n_kv_heads, c->n_ctx, sizeof(float));
+        if (!c->tr_resid || !c->tr_attn || !c->tr_mlp || !c->tr_norms || !c->tr_vnorm) {
             free(c->tr_resid);
             free(c->tr_attn);
             free(c->tr_mlp);
             free(c->tr_norms);
-            c->tr_resid = c->tr_attn = c->tr_mlp = c->tr_norms = NULL;
+            free(c->tr_vnorm);
+            c->tr_resid = c->tr_attn = c->tr_mlp = c->tr_norms = c->tr_vnorm = NULL;
             return -1;
         }
         c->trace_pos = -1;
     }
     c->trace_on = 1;
     return 0;
+}
+
+/* |v| of the cached positions [0, n) of every layer and kv head, from the cache itself: for
+ * positions that arrive by borg_ctx_copy or borg_ctx_load rather than through qkv_post. */
+static void vnorm_from_cache(borg_ctx *c, int n) {
+    const borg_config *cfg = &c->model->cfg;
+    const int HD = cfg->head_dim, NKV = cfg->n_kv_heads * HD;
+    for (int l = 0; l < cfg->n_layers; l++)
+        for (int h = 0; h < cfg->n_kv_heads; h++) {
+            const size_t base = (size_t)l * NKV * c->n_ctx + (size_t)h * c->n_ctx * HD;
+            float *out = c->tr_vnorm + ((size_t)l * cfg->n_kv_heads + h) * c->n_ctx;
+            for (int j = 0; j < n; j++) {
+                float ss = 0.0f;
+                if (c->kv_f16) {
+                    const uint16_t *v = (const uint16_t *)c->v_cache + base + (size_t)j * HD;
+                    for (int i = 0; i < HD; i++) {
+                        const float x = fp16_to_fp32(v[i]);
+                        ss += x * x;
+                    }
+                } else {
+                    const float *v = (const float *)c->v_cache + base + (size_t)j * HD;
+                    ss = vec_dot_f32(v, v, HD);
+                }
+                out[j] = sqrtf(ss);
+            }
+        }
 }
 
 int borg_ctx_trace_pos(const borg_ctx *c) { return c->tr_resid ? c->trace_pos : -1; }
@@ -228,6 +257,12 @@ const float *borg_ctx_trace_mlp(const borg_ctx *c, int layer) {
 
 const float *borg_ctx_trace_norms(const borg_ctx *c) {
     return c->tr_norms && c->trace_pos >= 0 ? c->tr_norms : NULL;
+}
+
+const float *borg_ctx_trace_vnorm(const borg_ctx *c, int layer, int kv_head) {
+    const borg_config *cfg = &c->model->cfg;
+    if (!c->tr_vnorm || layer < 0 || layer >= cfg->n_layers || kv_head < 0 || kv_head >= cfg->n_kv_heads) return NULL;
+    return c->tr_vnorm + ((size_t)layer * cfg->n_kv_heads + kv_head) * c->n_ctx;
 }
 
 int borg_ctx_n_ctx(const borg_ctx *c) { return c->n_ctx; }
@@ -382,6 +417,12 @@ static void qkv_post(borg_ctx *c, borg_ctx *kc, int l, int t, int pos) {
     const size_t layer_off = (size_t)l * NKV * kc->n_ctx;
     for (int h = 0; h < cfg->n_kv_heads; h++) {
         const size_t off = layer_off + ((size_t)h * kc->n_ctx + (size_t)pos) * HD;
+        /* |v| of this position for the effective-attention view (rows are distinct per item: no race);
+         * 0 while tracing is off, so a slot re-evaluated after a truncate or reset does not keep a
+         * stale norm from an earlier traced evaluation */
+        if (kc->tr_vnorm)
+            kc->tr_vnorm[((size_t)l * cfg->n_kv_heads + h) * kc->n_ctx + pos] =
+                kc->trace_on ? sqrtf(vec_dot_f32(v + h * HD, v + h * HD, HD)) : 0.0f;
         if (kc->kv_f16) {
             uint16_t *kd = (uint16_t *)kc->k_cache + off, *vd = (uint16_t *)kc->v_cache + off;
             for (int i = 0; i < HD; i++) {
@@ -624,6 +665,7 @@ int borg_ctx_copy(borg_ctx *dst, const borg_ctx *src) {
         }
     memcpy(dst->tokens, src->tokens, n * sizeof(int32_t));
     dst->n_past = src->n_past;
+    if (dst->tr_vnorm) vnorm_from_cache(dst, (int)n);
     return 0;
 }
 
@@ -685,6 +727,7 @@ int borg_ctx_load(borg_ctx *c, const char *path) {
     fclose(f);
     if (!ok) return -3;
     c->n_past = n;
+    if (c->tr_vnorm) vnorm_from_cache(c, n);
     return 0;
 }
 
@@ -710,25 +753,25 @@ int borg_ctx_lens(borg_ctx *c, const int *layers, int n, float *logits) {
 
 /* ---- fused logit lens ----------------------------------------------------- */
 /* borg_ctx_lens_summary multiplies the output matrix in blocks of LENS_BLOCK rows. A block leaves,
- * per lens row, its own partial summary (the top list, the max and the sum of exponentials, the
- * count above the chosen logit); the partials are merged in block order afterwards, so the
- * result is the same whichever threads ran which blocks. */
+ * per lens row, its own partial summary (the top list, the max, the sums of exp(z - max) and of
+ * (z - max) exp(z - max), the counts above each tracked logit); the partials are merged in block
+ * order afterwards, so the result is the same whichever threads ran which blocks. */
 #define LENS_BLOCK 512
 
 typedef struct {
-    double max, sum; /* the block's largest logit and the sum of exp(z - max) */
-    int32_t above;   /* logits strictly greater than the chosen token's */
-    int32_t n_top;   /* entries filled in the block's top list */
+    double max, sum, wsum; /* the block's largest logit, sum of exp(z - max), sum of (z - max) exp(z - max) */
+    int32_t n_top;         /* entries filled in the block's top list */
 } lens_part;
 
 typedef struct {
     borg_ctx *c;
-    int T, n_vocab, kb;        /* kb = min(k, LENS_BLOCK): entries kept per block */
-    const float *chosen_logit; /* [T] */
-    float *scratch;            /* [n_threads][T][LENS_BLOCK] logits of the block in flight */
-    lens_part *parts;          /* [n_blocks][T] */
-    int32_t *ids;              /* [n_blocks][T][kb] top ids of each block, best first */
-    float *vals;               /* [n_blocks][T][kb] their logits */
+    int T, n_vocab, k, n_track;
+    const float *track_logit; /* [T][n_track] logits of the tracked tokens */
+    float *scratch;           /* [n_threads][T][LENS_BLOCK] logits of the block in flight */
+    lens_part *parts;         /* [n_blocks][T] */
+    int32_t *above;           /* [n_blocks][T][n_track] logits strictly greater than each tracked one */
+    int32_t *ids;             /* [n_blocks][T][k] top ids of each block, best first */
+    float *vals;              /* [n_blocks][T][k] their logits */
 } lens_task;
 
 /* exp(z - mx) for floats z <= mx without a libm call, so that a loop over a block vectorizes:
@@ -785,66 +828,79 @@ static void lens_range(void *arg, int b0, int b1, int ith) {
     lens_task *t = (lens_task *)arg;
     borg_ctx *c = t->c;
     const borg_mat *w = &c->model->output;
-    const int T = t->T, kb = t->kb, D = c->model->cfg.dim;
+    const int T = t->T, k = t->k, nt = t->n_track, D = c->model->cfg.dim;
     float *z = t->scratch + (size_t)ith * T * LENS_BLOCK;
     double e[LENS_BLOCK];
     for (int b = b0; b < b1; b++) {
         const int r0 = b * LENS_BLOCK, r1 = r0 + LENS_BLOCK < t->n_vocab ? r0 + LENS_BLOCK : t->n_vocab;
         const int nr = r1 - r0;
         /* the kernel of borg_ctx_lens on the same normalized and quantized rows, so each logit is
-         * the same number; it writes out[t * ldo + r] for the absolute row r, hence the offset */
-        mat_mul_rows(w, r0, r1, T, c->xb, D, c->xq, c->max_cols / QK, z - r0, LENS_BLOCK);
+         * the same number; row r0 of the matrix lands in column 0 of z */
+        mat_mul_rows_off(w, r0, r1, T, c->xb, D, c->xq, c->max_cols / QK, z, LENS_BLOCK, r0);
         for (int tt = 0; tt < T; tt++) {
             const float *row = z + (size_t)tt * LENS_BLOCK;
-            const float zc = t->chosen_logit[tt];
             lens_part *p = &t->parts[(size_t)b * T + tt];
-            int32_t *ids = t->ids + ((size_t)b * T + tt) * kb;
-            float *vals = t->vals + ((size_t)b * T + tt) * kb;
+            int32_t *ids = t->ids + ((size_t)b * T + tt) * k;
+            float *vals = t->vals + ((size_t)b * T + tt) * k;
+            int32_t *above = t->above + ((size_t)b * T + tt) * nt;
             int n = 0;
             for (int j = 0; j < nr; j++)
-                if (n < kb || row[j] > vals[kb - 1]) top_insert(ids, vals, &n, kb, r0 + j, row[j]);
+                if (n < k || row[j] > vals[k - 1]) top_insert(ids, vals, &n, k, r0 + j, row[j]);
             const float mx = vals[0]; /* the block's largest logit */
-            int32_t above = 0;
-            for (int j = 0; j < nr; j++) above += row[j] > zc;
+            for (int i = 0; i < nt; i++) {
+                const float zt = t->track_logit[(size_t)tt * nt + i];
+                int32_t cnt = 0;
+                for (int j = 0; j < nr; j++) cnt += row[j] > zt;
+                above[i] = cnt;
+            }
             for (int j = 0; j < nr; j++) e[j] = lens_exp(row[j], mx);
-            double s = 0.0;
+            double s = 0.0, ws = 0.0;
             for (int j = 0; j < nr; j++) s += e[j];
+            for (int j = 0; j < nr; j++) ws += ((double)row[j] - (double)mx) * e[j];
             p->max = mx;
             p->sum = s;
-            p->above = above;
+            p->wsum = ws;
             p->n_top = n;
         }
     }
 }
 
-int borg_ctx_lens_summary(borg_ctx *c, const int *layers, int n, int n_vocab, int k, int32_t chosen, int32_t *top_ids,
-                          float *top_logits, float *chosen_logit, int32_t *chosen_rank, double *lse) {
+int borg_ctx_lens_summary(borg_ctx *c, const int *layers, int n, int n_vocab, int k, const int32_t *track, int n_track,
+                          int32_t *top_ids, float *top_logits, float *track_logit, int32_t *track_rank, double *lse,
+                          double *entropy) {
     const borg_model *m = c->model;
     const borg_config *cfg = &m->cfg;
     if (!c->tr_resid || c->trace_pos < 0) return -1;
     if (n <= 0) return 0;
-    if (!top_ids || !top_logits || !chosen_logit || !chosen_rank || !lse) return -2;
+    if (!top_ids || !top_logits || !lse) return -2;
+    if (n_track > 0 && (!track || !track_logit || !track_rank)) return -2;
     for (int i = 0; i < n; i++)
         if (layers[i] < 0 || layers[i] > cfg->n_layers) return -3;
     if (n_vocab == 0) n_vocab = cfg->vocab_size;
     if (n_vocab < 1 || n_vocab > cfg->vocab_size) return -6;
     if (k < 1 || k > n_vocab) return -4;
-    if (chosen < 0 || chosen >= n_vocab) return -5;
+    if (k > BORG_LENS_MAX_K) return -8;
+    if (n_track < 0) return -5;
+    for (int i = 0; i < n_track; i++)
+        if (track[i] < 0 || track[i] >= n_vocab) return -5;
     const int D = cfg->dim, nth = borg_pool_size(c->pool), ldxq = c->max_cols / QK;
     const int n_blocks = (n_vocab + LENS_BLOCK - 1) / LENS_BLOCK;
     const int TB = n < c->n_batch ? n : c->n_batch; /* lens rows per pass, as borg_ctx_lens */
+    const int nt1 = n_track > 0 ? n_track : 1;         /* allocations stay non-empty with nothing tracked */
     lens_task t;
     memset(&t, 0, sizeof t);
     t.c = c;
     t.n_vocab = n_vocab;
-    t.kb = k < LENS_BLOCK ? k : LENS_BLOCK;
+    t.k = k;
+    t.n_track = n_track;
     t.scratch = (float *)calloc2((uint64_t)nth * TB, LENS_BLOCK, sizeof(float));
     t.parts = (lens_part *)calloc2((uint64_t)n_blocks, TB, sizeof(lens_part));
-    t.ids = (int32_t *)calloc2((uint64_t)n_blocks * TB, t.kb, sizeof(int32_t));
-    t.vals = (float *)calloc2((uint64_t)n_blocks * TB, t.kb, sizeof(float));
-    float *zc = (float *)calloc((size_t)TB, sizeof(float));
+    t.above = (int32_t *)calloc2((uint64_t)n_blocks * TB, nt1, sizeof(int32_t));
+    t.ids = (int32_t *)calloc2((uint64_t)n_blocks * TB, k, sizeof(int32_t));
+    t.vals = (float *)calloc2((uint64_t)n_blocks * TB, k, sizeof(float));
+    float *zt = (float *)calloc2((uint64_t)TB, nt1, sizeof(float));
     int rc = 0;
-    if (!t.scratch || !t.parts || !t.ids || !t.vals || !zc) {
+    if (!t.scratch || !t.parts || !t.above || !t.ids || !t.vals || !zt) {
         rc = -7;
         goto done;
     }
@@ -856,44 +912,53 @@ int borg_ctx_lens_summary(borg_ctx *c, const int *layers, int n, int n_vocab, in
             quant_task qt = {c->xb, D, D, c->xq, ldxq};
             pool_for(c->pool, T, 1, quant_range, &qt);
         }
-        /* the chosen token's logit first: the blocks count the logits above it */
+        /* the tracked tokens' logits first: the blocks count the logits above each */
         for (int i = 0; i < T; i++)
-            zc[i] = mat_dot_row(&m->output, chosen, c->xb + (size_t)i * D, c->xq + (size_t)i * ldxq);
+            for (int j = 0; j < n_track; j++)
+                zt[(size_t)i * n_track + j] =
+                    mat_dot_row(&m->output, track[j], c->xb + (size_t)i * D, c->xq + (size_t)i * ldxq);
         t.T = T;
-        t.chosen_logit = zc;
+        t.track_logit = zt;
         pool_for(c->pool, n_blocks, 1, lens_range, &t);
         /* merge the blocks' partials, in block order */
         for (int i = 0; i < T; i++) {
             int32_t *ids = top_ids + (size_t)(done + i) * k;
             float *vals = top_logits + (size_t)(done + i) * k;
             int n_top = 0;
-            double mx = t.parts[i].max, s = 0.0;
-            int32_t above = 0;
+            double mx = t.parts[i].max, s = 0.0, ws = 0.0;
             for (int b = 0; b < n_blocks; b++) {
                 const lens_part *p = &t.parts[(size_t)b * T + i];
-                const int32_t *bi = t.ids + ((size_t)b * T + i) * t.kb;
-                const float *bv = t.vals + ((size_t)b * T + i) * t.kb;
+                const int32_t *bi = t.ids + ((size_t)b * T + i) * k;
+                const float *bv = t.vals + ((size_t)b * T + i) * k;
                 for (int j = 0; j < p->n_top; j++) { /* sorted: once one is out, the rest are too */
                     if (n_top == k && !(bv[j] > vals[k - 1])) break;
                     top_insert(ids, vals, &n_top, k, bi[j], bv[j]);
                 }
                 if (p->max > mx) mx = p->max;
-                above += p->above;
             }
+            /* sum (z - mx) e^(z - mx) over a block is e^(max_b - mx) (wsum_b + (max_b - mx) sum_b) */
             for (int b = 0; b < n_blocks; b++) {
                 const lens_part *p = &t.parts[(size_t)b * T + i];
-                s += p->sum * exp(p->max - mx);
+                const double f = exp(p->max - mx);
+                s += p->sum * f;
+                ws += (p->wsum + (p->max - mx) * p->sum) * f;
             }
             lse[done + i] = mx + log(s);
-            chosen_logit[done + i] = zc[i];
-            chosen_rank[done + i] = above;
+            if (entropy) entropy[done + i] = log(s) - ws / s; /* H = lse - E[z] */
+            for (int j = 0; j < n_track; j++) {
+                int32_t above = 0;
+                for (int b = 0; b < n_blocks; b++) above += t.above[((size_t)b * T + i) * n_track + j];
+                track_logit[(size_t)(done + i) * n_track + j] = zt[(size_t)i * n_track + j];
+                track_rank[(size_t)(done + i) * n_track + j] = above;
+            }
         }
     }
 done:
     free(t.scratch);
     free(t.parts);
+    free(t.above);
     free(t.ids);
     free(t.vals);
-    free(zc);
+    free(zt);
     return rc;
 }

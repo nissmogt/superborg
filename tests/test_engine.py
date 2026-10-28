@@ -194,6 +194,31 @@ def test_incremental_equals_batched(pool, name):
         m.close()
 
 
+@pytest.mark.parametrize("name", ["smollm2-135m-q8_0.borg", "smollm2-135m-q4_0.borg", "smollm2-135m-q4_1.borg"])
+def test_logits_identical_for_any_batching(pool, name):
+    """The quantized kernels give the same bits whether a prompt is evaluated 1, 4 or 40 tokens
+    at a time: every token count runs the same per-block arithmetic (engine/kernels.c)."""
+    eng = _engine()
+    m = eng.Model(model_path(name), pool=pool)
+    ctxs = []
+    try:
+        text = ("Bit-identical batching: speculative verification, prompt lookup and parallel sampling "
+                "all evaluate several tokens in one pass and must reproduce decoding one token at a time, "
+                "whatever the chunk size, the thread count or the instruction set of the machine happens to be.")
+        toks = m.tokenize(text, add_bos=False)
+        assert len(toks) >= 40
+        toks = toks[:40]
+        ctxs = [m.context(n_ctx=64, n_batch=nb) for nb in (40, 4, 1)]
+        outs = [c.decode(toks, logits="all") for c in ctxs]
+        assert all(o.shape == outs[0].shape and np.isfinite(o).all() for o in outs)
+        np.testing.assert_array_equal(outs[1], outs[0])
+        np.testing.assert_array_equal(outs[2], outs[0])
+    finally:
+        for c in ctxs:
+            c.close()
+        m.close()
+
+
 @pytest.mark.parametrize("name", ["smollm2-135m-q8_0.borg", "smollm2-135m-q4_0.borg"])
 def test_repeated_request_same_greedy_output(pool, name):
     """Sending the same prompt twice must give the same greedy text.

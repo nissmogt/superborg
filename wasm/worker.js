@@ -6,9 +6,11 @@
 //                                       (try here first)
 //   {op: "info", id}                    -> {id, info}
 //   {op: "chat", id, body}              -> {id, event} for every TraceSession event, then {id, end: true};
-//                                       body as POST /api/chat (superborg/ui.py), with "request_id"? and
+//                                       body as POST /api/chat (superborg/ui.py), with "request_id"?,
 //                                       "chat_template_kwargs"? (extra chat template variables, as
-//                                       superborg/server.py takes them)
+//                                       superborg/server.py takes them) and "trace_prompt"? (a
+//                                       "prompt_token" event per uncached prompt position, the last
+//                                       256, each evaluated alone; docs/TRACE.md)
 //   {op: "stop", id?, request_id?}      cancel the running generation (it ends with stop_reason
 //                                       "cancelled"), or only the one with that request_id; a request_id
 //                                       whose chat has not started yet is remembered, and that chat
@@ -17,8 +19,10 @@
 // Messages to the page without an id: {status: {text, progress}}, {ready: info}, {fatal: message}.
 // A chat while another runs gets the one event {type: "error", message, code: "busy"}.
 //
-// model.json: {"wasm": "borg.wasm", "n_ctx", "lens_stride",
+// model.json: {"wasm": "borg.wasm", "n_ctx", "lens_stride", "basis"?,
 //              "model": {"name", "id", "size", "wrap"?, "parts": [{"path", "size"}...]}}
+// "basis" names the residual-stream basis file (tools/trace_basis.py) the "xyz" trace field is
+// projected onto; without one, or when it cannot be loaded, xyz is null.
 // Model parts are cached in IndexedDB when the browser allows it, so a second visit skips the download.
 // The worker expects Borg (borg-runtime.js) and TraceSession (trace-session.js) as globals: either
 // concatenated into one file (wasm/make_artifact.py does that) or loaded with importScripts.
@@ -227,6 +231,13 @@ async function init(base, via) {
   defaultStride = Math.min(Math.max(1, (manifest.lens_stride || 3) * (slow ? 2 : 1)), model.config.n_layers);
   session = new TraceSession(model, ctx, { lensStride: defaultStride });
   modelName = mm.name;
+  if (manifest.basis) {  // optional: a trace without the projection is better than no trace
+    try {
+      session.setBasis(JSON.parse(new TextDecoder().decode(await fetchBytes(url(manifest.basis), () => {}))));
+    } catch (e) {
+      console.warn("[borg] the residual basis", manifest.basis, "is not usable:", e.message);
+    }
+  }
   return info();
 }
 
@@ -283,6 +294,8 @@ function parseChat(body) {
     throw new Error("'request_id' must be 1-64 characters from A-Z, a-z, 0-9, '_' and '-'");
   if (body.enable_thinking != null && typeof body.enable_thinking !== "boolean")
     throw new Error("'enable_thinking' must be true or false");
+  if (body.trace_prompt != null && typeof body.trace_prompt !== "boolean")
+    throw new Error("'trace_prompt' must be true or false");
   // chat_template_kwargs reach the template as variables; enable_thinking in it counts unless the
   // field above is given, and off is the default, as in superborg/server.py
   const tmpl = body.chat_template_kwargs ?? {};
@@ -303,6 +316,7 @@ function parseChat(body) {
     seed: num("seed", 0, 0, 2 ** 64 - 1),
     enableThinking: typeof body.enable_thinking === "boolean" ? body.enable_thinking : tmpl.enable_thinking === true,
     chatTemplateKwargs: Object.keys(tmpl).length ? Object.assign({}, tmpl) : null,
+    tracePrompt: body.trace_prompt === true,
   };
 }
 

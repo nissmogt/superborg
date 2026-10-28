@@ -13,6 +13,8 @@
 - Local patches (applied by the generator, in this order):
 1. **strip-chars**: str.strip(), lstrip() and rstrip() ignore their characters argument (huggingface.js issue #2597, fix PR #2598 unreleased as of 2026-10-16); Qwen3's template uses rstrip('\n') and lstrip('\n') on reasoning content, so the browser rendered spaces around <think> blocks differently from Python.
 2. **strftime-c-locale**: strftime_now supports only %Y %m %d %b %B %H %M %% and takes month names from the browser's locale (Intl.DateTimeFormat: '16 Okt 2026' under de-DE), while Python's datetime.strftime uses the C locale and the full directive set; templates that call strftime_now (SmolLM3 '%d %B %Y', gpt-oss '%Y-%m-%d', Llama 3.2 '%d %b %Y') must render the same prompt in every browser.
+3. **str-concat**: `+` with one str operand turns the other into text (a dict renders as "[object Map]"), while Python raises TypeError for str + dict, list, int or bool; DeepSeek's templates concatenate tool_calls[].function.arguments into the prompt, so a dict there gave a silently wrong browser prompt where superborg/server.py answers 400. Only str + str concatenates now.
+4. **none-output**: `{{ expr }}` prints nothing when the expression is None, while Python prints str(None), "None" (an undefined variable prints nothing on both sides); a message whose content is null, as OpenAI-style clients send tool-call turns, rendered differently in the browser for every template that prints the content as it is (GLM-4-9B-0414, GLM-5.1). Only expressions print "None": the set, macro and comment statements also evaluate to None and still print nothing.
 - License: MIT
 
 ```

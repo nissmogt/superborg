@@ -18,6 +18,7 @@
   --accent-wash: rgba(42,120,214,.13);
   --prob: #2a78d6; --attn: #eb6834; --mlp: #1baf7a; --resid: #52514e;
   --good: #0ca30c; --critical: #d03b3b;
+  --cand: #2a78d6; --chosen: #eb6834; --chosen-ink: #b4400f; --read: #1baf7a; --read-wash: 27,175,122; --region-alpha: .6;  /* the flow view: candidate, chosen, read-from wash, region-label opacity (a step darker on paper) */
   --shadow: 0 6px 24px rgba(11,11,11,.12);
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -33,6 +34,7 @@
     --accent-wash: rgba(57,135,229,.20);
     --prob: #3987e5; --attn: #d95926; --mlp: #199e70; --resid: #c3c2b7;
     --good: #0ca30c; --critical: #e66767;
+    --cand: #3987e5; --chosen: #d95926; --chosen-ink: #f08a5a; --read: #199e70; --read-wash: 25,158,112; --region-alpha: .45;
     --shadow: 0 6px 24px rgba(0,0,0,.5);
   }
 }
@@ -46,6 +48,7 @@
   --accent-wash: rgba(57,135,229,.20);
   --prob: #3987e5; --attn: #d95926; --mlp: #199e70; --resid: #c3c2b7;
   --good: #0ca30c; --critical: #e66767;
+  --cand: #3987e5; --chosen: #d95926; --chosen-ink: #f08a5a; --read: #199e70; --read-wash: 25,158,112; --region-alpha: .45;
   --shadow: 0 6px 24px rgba(0,0,0,.5);
 }
 
@@ -256,6 +259,98 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
 .tip .r .tok { white-space: pre; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
 .tip .s { color: var(--muted); margin-top: 4px; }
 
+/* ---- flow view: the word map, the conversation strip, the story and its cards ---- */
+.flow { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; align-items: start; padding-bottom: 8px; }
+.flow .fcol { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.fstrip { grid-column: 1 / -1; max-height: 132px; overflow-y: auto; overscroll-behavior: contain; padding: 8px 12px 10px; font-size: 14px; line-height: 1.75; }
+.fstrip .fh { font-size: 11px; font-weight: 600; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 2px; }
+.fstrip .fh span { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.fstrip .who { display: inline-block; font-size: 10.5px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin: 0 8px 0 2px; }
+.fstrip .fhint { color: var(--muted); font-size: 12.5px; }
+.fw { display: inline-block; border-radius: 4px; padding: 1px 0; white-space: pre-wrap; cursor: pointer; border-bottom: 2px solid transparent; }  /* inline-block: the spaces are glyphs, so the strip breaks its lines between the words */
+.fw.q { color: var(--ink-2); }
+.fw.sys { color: var(--muted); font-size: 12px; }
+.fw.sp { font-family: var(--mono); font-size: 11px; color: var(--muted); background: var(--surface-2); padding: 0 3px; margin: 0 1px; }
+.fw.nostory { cursor: default; }
+.fw.cur { border-bottom-color: var(--chosen); color: var(--ink); font-weight: 600; }
+.fw.read { background: rgba(var(--read-wash), var(--w, 0)); }
+.fw.sink { text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+.fold { font-size: 11.5px; color: var(--muted); border: 1px dashed var(--border-2); border-radius: 6px; padding: 0 6px; background: none; margin-right: 4px; line-height: 18px; }
+.fstagecard { padding: 0; overflow: hidden; }
+.fstage { position: relative; aspect-ratio: 1 / 1; max-height: 560px; min-height: 260px; width: 100%; overflow: hidden; touch-action: none; background: var(--surface); }
+.fstage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.fstage .ov { position: absolute; inset: 0; pointer-events: none; }
+.fstage .rl { position: absolute; transform: translate(-50%, -50%); font: 10.5px/1 var(--mono); letter-spacing: .04em; color: var(--muted); opacity: var(--region-alpha); white-space: nowrap; pointer-events: auto; cursor: default; }
+.fstage .rl.lt { transform: translate(0, -50%); }
+.fstage .rung { position: absolute; left: 36px; right: 12px; height: 1px; background: var(--grid); }
+.fstage .lab { position: absolute; font: 600 12px/1.2 var(--mono); white-space: pre; padding: 2px 6px; border-radius: 6px; background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--ink); transform: translate(10px, -50%); border: 1px solid var(--border); max-width: 24ch; overflow: hidden; text-overflow: ellipsis; }
+.fstage .lab.left { transform: translate(calc(-100% - 10px), -50%); }
+.fstage .lab.o { color: var(--chosen-ink); }
+.fstage .lab.r { color: var(--ink-2); font-weight: 500; font-size: 11px; }
+.fstage .ring { position: absolute; width: 22px; height: 22px; margin: -11px; border-radius: 50%; border: 1.5px solid var(--chosen); opacity: .9; }
+.fstage .ring.r { width: 16px; height: 16px; margin: -8px; border: 1px solid var(--ink-2); opacity: .8; }
+.fstage .ring.pulse { animation: fpulse .3s ease-out; }
+@keyframes fpulse { from { transform: scale(2.6); opacity: .15; } to { transform: scale(1); opacity: .9; } }
+@media (prefers-reduced-motion: reduce) { .fstage .ring.pulse { animation: none; } }
+.fstage .axes { position: absolute; left: 12px; bottom: 10px; right: 12px; font-size: 11px; color: var(--muted); line-height: 1.35; }
+.fstage .axes b { color: var(--ink-2); font-weight: 600; }
+.fstage .hud { position: absolute; left: 12px; top: 8px; right: 12px; font: 10.5px/1.3 var(--mono); color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.fstage .hud .rend { opacity: .7; }
+.fcoach { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 6; background: var(--surface); border: 1px solid var(--border-2); border-radius: 12px; box-shadow: var(--shadow); padding: 12px 14px; font-size: 13px; }
+.fcoach .step { color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.fcoach p { margin: 4px 0 8px; }
+.fcoach .acts { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+.fscrub { padding: 8px 14px 10px; border-top: 1px solid var(--border); }
+.fscrub .row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.fscrub .row b { color: var(--ink); font-weight: 600; font-size: 13px; }
+.fscrub canvas { display: block; width: 100%; height: 44px; }
+.fscrub input[type=range] { width: 100%; margin: 0; height: 32px; accent-color: var(--chosen); cursor: pointer; display: block; }
+.fscrub .ticks { display: flex; justify-content: space-between; font: 10px/1 var(--mono); color: var(--muted); padding: 0 2px; }
+.fscrub .ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.fkey { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 8px 14px 10px; font-size: 11.5px; color: var(--ink-2); border-top: 1px solid var(--border); }
+.fkey .blob { display: inline-block; vertical-align: middle; border-radius: 50%; margin-right: 5px; width: 10px; height: 10px; }
+.fkey .blob.c { background: var(--cand); } .fkey .blob.o { background: var(--chosen); }
+.fkey .blob.f { width: 14px; height: 14px; background: radial-gradient(circle, var(--cand) 0%, transparent 70%); }
+.fkey .blob.h { border: 1px solid var(--ink-2); } .fkey .blob.d { width: 6px; height: 6px; background: var(--axis); margin: 0 7px 0 2px; }
+.fkey .blob.g { width: 14px; height: 14px; background: radial-gradient(circle, var(--chosen) 0%, transparent 70%); opacity: .55; }
+.fnarr.dim > :not(.title):not(.emerge) { opacity: .5; }  /* while a story's sweep plays: the layer paragraphs wait for it to land */
+.ftable summary { cursor: pointer; list-style: none; } .ftable summary::-webkit-details-marker { display: none; }
+.ftable summary h2 { display: inline; } .ftable summary h2::before { content: "▸ "; color: var(--muted); } .ftable[open] summary h2::before { content: "▾ "; }
+.ftable table { font-size: 12px; margin-top: 4px; } .ftable th { font-weight: 500; color: var(--muted); text-align: left; padding: 2px 0; }
+.ftable th.p, .ftable td.p { text-align: right; width: auto; padding-left: 8px; } .ftable td.ly, .ftable th.ly { width: 38px; font-variant-numeric: tabular-nums; }
+.ftable tbody tr { cursor: pointer; } .ftable tbody tr:hover td { background: var(--surface-2); } .ftable tbody tr.cur td { background: var(--surface-3); }
+.ftable tbody tr.lead td.ly { color: var(--chosen-ink); font-weight: 600; } .ftable tbody tr.na td { color: var(--muted); }
+.fkey .wash { display: inline-block; padding: 0 4px; border-radius: 3px; background: rgba(var(--read-wash), .45); }
+.fnarr { font-size: 13.5px; }
+.fnarr p { margin: 6px 0; }
+.fnarr .title { font-size: 16px; font-weight: 600; margin: 0 0 4px; line-height: 1.35; }
+.fnarr .k { color: var(--muted); font-size: 11.5px; letter-spacing: .04em; text-transform: uppercase; }
+.fnarr .note { color: var(--ink-2); font-size: 12.5px; border-left: 2px solid var(--axis); padding-left: 10px; }
+.fnarr .emerge { font-weight: 600; }
+.fnarr .idle { color: var(--muted); }
+.ftok { font-family: var(--mono); font-size: .92em; background: var(--surface-2); border-radius: 4px; padding: 0 4px; white-space: pre; }
+.fcard h2 { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+.fcard h2 .muted { font-weight: 400; font-size: 12px; }
+.fcard table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.fcard td { padding: 3px 0; vertical-align: middle; }
+.fcard td.p, .fcard .r .p { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.fcard td.p { width: 50px; }
+.fcard td.b { width: 36%; padding-left: 8px; }
+.fcard tr.ch td { font-weight: 600; }
+.fcard .r { display: grid; grid-template-columns: minmax(0, 1fr) 46px 36%; align-items: center; gap: 8px; padding: 3px 0; font-size: 12.5px; }
+.fcard .s { color: var(--muted); font-size: 11.5px; margin: 6px 0 0; }
+.fcard .bar { display: block; height: 6px; border-radius: 3px; }
+.fcard .bar > i { border-radius: 3px; }
+#fstateCv { display: block; width: 100%; height: 150px; }
+.muted { color: var(--muted); }
+@container viz (max-width: 760px) {  /* phones: one column, the field square, the story and the cards a scroll away */
+  .flow { grid-template-columns: minmax(0, 1fr); }
+  .fstage { max-height: none; }
+  .fstrip { max-height: 150px; font-size: 13.5px; }
+  .fstage .rl { font-size: 9.5px; }
+  .fkey { font-size: 11px; gap: 4px 10px; }
+}
+
 /* ---- narrow screens: stack chat above the visualization ---- */
 @media (max-width: 900px) {
   .app { height: auto; min-height: 100vh; }
@@ -312,8 +407,69 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
         <div class="what" id="selWhat"><span>No token selected yet.</span></div>
         <button class="btn small" id="followBtn" type="button" aria-pressed="true"
           title="Follow live: always show the newest token. Click a token or a map column to pin one instead.">Following live</button>
+        <div class="seg" role="group" aria-label="View">
+          <button type="button" data-view="flow" aria-pressed="true" title="The flow: one word's story on the word map">Flow</button>
+          <button type="button" data-view="details" aria-pressed="false" title="Every panel: the emergence map, the readout, attention, MLP neurons">Details</button>
+        </div>
       </div>
-      <div class="grid">
+      <section class="flow" id="flow" aria-label="Flow: one word's story on the word map">
+        <div class="panel fstrip" id="fstrip" tabindex="0" role="application" aria-label="The conversation as words. Tap a word for its story; arrow keys: left and right choose a word, up and down a layer, Escape clears.">
+          <div class="fh">Conversation <span id="fstripNote">— words the model reads from light up aqua</span></div>
+          <div id="fwords"></div>
+        </div>
+        <div class="fcol">
+          <div class="panel fstagecard">
+            <div class="fstage" id="fstage">
+              <canvas id="flowCv" aria-label="Word space: the vocabulary map with the selected word's story"></canvas>
+              <div class="ov" id="flabels"></div>
+              <div class="ov" id="fmarks"></div>
+              <div class="hud" id="fhud"><span id="fhudMap"></span><span class="rend" id="fhudRend"></span></div>
+              <div class="axes" id="faxes"></div>
+              <div class="fcoach" id="fcoach" hidden></div>
+            </div>
+            <div class="fscrub">
+              <div class="row"><span>Layer <b id="flayerLabel">–</b> <span id="flayerWord"></span></span><span id="femergeLabel"></span></div>
+              <canvas id="fspark" aria-hidden="true"></canvas>
+              <input type="range" id="fscrub" min="0" max="1" value="1" step="1" aria-label="Layer" title="The layer shown on the field: 0 is the word itself, the last is the model's output" disabled>
+              <div class="ticks"><span>0 · the word itself</span><span id="ftickEnd">output</span></div>
+              <div class="ctl">
+                <span>Sweep</span>
+                <div class="seg" role="group" aria-label="Sweep speed">
+                  <button type="button" data-speed="0.5" aria-pressed="false" title="Half speed">½×</button>
+                  <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                  <button type="button" data-speed="3" aria-pressed="false" title="Three times faster">3×</button>
+                </div>
+                <button class="btn small" id="fstepBtn" type="button" title="One layer up; from the output, back to layer 0 (keys: up and down arrows on the slider)">Step ›</button>
+                <button class="btn small" id="fwalkBtn" type="button" title="Play this word's story slowly, with captions at the layers that matter">Walk me through this word</button>
+                <button class="btn small" id="fhelpBtn" type="button" title="Show the guidance again" aria-label="Help">?</button>
+              </div>
+            </div>
+            <div class="fkey" id="fkey">
+              <span><span class="blob c"></span>a candidate word</span>
+              <span><span class="blob o"></span>the word it chose</span>
+              <span><span class="blob f"></span>softer and larger = more undecided</span>
+              <span>brighter = more likely</span>
+              <span><span class="blob h"></span>runner-up at the output</span>
+              <span><span class="blob d"></span>a reply word so far</span>
+              <span><span class="blob g"></span>pigment: where the reply was written (fades over ~27 words)</span>
+              <span><span class="wash">word</span> = read from</span>
+            </div>
+          </div>
+        </div>
+        <div class="fcol">
+          <div class="panel fnarr" id="fnarr" aria-live="polite" aria-label="The story of this word"><p class="idle">Send a message. Each reply word's story plays here as it is generated.</p></div>
+          <div class="panel fcard"><h2>Reads from <span class="muted" id="freadsLayer"></span></h2><div id="freads"><p class="muted">—</p></div></div>
+          <div class="panel fcard"><h2>Candidates <span class="muted" id="fcandsLayer"></span></h2><div id="fcands"><p class="muted">—</p></div></div>
+          <div class="panel fcard"><h2>Final choice</h2><div id="ffinal"><p class="muted">—</p></div></div>
+          <div class="panel fcard"><h2>Inner state <span class="muted" id="fstateLayer"></span></h2><canvas id="fstateCv" aria-label="Inner state at this layer"></canvas><p class="s" id="fstateNote">—</p></div>
+          <details class="panel fcard ftable" id="ftable">
+            <summary><h2>Layer by layer <span class="muted" id="ftableNote"></span></h2></summary>
+            <p class="s">The full-depth twin of the sparkline: the lens top-1 after every layer, the chosen word's probability and rank there, and the readout's entropy. Click a row to scrub to that layer.</p>
+            <table><thead><tr><th class="ly">layer</th><th>lens top-1</th><th class="p">p(chosen)</th><th class="p">rank</th><th class="p">entropy</th></tr></thead><tbody id="ftableRows"></tbody></table>
+          </details>
+        </div>
+      </section>
+      <div class="grid" id="details" hidden>
         <div class="panel s12" id="pMap">
           <div class="ph">
             <h2 title="Columns are reply tokens, rows are layers: embeddings at the bottom, the model's output at the top. Each cell is the probability that the logit lens (final norm + unembedding applied to the residual stream after that layer) gives the token the model finally chose. Layer k is the residual stream after block k.">Emergence map</h2>
@@ -422,7 +578,7 @@ select.sel { border: 1px solid var(--border-2); background: var(--surface); bord
                                                for it); without an id, whatever is running
      onStatus(cb)         (optional)           cb({text, progress}) while the engine gets ready
    ============================================================================================ */
-const BORG = window.BORG_TRANSPORT || (function httpTransport() {
+function httpTransport() {
   let ctrl = null;
   async function errorOf(res) {
     let message = `HTTP ${res.status}`, code = null;
@@ -489,7 +645,80 @@ const BORG = window.BORG_TRANSPORT || (function httpTransport() {
       }
     },
   };
-})();
+}
+/* ---------------------------------------------------------------- replay and the vocabulary map
+   ?replay=<url of a recorded .jsonl trace> replaces the engine: the trace (tools in docs/VIEWER.md) is
+   streamed as if generated, one reply token every 1000/replay_speed ms (replay_speed=0: at once).
+   The vocabulary map (tools/vocab_map.py) comes from a transport's vocabMap() when it has one, else
+   from api/vocab_map.{json,bin} (the UI server) or vocab_map.{json,bin} next to the page (a static
+   site); without one the flow view lays the candidates out by rank and layer instead. */
+const PAGE_Q = new URLSearchParams(location.search);
+function replayTransport(url) {
+  const speed = PAGE_Q.has("replay_speed") ? Math.max(0, +PAGE_Q.get("replay_speed") || 0) : 6;
+  let loaded = null, stopped = new Set();
+  async function load() {
+    if (loaded) return loaded;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`cannot load the trace: HTTP ${res.status}`);
+    const lines = (await res.text()).split("\n").filter((l) => l.trim());
+    const evs = lines.map((l) => JSON.parse(l));
+    const req = evs.length && evs[0].type === "request" ? evs.shift() : null;
+    const first = evs.find((e) => e.type === "token" || e.type === "prompt_token") || {};
+    const nL = (first.lens || []).reduce((m, r) => Math.max(m, r.layer), 0);
+    const nH = first.attn_entropy && first.attn_entropy[0] ? first.attn_entropy[0].length : 1;
+    const msgs = (req && req.body && req.body.messages) || [];
+    const user = msgs.filter((m) => m.role === "user").pop();
+    loaded = { req, evs, nL, nH, question: user ? user.content : "(recorded chat)" };
+    return loaded;
+  }
+  return {
+    name: "replay",
+    replay: { url, speed, question: () => load().then((t) => t.question) },
+    async info() {
+      const t = await load();
+      const lens = (t.evs.find((e) => e.type === "token" || e.type === "prompt_token") || {}).lens || [];
+      return { model: (t.req && t.req.model) || url.split("/").pop(), arch: "replay", quant: "", n_layers: t.nL, n_heads: t.nH, n_kv_heads: t.nH,
+               dim: 0, hidden_dim: 0, vocab: 0, n_ctx: 4096, chat_format: "", threads: 0, lens_layers: lens.map((r) => r.layer),
+               lens_stride: lens.length > 1 ? lens[1].layer - lens[0].layer : 1, max_tokens_default: 512, busy: false, backend: "replay of a recorded trace" };
+    },
+    async chat(body, onEvent) {
+      const t = await load();
+      const id = body && body.request_id;
+      const wait = speed > 0 ? () => new Promise((r) => setTimeout(r, 1000 / speed)) : () => Promise.resolve();
+      let n = 0, ended = false;
+      for (const ev of t.evs) {
+        if (stopped.has(id)) { onEvent({ type: "done", text: "", n_gen: n, stop_reason: "cancelled", seconds: 0, tok_per_s: 0 }); ended = true; break; }
+        if (ev.type === "token") { await wait(); if (stopped.has(id)) continue; n++; }
+        if (ev.type === "done") ended = true;
+        onEvent(ev);
+      }
+      if (!ended) onEvent({ type: "done", text: "", n_gen: n, stop_reason: "length", seconds: 0, tok_per_s: 0 });
+      stopped.delete(id);
+    },
+    async stop(requestId) { stopped.add(requestId == null ? null : requestId); return { stopped: true }; },
+  };
+}
+const BORG = PAGE_Q.get("replay") ? replayTransport(PAGE_Q.get("replay")) : (window.BORG_TRANSPORT || httpTransport());
+async function loadVocabMap(info) {
+  if (typeof BORG.vocabMap === "function") return BORG.vocabMap();
+  if (info && info.vocab_map === false) return null;  // the server says it has none: no request to 404
+  const pair = async (j, b) => {
+    try {
+      const [mj, mb] = await Promise.all([fetch(j, { cache: "force-cache" }), fetch(b, { cache: "force-cache" })]);
+      return mj.ok && mb.ok ? { meta: await mj.json(), bin: await mb.arrayBuffer() } : null;
+    } catch (e) { return null; }  // no map here
+  };
+  if (BORG.name !== "http" && BORG.name !== "replay") {  // a static site (wasm/make_artifact.py): its model.json names the map's files, or none
+    try {
+      const r = await fetch("model.json", { cache: "force-cache" });
+      if (r.ok) { const vm = (await r.json()).vocab_map; return vm && vm.json && vm.bin ? pair(vm.json, vm.bin) : null; }
+    } catch (e) { /* no manifest: probe the fixed names */ }
+  }
+  for (const b of BORG.name === "http" ? ["api/vocab_map"] : BORG.name === "replay" ? ["api/vocab_map", "vocab_map"] : ["vocab_map"]) {
+    const m = await pair(b + ".json", b + ".bin"); if (m) return m;
+  }
+  return null;
+}
 
 (() => {
 /* ---------------------------------------------------------------- helpers */
@@ -612,7 +841,7 @@ const store = {
 };
 // max_tokens and lens_stride 0: the engine's default (info.max_tokens_default, info.lens_stride)
 const SETTINGS0 = { temperature: 0, top_p: 1, max_tokens: 0, seed: 0, lens_stride: 0 };
-const PREFS0 = { mapMode: "words", mapScale: "linear", normScale: "log", theme: "auto" };
+const PREFS0 = { mapMode: "words", mapScale: "linear", normScale: "log", theme: "auto", view: "flow", speed: 1 };
 const S = {
   info: null, nL: 0, nH: 0, ready: false,
   history: [], turns: [], toks: [],
@@ -642,19 +871,23 @@ function frame() {
   const prof = S.profile;  // set window.__superborg.profile = {} to collect per-phase times (ms)
   const run = prof ? (name, fn) => { const t = performance.now(); fn(); prof[name] = (prof[name] || 0) + performance.now() - t; } : (name, fn) => fn();
   // canvases first: setting a canvas font resolves style, which is cheap only before this frame's DOM changes
-  if (d.map || all) run("map", drawMap);
-  if (all || d.contrib) run("contrib", () => drawContrib(r));
-  if (all || d.ent) run("entropy", () => drawEnt(r));
-  if (d.theme || d.legend) drawLegends();
+  const det = !F.active;  // the details panels are drawn only while they are the visible view (a switch redraws them)
+  if (det && (d.map || all)) run("map", drawMap);
+  if (det && (all || d.contrib)) run("contrib", () => drawContrib(r));
+  if (det && (all || d.ent)) run("entropy", () => drawEnt(r));
+  if (det && (d.theme || d.legend)) drawLegends();
   if (all) {
-    run("selbar", () => renderSelbar(r)); run("readout", () => renderReadout(r)); run("output", () => renderOutput(r));
-    run("attention", () => renderAttention(r)); run("mlp", () => renderMlp(r)); run("transcript", markTranscript);
-    run("values", () => renderVals(r));
+    run("selbar", () => renderSelbar(r)); run("transcript", markTranscript);
+    if (det) {
+      run("readout", () => renderReadout(r)); run("output", () => renderOutput(r));
+      run("attention", () => renderAttention(r)); run("mlp", () => renderMlp(r)); run("values", () => renderVals(r));
+    }
+    run("flow", () => flowOnSelection(d));
   }
   if (d.status) run("status", renderStatus);
   // a pointer resting on a canvas that was redrawn (following live): rebuild its hover state and
   // tooltip for what is under it now
-  if (S.ptr && (all || d.map || d.contrib || d.ent)) S.ptr.fn(S.ptr.e);
+  if (det && S.ptr && (all || d.map || d.contrib || d.ent)) S.ptr.fn(S.ptr.e);
   // Scroll writes last, after every DOM change of this frame: they need layout, and done here the
   // browser lays out once per frame instead of once per panel. Scroll offsets are never read back
   // (that would force layout too); user scrolls are tracked by trackUserScroll.
@@ -770,7 +1003,8 @@ function addToken(turn, ev) {
   const now = performance.now();
   S.rate.push(now);
   if (S.rate.length > 16) S.rate.shift();
-  if (S.follow) S.sel = rec.k;
+  flowIngestToken(turn, rec, ev);
+  if (S.follow && !F.active) S.sel = rec.k;  // in the flow view the story queue selects the token when its story starts
   invalidate("map", "status", "chat");
   if (S.follow) invalidate("sel");
   else if (S.sel >= 0 && S.toks[S.sel].turn === turn) invalidate("sel");  // the pinned token's context grew
@@ -1450,6 +1684,7 @@ function renderStatus() {
        S.lastDone ? `last reply: ${S.lastDone.n_gen} tokens at ${S.lastDone.tok_per_s} tokens/s (with tracing)` : "");
 }
 function showEngineStatus(m) {
+  if (m && m.decoding != null) F.decoding = !!m.decoding;  // a transport that runs on this thread may say when a decode is in flight
   if (S.ready || !m) return;
   const st = $("status");
   setText($("statusText"), m.text || "");
@@ -1477,8 +1712,8 @@ function renderHeader() {
   const add = (s) => parts.push(document.createTextNode(" · " + s));
   if (i.quant) add(i.quant);
   add(`${i.n_layers} layers × ${i.n_heads} heads`);
-  add(`d ${i.dim}`);
-  add(`ctx ${fmtInt(i.n_ctx)}`);
+  if (i.dim) add(`d ${i.dim}`);  // a replayed trace does not know the model's sizes
+  if (i.n_ctx) add(`ctx ${fmtInt(i.n_ctx)}`);
   if (i.backend) add(i.backend);
   m.replaceChildren(...parts);
   m.title = `${i.model} (${i.arch}, ${i.quant}): ${i.n_layers} layers, ${i.n_heads} heads (${i.n_kv_heads} KV), dim ${i.dim}, MLP ${i.hidden_dim}, vocabulary ${fmtInt(i.vocab)}, context ${fmtInt(i.n_ctx)}, ${i.threads} thread${i.threads === 1 ? "" : "s"}` + (i.backend ? `, ${i.backend}` : "");
@@ -1556,6 +1791,7 @@ async function send(text) {
   turn.userEl = addUserMsg(text);
   addAsstMsg(turn);
   S.generating = true; S.rate = []; S.chatStick = true; S.statusErr = null;
+  flowChatStarted();
   setSendMode(true);
   invalidate("status", "chat");
   const req = S.req = newReq();
@@ -1585,6 +1821,7 @@ async function send(text) {
         if (ev.type === "prefill") onPrefill(turn, ev);
         else if (ev.type === "prompt") onPrompt(turn, ev);
         else if (ev.type === "token") addToken(turn, ev);
+        else if (ev.type === "prompt_token") flowPromptToken(turn, ev);
         else if (ev.type === "done") turn.done = ev;
         else if (ev.type === "error") err = Object.assign({}, ev, { message: ev.message || ev.error || "unknown error" });
       } catch (e) {
@@ -1618,6 +1855,7 @@ function onPrompt(turn, ev) {
   turn.prompt = ev;
   if (turn.pendEl) { turn.pendEl.remove(); turn.pendEl = null; }
   setText(turn.metaEl, `prompt ${fmtInt(ev.n_prompt)} tokens (${fmtInt(ev.n_reused)} cached) · ${ev.prompt_ms} ms`);
+  flowOnPrompt(turn);
   invalidate("status");
 }
 function finish(turn, err) {
@@ -1670,6 +1908,7 @@ function newChat() {
                      chipsTurn: null, chipEls: [], chipShaded: [], qEl: null, outEl: null, readKey: "" });
   markedSpan = hovSpan = null;
   $("chips").replaceChildren();
+  flowReset();
   msgs.replaceChildren(intro());
   setSendMode(false);
   invalidate("sel", "map", "status");
@@ -1716,6 +1955,7 @@ function syncSegs() {
   for (const b of document.querySelectorAll("[data-mapmode]")) b.setAttribute("aria-pressed", String(b.dataset.mapmode === S.prefs.mapMode));
   for (const b of document.querySelectorAll("[data-mapscale]")) b.setAttribute("aria-pressed", String(b.dataset.mapscale === S.prefs.mapScale));
   for (const b of document.querySelectorAll("[data-normscale]")) b.setAttribute("aria-pressed", String(b.dataset.normscale === S.prefs.normScale));
+  for (const b of document.querySelectorAll("[data-speed]")) b.setAttribute("aria-pressed", String(+b.dataset.speed === (+S.prefs.speed || 1)));
 }
 const savePrefs = () => store.set("superborg.ui.prefs", S.prefs);
 
@@ -1771,6 +2011,12 @@ document.addEventListener("click", (e) => {
   invalidate("map", "sel", "legend");
 });
 $("layerSel").addEventListener("change", (e) => setLayer(+e.target.value));
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-view],[data-speed]");
+  if (!b) return;
+  if (b.dataset.view) { S.prefs.view = b.dataset.view; savePrefs(); applyView(); }
+  if (b.dataset.speed) { S.prefs.speed = +b.dataset.speed; savePrefs(); syncSegs(); }
+});
 
 // map
 const mapScroll = $("mapScroll"), mapCanvas = $("mapCanvas");
@@ -1878,6 +2124,1203 @@ ro.observe(mapScroll); ro.observe($("contribBox"));
 })();
 window.addEventListener("beforeunload", stopGen);
 
+/* ---------------------------------------------------------------- flow view: one word's story on the word map
+   The default right-hand view. Every word piece of the vocabulary is a dim dot at its position on the
+   model's vocabulary map (tools/vocab_map.py); the selected word's story is drawn over it: for the
+   current layer the lens top-3 glow at their map positions (blue), the word the model chose glows
+   orange, earlier layers remain as an afterimage. Attention is shown on the words of the conversation
+   (an aqua wash), not on the map. The narration and the cards are the text twins of what is drawn.
+   Without a map the candidates are laid out by rank (across) and layer (up) instead. */
+const REDUCED_MQ = window.matchMedia("(prefers-reduced-motion: reduce)");
+const reduced = () => REDUCED_MQ.matches;
+const FS = { renderer: "", frames: 0, ms: 0, mean: 0, max: 0, p95: 0, particles: 0, trail: 0, pigment: 0, points: 0, ingestN: 0, ingestMean: 0, ingestMax: 0,
+             animating: false, reduced: false, lowPower: false, mapLoaded: false, samples: [], phase: {} };
+S.flowStats = FS;  // window.__superborg.flowStats: main-thread ms per frame of the flow view, measured with performance.now()
+const MAP = { n: 0, xy: null, box: null, meta: null, clusters: [], grid: null, G: 96, off: 0 };
+const VOCAB = new Map();  // token id -> text, from what the traces mention (lens tops, alternatives, reply tokens, region labels)
+const VIEW = { w: 0, h: 0, dpr: 1, s: 1, ox: 0, oy: 0 };  // map units -> css px: (x * s + ox, oy - y * s)
+const F = {
+  active: false,       // the flow view is the visible one
+  cur: null,           // the record whose story is on the stage: a reply record of S.toks or a prompt record
+  k: 0, kf: 0,         // the scrubbed layer, and its fractional value while a sweep plays
+  sweep: null,         // {from, to, t0, dur, linear, onEnd}
+  walk: null,          // the guided walk: {rec, stops, i, phase, until}
+  live: false,         // the story is played by follow-live: the afterimage decays with time, not with the layer
+  entered: null,       // live mode: performance.now() at which each layer was entered
+  prev: null,          // live mode: the previous story, still fading {rec, entered, t1}
+  queue: [],           // reply records waiting for their story (follow-live)
+  stripTurn: null, spans: new Map(), washed: [], tipPending: null, heavy: 0, rafId: 0, lastFrame: 0, landedAt: -1e9,
+  align: null, alignN: 0, onThread: false, decoding: false, nV: 0, ready: false, caption: null, trailAt: 0,
+  labs: [], hudBottom: 0, capTop: Infinity,  // the labels beside the marks, and the header line's bottom and the caption's top they stay between (settleLabels)
+};
+let REND = null;
+const DECAY = 0.8;      // scrub mode: each earlier layer keeps this fraction of the next one's light
+const TAU = 500;        // live mode: the afterimage decays as exp(-age / TAU ms)
+const SINK_SPIKE = 100; // a residual spike (max |dim| / median |dim|) above this marks a delimiter sink
+const PIG_DECAY = 0.975; // the pigment: each reply word's deposit keeps this fraction per later word (half-life ~27 words), never per second
+const PIG_CAP = 0.7;     // the pigment's light at one spot is clamped here, so a long reply written in one region cannot saturate
+const LOW_RECORDS = 200; // sprite records per pass while the engine shares this thread
+const pct = (p) => (p == null || Number.isNaN(p) ? "–" : p <= 0 ? "0%" : p >= 0.995 ? "100%" : p >= 0.1 ? `${Math.round(p * 100)}%`
+  : p >= 0.01 ? `${(p * 100).toFixed(1)}%` : p >= 0.0001 ? `${(p * 100).toFixed(2)}%` : "<0.01%");
+const rankStr = (r) => (r < 0 ? "–" : `#${fmtInt(r + 1)}`);
+const nVocab = () => F.nV || MAP.n || 50000;
+const hnOf = (h) => (h == null || Number.isNaN(h) ? NaN : h / Math.log(nVocab()));  // 0 = one word, 1 = every word equally likely
+const certainty = (hn) => (Number.isNaN(hn) ? "" : hn > 0.45 ? "wide open" : hn > 0.2 ? "undecided" : hn > 0.06 ? "narrowing" : "settled");
+const speedF = () => +S.prefs.speed || 1;
+function ftok(text) { const s = el("span", "ftok"); s.append(visFrag(text == null ? "" : String(text))); return s; }
+function para(...parts) { const e = el("p"); for (const x of parts) e.append(x); return e; }
+function layerWord(k) { const L = S.nL; return k === 0 ? "the word itself, before any layer" : k === L ? "the model's output" : k <= Math.round(L * 0.3) ? "early" : k >= Math.round(L * 0.8) ? "late" : "middle"; }
+const idleCall = window.requestIdleCallback ? (fn, t) => window.requestIdleCallback(fn, { timeout: t }) : (fn, t) => setTimeout(fn, Math.min(16, t));
+const cancelIdle = window.cancelIdleCallback ? (id) => window.cancelIdleCallback(id) : (id) => clearTimeout(id);
+
+/* ---- the vocabulary map ---- */
+function f16(h) { const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, f = h & 1023; if (e === 0) return s * f * 2 ** -24; if (e === 31) return f ? NaN : s * Infinity; return s * (1 + f / 1024) * 2 ** (e - 15); }
+function percentile(arr, q) { const a = Float32Array.from(arr).sort(); return a[Math.min(a.length - 1, Math.floor(q * a.length))]; }
+function buildMap(m) {
+  const u = new Uint16Array(m.bin), n = u.length >> 1, xy = new Float32Array(n * 2);
+  if (!n) return;
+  for (let i = 0; i < n * 2; i++) xy[i] = f16(u[i]);
+  const xs = new Float32Array(n), ys = new Float32Array(n);
+  for (let i = 0; i < n; i++) { xs[i] = xy[2 * i]; ys[i] = xy[2 * i + 1]; }
+  // frame the 0.5..99.5 percentile box (a map's junk-token islands would otherwise squeeze its body); the rest sits on the border
+  const box = { x0: percentile(xs, 0.005), x1: percentile(xs, 0.995), y0: percentile(ys, 0.005), y1: percentile(ys, 0.995) };
+  if (!(box.x1 > box.x0)) { box.x0 -= 1; box.x1 += 1; }
+  if (!(box.y1 > box.y0)) { box.y0 -= 1; box.y1 += 1; }
+  let off = 0;
+  for (let i = 0; i < n; i++) {
+    const x = xy[2 * i], y = xy[2 * i + 1];
+    if (x < box.x0 || x > box.x1 || y < box.y0 || y > box.y1) off++;
+    xy[2 * i] = clamp(x, box.x0, box.x1); xy[2 * i + 1] = clamp(y, box.y0, box.y1);
+  }
+  const G = MAP.G, grid = new Array(G * G);  // a coarse grid for "which word piece is under the pointer"
+  for (let i = 0; i < n; i++) {
+    const gx = Math.min(G - 1, Math.floor((xy[2 * i] - box.x0) / (box.x1 - box.x0) * G)), gy = Math.min(G - 1, Math.floor((xy[2 * i + 1] - box.y0) / (box.y1 - box.y0) * G));
+    const c = gy * G + gx; (grid[c] || (grid[c] = [])).push(i);
+  }
+  MAP.n = n; MAP.xy = xy; MAP.box = box; MAP.meta = m.meta || {}; MAP.off = off / n; MAP.grid = grid;
+  MAP.clusters = (MAP.meta.clusters || []).filter((c) => c.x > box.x0 && c.x < box.x1 && c.y > box.y0 && c.y < box.y1).map((c) => Object.assign({ name: regionName(c) }, c));
+  for (const c of MAP.clusters) for (const [t, id] of c.tokens || []) VOCAB.set(id, t);
+  FS.points = n; FS.mapLoaded = true;
+}
+/* A region's name: the map json's readable landmark when it carries one (`landmark`, the landmark rule of tools/vocab_map.py: up
+   to three of the region's whole words, the lowest ids, a frequency proxy, among those in its inner half around its density peak,
+   or, for a region without whole words, the kind of piece it is mostly made of: fragments, punctuation, numbers or code), else its
+   three commonest pieces joined with middle dots so the reader sees that the regions are made of word pieces ("stud · bec · includ",
+   not "stud bec includ"). */
+const PIECE_KINDS = new Set(["fragments", "punctuation", "numbers", "code"]);  // the landmarks that name a kind, not words
+function regionName(c) {
+  if (c.landmark) return String(c.landmark).trim();
+  const pieces = (c.tokens || []).map((t) => String(t[0]).trim()).filter(Boolean);
+  return (pieces.length ? pieces : String(c.label || "").trim().split(/\s+/)).join(" · ");
+}
+const tokXY = (id) => (MAP.n && id >= 0 && id < MAP.n ? [MAP.xy[2 * id], MAP.xy[2 * id + 1]] : null);
+const toPx = (x, y) => (MAP.n ? [x * VIEW.s + VIEW.ox, VIEW.oy - y * VIEW.s] : [x, y]);
+// the layer ladder, when there is no map: rank slots across, layers up (in css px)
+const slotX = (j) => VIEW.w * (0.2 + 0.3 * j);
+const layerY = (l) => 48 + (VIEW.h - 84) * (1 - l / Math.max(1, S.nL));
+
+/* ---- records: the trace fields the flow uses, on reply records (S.toks) and prompt records (turn.ptoks) ---- */
+function decodeRow(row) {  // {scale, sink, pos, w} -> Map pos -> weight; position 0 (the sink) is kept apart by the encoding
+  const m = new Map(); if (!row || !row.pos) return m;
+  for (let j = 0; j < row.pos.length; j++) m.set(row.pos[j], row.w[j] * row.scale / 255);
+  return m;
+}
+function lensArrays(ev) {
+  const nL = S.nL;
+  const P = new Float32Array(nL + 1).fill(NaN), R = new Int32Array(nL + 1).fill(-1), top = new Array(nL + 1).fill(null);
+  for (const e of ev.lens || []) { if (e.layer < 0 || e.layer > nL) continue; P[e.layer] = e.p; R[e.layer] = e.rank; top[e.layer] = e.top; }
+  let emerge = -1, emergeExact = true;
+  for (let l = 0; l <= nL; l++) { if (R[l] === 0) { emerge = l; break; } if (R[l] < 0) emergeExact = false; }
+  return { P, R, top, emerge, emergeExact };
+}
+function flowFields(ev, rec) {
+  const nL = S.nL;
+  rec.H = new Float32Array(nL + 1).fill(NaN);
+  for (const e of ev.lens || []) { if (e.layer >= 0 && e.layer <= nL && e.entropy != null) rec.H[e.layer] = e.entropy; for (const t of e.top || []) VOCAB.set(t[2], t[0]); }
+  const leads = []; let on = false;  // the layers at which the tracked token leads: "takes the lead at 6, loses it at 9, leads again from 11"
+  for (let l = 0; l <= nL; l++) { const t = rec.R[l] === 0; if (t && !on) leads.push([l, l]); else if (t) leads[leads.length - 1][1] = l; on = t; }
+  rec.leads = leads;
+  rec.attnEff = ev.attn_eff || null; rec.attnRows = ev.attn_rows || null; rec.attnTop = ev.attn_top || null;
+  rec.rival = ev.rival || null;
+  const rs = ev.resid || {};
+  rec.xyz = rs.xyz || null; rec.spike = rs.spike || null;
+  rec.spikeMax = rec.spike ? rec.spike.reduce((m, v) => Math.max(m, v), 0) : 0;
+  rec.qpos = ev.pos; rec.readsMean = null;
+  if (ev.alternatives) for (const t of ev.alternatives) VOCAB.set(t[2], t[0]);
+  if (ev.rival) VOCAB.set(ev.rival[2], ev.rival[0]);
+  if (rec.spike) rec.turn.sinksStale = true;
+}
+/* Context positions that act as attention sinks: position 0, and every traced position whose residual spike
+   (max |dim| / median |dim|) at some layer after the first two exceeds SINK_SPIKE and stands out at least
+   SINK_RATIO times above the median spike of the traced positions at that layer. The absolute rule alone
+   would flag ordinary words (in the recordings many reach 110-150x at layer 1 or 2, where every position
+   spikes); the sinks sit 14-50x above the rest for a run of layers. */
+const SINK_RATIO = 5;
+function turnSinks(turn) {
+  if (turn.sinks && !turn.sinksStale) return turn.sinks;
+  const sinks = turn.sinks || new Map(); sinks.clear(); sinks.set(0, Infinity);
+  const recs = [];
+  for (const k of turn.toks) if (S.toks[k].spike) recs.push(S.toks[k]);
+  if (turn.ptoks) for (const r of turn.ptoks.values()) if (r.spike) recs.push(r);
+  if (recs.length) {
+    const L = recs[0].spike.length, med = new Float32Array(L);
+    for (let l = 0; l < L; l++) { const v = recs.map((r) => r.spike[l] || 0).sort((a, b) => a - b); med[l] = v[v.length >> 1]; }
+    for (const r of recs) for (let l = 2; l < L; l++) {
+      const sp = r.spike[l]; if (sp > SINK_SPIKE && (recs.length < 4 ? sp > 3 * SINK_SPIKE : sp > SINK_RATIO * med[l])) { sinks.set(r.cpos, r.spikeMax); break; }
+    }
+  }
+  turn.sinks = sinks; turn.sinksStale = false; return sinks;
+}
+function flowIngestToken(turn, rec, ev) {  // called by addToken
+  const t0 = performance.now();
+  rec.kind = "reply"; rec.cpos = ev.pos + 1; rec.tracked = rec.id; rec.name = rec.raw;
+  flowFields(ev, rec);
+  VOCAB.set(rec.id, rec.raw);
+  if (F.stripTurn === turn) stripAppend(turn, rec);
+  F.queue.push(rec);
+  if (REND) { REND.invalidate("trail"); REND.invalidate("pigment"); }  // the constellation gained a dot, the pigment a deposit
+  const dt = performance.now() - t0; FS.ingestN++; FS.ingestMean += (dt - FS.ingestMean) / FS.ingestN; FS.ingestMax = Math.max(FS.ingestMax, dt);
+  flowRequestFrame();
+}
+function flowPromptToken(turn, ev) {  // a traced prompt position ("trace_prompt"): its story is what the model expected next
+  if (!S.nL) return;
+  const la = lensArrays(ev);
+  const norms = ev.norms || { attn: [], mlp: [], resid: [] };
+  const rec = Object.assign({ kind: "prompt", turn, k: -1, i: -1, id: ev.id, tracked: ev.next, cpos: ev.pos, text: "", name: "", raw: "",
+    nM: Float32Array.from(norms.mlp || []), nR: Float32Array.from(norms.resid || []), prob: null, entropy: null, alts: null, eos: false }, la);
+  flowFields(ev, rec);
+  (turn.ptoks || (turn.ptoks = new Map())).set(ev.pos, rec);
+  if (turn.prompt) promptTexts(turn, rec);
+}
+function promptTexts(turn, rec) {
+  const t = turn.prompt.tokens;
+  rec.text = t[rec.cpos] != null ? t[rec.cpos] : ""; rec.name = t[rec.cpos + 1] != null ? t[rec.cpos + 1] : ""; rec.raw = rec.text;
+  VOCAB.set(rec.id, rec.text); if (rec.tracked != null) VOCAB.set(rec.tracked, rec.name);
+}
+function flowOnPrompt(turn) {  // called by onPrompt: texts for the prompt records, the strip for this turn
+  if (turn.ptoks) for (const rec of turn.ptoks.values()) promptTexts(turn, rec);
+  if (!F.cur || F.cur.turn === turn || F.stripTurn === null) stripBuild(turn);
+  setText($("fstripNote"), "— tap a word to see its story");
+}
+function wordAt(turn, pos) {  // the word at a context position: prompt words from the prompt event, reply words by index
+  if (turn.prompt && pos < turn.prompt.n_prompt) return turn.prompt.tokens[pos];
+  const k = turn.prompt ? turn.toks[pos - turn.prompt.n_prompt] : null;
+  return k == null ? `#${pos + 1}` : S.toks[k].raw;
+}
+function recordAt(turn, pos) {  // the traced record (if any) of a context position
+  if (turn.prompt && pos >= turn.prompt.n_prompt) { const k = turn.toks[pos - turn.prompt.n_prompt]; return k == null ? null : S.toks[k]; }
+  return turn.ptoks ? turn.ptoks.get(pos) || null : null;
+}
+function allTraced() { const out = S.toks.slice(); for (const t of S.turns) if (t.ptoks) for (const r of t.ptoks.values()) out.push(r); return out; }
+
+/* ---- the conversation strip: every context word is a span; attention is a wash behind it ---- */
+function stripBuild(turn) {
+  F.stripTurn = turn; F.spans = new Map(); F.washed = [];
+  const box = $("fwords"); box.replaceChildren();
+  if (!turn || !turn.prompt) { box.append(el("span", "fhint", "The words of the conversation appear here as the model reads them.")); return; }
+  const toks = turn.prompt.tokens, n = toks.length, sinks = turnSinks(turn);
+  // the last user turn is the question; what precedes it (template, system prompt, earlier turns) and the assistant header fold away
+  let q0 = 0, q1 = n;
+  for (let i = n - 1; i >= 1; i--) if (toks[i] === "user" && isSpecial(toks[i - 1])) { q0 = i + 1; if (/^\n+$/.test(toks[q0] || "")) q0++; break; }
+  for (let i = q0; i < n; i++) if ((toks[i] === "assistant" || toks[i] === "ass") && isSpecial(toks[i - 1])) { q1 = i - 1; break; }
+  const span = (pos, text, cls) => {
+    const s = el("span", "fw " + cls); s.dataset.pos = pos; s.append(visFrag(text));
+    if (isSpecial(text)) s.classList.add("sp");
+    const rec = recordAt(turn, pos);
+    if (!rec) { s.classList.add("nostory"); s.title = pos < turn.prompt.n_reused ? "reused from the cached chat prefix: not traced" : "not traced"; }
+    else s.title = `position ${pos + 1}: tap to see what the model expected next`;
+    if (sinks.has(pos)) { s.classList.add("sink"); s.title += pos === 0 ? " · position 1 is the attention sink" : ` · acts as an attention sink: its residual spikes ${Math.round(sinks.get(pos))}x`; }
+    F.spans.set(pos, s); return s;
+  };
+  const folded = (a, b, label) => {
+    if (a >= b) return;
+    const btn = el("button", "fold", label); btn.type = "button"; btn.title = "Hidden template tokens; tap to show";
+    const hid = el("span"); hid.hidden = true;
+    for (let i = a; i < b; i++) hid.append(span(i, toks[i], "sys q"));
+    btn.addEventListener("click", () => { hid.hidden = !hid.hidden; });
+    box.append(btn, hid);
+  };
+  folded(0, q0, `chat template · ${q0} words`);
+  box.append(el("span", "who", "You"));
+  for (let i = q0; i < q1; i++) box.append(span(i, toks[i], "q"));
+  folded(q1, n, `· ${n - q1}`);
+  box.append(el("span", "who", "Model"));
+  const reply = el("span"); reply.id = "freply"; box.append(reply);
+  for (const k of turn.toks) stripAppend(turn, S.toks[k]);
+  if (F.cur && F.cur.turn === turn) stripMark(F.cur);
+}
+function stripAppend(turn, rec) {
+  const box = $("freply"); if (!box || F.spans.has(rec.cpos)) return;
+  const s = el("span", "fw a"); s.dataset.pos = rec.cpos; s.append(visFrag(rec.eos ? rec.raw : rec.text));
+  if (rec.eos) s.classList.add("sp");
+  s.title = `word ${rec.i + 1} of the reply: chosen at ${pct(rec.prob)}`;
+  F.spans.set(rec.cpos, s); box.append(s);
+  markSinks(turn);
+}
+function markSinks(turn) {  // the sink flags on the strip's words follow the rule as more positions are traced
+  const sinks = turnSinks(turn);
+  for (const [pos, s] of F.spans) {
+    const is = sinks.has(pos);
+    if (is === s.classList.contains("sink")) continue;
+    s.classList.toggle("sink", is);
+    const base = s.title.split(" · ")[0];
+    s.title = is ? `${base} · ${pos === 0 ? "position 1 is the attention sink" : `acts as an attention sink: its residual spikes ${Math.round(sinks.get(pos))}x`}` : base;
+  }
+}
+let stripCur = null;
+function stripMark(rec) {
+  const s = rec ? F.spans.get(rec.cpos) : null;
+  if (stripCur && stripCur !== s) stripCur.classList.remove("cur");
+  if (s) s.classList.add("cur");  // scrolled into view by refreshHeavy: reading its offset here would force a layout in the frame
+  stripCur = s || null;
+}
+function revealSpan(s) {  // scroll the strip (only it, never the page) so the word is in view
+  const box = $("fstrip"), top = s.offsetTop - box.offsetTop, bottom = top + s.offsetHeight, view = box.clientHeight;
+  if (top < box.scrollTop + 8) box.scrollTop = Math.max(0, top - 8); else if (bottom > box.scrollTop + view - 8) box.scrollTop = bottom - view + 8;
+}
+function applyWash(rd) {
+  for (const s of F.washed) { s.classList.remove("read"); s.style.removeProperty("--w"); }
+  F.washed = [];
+  if (!rd || !rd.max) return;
+  for (const [pos, w] of rd.map) {
+    const s = F.spans.get(pos); if (!s) continue;
+    s.classList.add("read"); s.style.setProperty("--w", (0.12 + 0.78 * w / rd.max).toFixed(3)); F.washed.push(s);
+  }
+}
+$("fwords").addEventListener("click", (e) => {
+  const s = e.target.closest(".fw"); if (!s || s.classList.contains("nostory") || !F.stripTurn) return;
+  flowSelectPos(F.stripTurn, +s.dataset.pos, true);
+});
+$("fwords").addEventListener("pointerover", (e) => {
+  const s = e.target.closest(".fw.read"); if (!s || !F.cur) return;
+  const rd = readsAt(F.cur, F.k), w = rd && rd.map.get(+s.dataset.pos);
+  if (w == null) return;
+  showTip(e.clientX, e.clientY, (t) => { t.append(el("div", "h", `reads ${pct(w)} from here ${F.k === S.nL ? "over all layers" : `at layer ${F.k}`}`)); });
+});
+$("fwords").addEventListener("pointerout", (e) => { if (e.target.closest(".fw")) hideTip(); });
+function flowSelectPos(turn, pos, user) {
+  const rec = recordAt(turn, pos); if (!rec) return;
+  if (rec.kind === "reply") { selectToken(rec.k, { pin: true, revealText: true }); return; }
+  if (S.follow) setFollow(false);
+  flowStartStory(rec, { user });
+}
+
+/* ---- what the word read: the effective attention row of one block, or its mean over all blocks at rest ---- */
+function readsMean(r) {  // the decoded rows averaged over the L blocks: "what did this word read overall"
+  if (r.readsMean !== null) return r.readsMean;
+  const rows = r.attnEff || r.attnRows;
+  const m = new Map(); let sink = 0, n = 0, kind;
+  if (rows) {
+    kind = r.attnEff ? "mean" : "rawmean";
+    for (const row of rows) { if (!row || !row.pos) continue; n++; sink += row.sink || 0; for (let j = 0; j < row.pos.length; j++) m.set(row.pos[j], (m.get(row.pos[j]) || 0) + row.w[j] * row.scale / 255); }
+  } else if (r.attnTop) {
+    kind = "topmean";
+    for (const row of r.attnTop) { if (!row) continue; n++; for (const [p, w] of row) m.set(p, (m.get(p) || 0) + w); }
+  } else return (r.readsMean = false);
+  for (const [p, w] of m) m.set(p, w / Math.max(1, n));
+  return (r.readsMean = { map: m, sink: rows ? sink / Math.max(1, n) : null, kind });
+}
+function readsAt(r, k) {  // lens layer k is the residual after block k, so block k's attention is row k-1; layer 0 has read nothing
+  if (!r || k <= 0) return null;
+  let m = null, sink = null, kind = "";
+  if (k === S.nL) { const mm = readsMean(r); if (mm) { m = new Map(mm.map); sink = mm.sink; kind = mm.kind; } }
+  if (!m) {
+    const a = k - 1;
+    if (r.attnEff && r.attnEff[a]) { m = decodeRow(r.attnEff[a]); sink = r.attnEff[a].sink; kind = "eff"; }
+    else if (r.attnTop && r.attnTop[a]) { m = new Map(r.attnTop[a]); kind = "top"; }
+    else if (r.attnRows && r.attnRows[a]) { m = decodeRow(r.attnRows[a]); sink = r.attnRows[a].sink; kind = "raw"; }
+    else return null;
+  }
+  const turn = r.turn, nP = turn.prompt ? turn.prompt.n_prompt : Infinity, sinks = turnSinks(turn), delims = [], ents = [];
+  let prompt = 0, reply = 0;
+  for (const [pos, w] of m) {
+    if (pos === 0) { if (sink == null) sink = w; m.delete(pos); continue; }  // the first token is the sink: stated in words, never washed
+    if (sinks.has(pos)) { delims.push([pos, w, wordAt(turn, pos), sinks.get(pos)]); m.delete(pos); continue; }  // a sink-like position: named, not washed
+    if (pos < nP) prompt += w; else reply += w;
+    ents.push([pos, w, wordAt(turn, pos)]);
+  }
+  ents.sort((a, b) => b[1] - a[1]);
+  return { map: m, top: ents, prompt, reply, sink, delims, kind, max: ents.length ? ents[0][1] : 0, overall: k === S.nL && kind !== "eff" && kind !== "top" && kind !== "raw" };
+}
+function mlpWrite(r, k) {  // the MLP's write relative to the stream: ‖mlp out of block k‖ / ‖residual after k‖
+  if (!r.nM || !r.nR || !r.nM.length) return "";
+  let best = -1, bv = 0;
+  for (let l = 1; l < r.nR.length && l - 1 < r.nM.length; l++) { const v = r.nM[l - 1] / (r.nR[l] || 1); if (v > bv) { bv = v; best = l; } }
+  if (best < 0) return "";
+  const own = k >= 1 && k - 1 < r.nM.length ? `This layer's MLP wrote a vector ${Math.round(100 * r.nM[k - 1] / (r.nR[k] || 1))}% the size of the state; ` : "";
+  return `${own}${own ? "the" : "The"} biggest rewrite is at layer ${best} (${Math.round(100 * bv)}%).`;
+}
+
+/* ---- narration: generated from the fields, never free text ---- */
+function narrate() {
+  const r = F.cur, box = $("fnarr"), k = F.k, L = S.nL;
+  box.replaceChildren();
+  setText($("ftickEnd"), `${L} · output`);
+  if (!r) {
+    box.classList.remove("dim");
+    box.append(para(el("span", "idle", S.toks.length ? "Tap a word of the reply (or of the question) to see how the model arrived at it, layer by layer."
+      : "Send a message. Each reply word's story plays here as it is generated: where the model's guess sat on the word map, layer by layer, and which words it read.")));
+    setText($("femergeLabel"), ""); return;
+  }
+  const name = r.kind === "reply" ? r.raw : r.name;
+  const t = el("div", "title");
+  if (r.kind === "reply") t.append(`Word ${r.i + 1} of the reply: `, ftok(name));
+  else t.append("Reading ", ftok(r.text), ` (position ${r.cpos + 1}): what came next was `, ftok(name));
+  box.append(t);
+  const em = r.emerge, emEl = el("p", "emerge");
+  if (em < 0) emEl.append(ftok(name), " never takes the lead at any traced layer.");
+  else {
+    const keeps = r.leads.length === 1 && r.leads[0][1] === L;
+    emEl.append(ftok(name), em === L ? ` only takes the lead at the output layer ${L}.` : ` first takes the lead at layer ${em}`
+      + (keeps ? " and keeps it to the output." : r.leads.length > 1 ? `, loses it at layer ${r.leads[0][1] + 1}, and leads again from layer ${r.leads[r.leads.length - 1][0]}.` : "."));
+    if (!r.emergeExact) emEl.append(el("span", "muted", " (first traced layer: the lens stride skipped layers)"));
+  }
+  box.append(emEl);
+  setText($("femergeLabel"), em < 0 ? "never leads" : `leads from layer ${em}`);
+  // while a sweep plays the cards follow each layer and the narration waits, dimmed: the page never names two layers at once
+  box.classList.toggle("dim", !!F.sweep);
+  if (F.sweep) { box.append(para(el("span", "k", "Playing the story"), el("br"), `From the word itself at layer 0 to the model's output at layer ${L}; the cards follow each layer and the full account appears when it lands.`)); return; }
+  const top = r.top[k], pk = r.P[k], rk = r.R[k], hn = hnOf(r.H[k]);
+  const here = el("p");
+  here.append(el("span", "k", `Layer ${k} · ${layerWord(k)}`), el("br"));
+  if (!top) here.append("Not traced at this layer (lens stride).");
+  else if (rk === 0) { here.append(ftok(name), ` is the top guess here at ${pct(pk)}`); if (top[1]) here.append("; runner-up ", ftok(top[1][0]), ` at ${pct(top[1][1])}`); here.append("."); }
+  else here.append("Top guess here: ", ftok(top[0][0]), ` at ${pct(top[0][1])}. `, ftok(name), ` is ranked ${rankStr(rk)} at ${pct(pk)}.`);
+  if (!Number.isNaN(hn)) here.append(` The readout is ${certainty(hn)} (${r.H[k].toFixed(2)} nats).`);
+  else if (top) here.append(el("span", "muted", " (no lens entropy in this trace: the glow's spread comes from the top probability)"));
+  const mw = mlpWrite(r, k); if (mw) here.append(el("br"), el("span", "muted", mw));
+  box.append(here);
+  const rd = readsAt(r, k);
+  if (!rd && k === 0) box.append(para(el("span", "k", "Reads from"), el("br"), "Nothing yet: layer 0 is the word's own embedding, before any attention."));
+  if (rd) {
+    const rp = el("p"); rp.append(el("span", "k", rd.overall ? "Reads from, over all layers" : `Reads from, block ${k}`), el("br"));
+    if (rd.top.length) { rp.append("Mostly "); rd.top.slice(0, 3).forEach(([, w, text], i) => rp.append(i ? ", " : "", ftok(text), ` ${pct(w)}`)); rp.append(". "); }
+    const sinkTxt = rd.sink == null ? "" : `${pct(rd.sink)} rests on the first token (the sink)`;
+    if (rd.kind === "top" || rd.kind === "topmean") rp.append(`Of the eight positions the trace kept per layer, ${pct(rd.prompt)} is the question and ${pct(rd.reply)} its own words.`);
+    else if (r.kind === "reply") rp.append(`${pct(rd.prompt)} of its reading is the question, ${pct(rd.reply)} its own words${sinkTxt ? "; " + sinkTxt : ""}.`);
+    else rp.append(sinkTxt ? `${sinkTxt}; the rest is the question read so far.` : "All of its reading is the question read so far.");
+    rd.delims.slice(0, 2).forEach(([, w, text, sp]) => rp.append(` ${pct(w)} on `, ftok(text), `, which acts as a sink (its residual spikes ${Math.round(sp)}x) and is left out of the wash.`));
+    if (rd.delims.length > 2) rp.append(` ${rd.delims.length - 2} more sink-like position${rd.delims.length > 3 ? "s are" : " is"} left out too.`);
+    if (rd.kind === "raw" || rd.kind === "rawmean") rp.append(el("span", "muted", " Raw attention weights (this trace has no effective row): the sink and punctuation are overstated."));
+    box.append(rp);
+  }
+  if (k <= Math.round(L * 0.3) && rk !== 0) box.append(el("p", "note", "Early readouts are mostly reflexes: common words, or the word just read. They are not yet what the model believes."));
+  if (r.qpos === 0) box.append(el("p", "note", "Position 1 is the attention sink: its readout carries little meaning."));
+  if (r.kind === "reply") {
+    const f = el("p"); f.append(el("span", "k", "Final"), el("br"), `Chosen at ${pct(r.prob)}`);
+    if (r.rival) f.append("; runner-up ", ftok(r.rival[0]), ` at ${pct(r.rival[1])}`);
+    f.append(r.entropy != null ? ` (${r.entropy.toFixed(2)} nats).` : "."); box.append(f);
+  } else box.append(para(el("span", "k", "Note"), el("br"), "The model was reading your question here: this is what it expected next, before it saw the actual next word."));
+}
+
+/* ---- the cards: the text twins of the wash and the glows ---- */
+function barCell(w, color) { const b = el("span", "bar"), i = el("i"); i.style.width = `${Math.max(1, Math.round(100 * w))}%`; i.style.background = color; b.append(i); return b; }
+function drawReads(rd) {  // rd: the decoded row of this layer when the caller already has it (the wash and the card share one decode per step)
+  const box = $("freads"), r = F.cur; box.replaceChildren();
+  if (rd === undefined) rd = readsAt(r, F.k);
+  setText($("freadsLayer"), r ? (F.k === S.nL && rd && rd.overall ? "· all layers" : `· layer ${F.k}`) : "");
+  if (!rd) { box.append(el("p", "muted", r && F.k === 0 ? "nothing yet: layer 0 is the word's own embedding" : "—")); return; }
+  const nP = r.turn.prompt ? r.turn.prompt.n_prompt : Infinity;
+  for (const [pos, w, text] of rd.top.slice(0, 6)) {
+    const row = el("div", "r"), tc = el("span"); tc.append(ftok(text), el("span", "muted", pos < nP ? "  question" : "  reply"));
+    row.append(tc, el("span", "p", pct(w)), barCell(w / rd.max, FC.read)); box.append(row);
+  }
+  const heads = S.nH ? `${S.nH} ` : "";
+  box.append(el("p", "s", rd.kind === "eff" ? `Effective attention of block ${F.k}: averaged over the ${heads}heads and weighted by what each position has to offer; ${pct(rd.sink)} on the first token is left out.`
+    : rd.kind === "mean" ? `Effective attention averaged over all ${S.nL} blocks: what this word read overall. ${pct(rd.sink)} on the first token is left out.`
+    : rd.kind === "top" || rd.kind === "topmean" ? "The eight strongest positions of the effective attention row per layer (this trace kept no full row)."
+    : `Raw attention averaged over the ${heads}heads${rd.kind === "rawmean" ? " and over the layers" : ""} (no effective row in this trace); ${pct(rd.sink)} on the first token is left out.`));
+}
+function drawCands() {
+  const box = $("fcands"), r = F.cur; box.replaceChildren();
+  setText($("fcandsLayer"), r ? `· layer ${F.k}` : "");
+  if (!r) { box.append(el("p", "muted", "—")); return; }
+  const top = r.top[F.k]; if (!top) { box.append(el("p", "muted", "not traced at this layer")); return; }
+  const tb = el("table"), rows = top.slice();
+  if (!rows.some((t) => t[2] === r.tracked)) rows.push([r.kind === "reply" ? r.raw : r.name, r.P[F.k], r.tracked, true]);
+  for (const t of rows) {
+    const tr = el("tr", t[2] === r.tracked ? "ch" : ""), td = el("td"); td.append(ftok(t[0]), t[3] ? el("span", "muted", `  ${rankStr(r.R[F.k])}`) : "");
+    const tb2 = el("td", "b"); tb2.append(barCell(t[1], t[2] === r.tracked ? FC.chosen : FC.cand));
+    tr.append(td, el("td", "p", pct(t[1])), tb2); tb.append(tr);
+  }
+  box.append(tb, el("p", "s", `The lens: the output layer's own readout applied to the residual after layer ${F.k}. ` + (Number.isNaN(r.H[F.k]) ? "No entropy in this trace." : `Entropy ${r.H[F.k].toFixed(2)} nats.`)));
+}
+function drawFinal() {
+  const box = $("ffinal"), r = F.cur; box.replaceChildren();
+  if (!r || r.kind !== "reply" || !r.alts || !r.alts.length) { box.append(el("p", "muted", r && r.kind === "prompt" ? "a question word: no sampling here" : "—")); return; }
+  const tb = el("table"); let found = false;
+  const items = r.alts.map((t) => { const c = !found && isChosen(r, t[0], t[2]); if (c) found = true; return [t[0], t[1], c]; });
+  if (!found) items.push([r.raw, r.prob, true]);
+  for (const [s, p, c] of items) {
+    const tr = el("tr", c ? "ch" : ""), td = el("td"); td.append(ftok(s));
+    const tb2 = el("td", "b"); tb2.append(barCell(p, c ? FC.chosen : FC.cand));
+    tr.append(td, el("td", "p", pct(p)), tb2); tb.append(tr);
+  }
+  box.append(tb, el("p", "s", `The sampling distribution${S.settings.temperature === 0 ? " (temperature 0: the top word is always taken)" : ""}. Entropy ${r.entropy != null ? r.entropy.toFixed(2) : "–"} nats.`));
+}
+function drawTable() {  // the layer-by-layer table: built once per story (its rows are per layer); the current row is marked per step
+  const body = $("ftableRows"), r = F.cur;
+  if (F.tableRec === r && (!r || body.children.length)) { tableMark(); return; }
+  F.tableRec = r; F.tableCur = null; body.replaceChildren();
+  setText($("ftableNote"), r ? `· ${S.nL + 1} layers` : "");
+  if (!r) return;
+  for (let l = 0; l <= S.nL; l++) {
+    const top = r.top[l], tr = el("tr", (top ? "" : "na") + (l === r.emerge ? " lead" : "")); tr.dataset.l = l;
+    tr.title = l === r.emerge ? `layer ${l}: the word first takes the lead here; click to scrub` : `click to scrub to layer ${l}`;
+    const t1 = el("td"); if (top) t1.append(ftok(top[0][0]), el("span", "muted", ` ${pct(top[0][1])}`)); else t1.textContent = "not traced";
+    tr.append(el("td", "ly", String(l)), t1, el("td", "p", top ? pct(r.P[l]) : "–"), el("td", "p", top ? rankStr(r.R[l]) : "–"), el("td", "p", Number.isNaN(r.H[l]) ? "–" : r.H[l].toFixed(2)));
+    body.append(tr);
+  }
+  tableMark();
+}
+function tableMark() {
+  if (F.tableCur) F.tableCur.classList.remove("cur");
+  F.tableCur = F.cur && F.tableRec === F.cur ? $("ftableRows").children[F.k] || null : null;
+  if (F.tableCur) F.tableCur.classList.add("cur");
+}
+$("ftableRows").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr"); if (!tr || !F.cur) return;
+  if (S.follow && S.generating) setFollow(false);
+  flowSetLayer(+tr.dataset.l, { user: true });
+});
+let CSZ = new WeakMap();  // canvas css sizes, read from layout once per resize (a clientWidth read after DOM writes forces a layout)
+function flCanvas(cv) {
+  const d = Math.min(2, window.devicePixelRatio || 1);
+  let s = CSZ.get(cv); if (!s || !s.w) { s = { w: cv.clientWidth, h: cv.clientHeight }; CSZ.set(cv, s); }
+  const W = Math.round(s.w * d), H = Math.round(s.h * d);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext("2d"); ctx.setTransform(d, 0, 0, d, 0, 0); return [ctx, s.w, s.h];
+}
+function spreadAt(r, l) {  // normalized lens entropy; without the entropy field (old traces) the top probability stands in
+  const hn = hnOf(r.H[l]); if (!Number.isNaN(hn)) return Math.min(1, hn);
+  const top = r.top[l]; return top && top[0] ? Math.max(0, 1 - top[0][1]) : 0;
+}
+function drawSpark() {  // p(tracked) per layer, the entropy per layer as grey bars, the emergence tick and the current layer
+  const [ctx, w, h] = flCanvas($("fspark")); ctx.clearRect(0, 0, w, h);
+  const r = F.cur, L = S.nL; if (!r || !L || !w) return;
+  const x = (l) => 8 + (w - 16) * l / L, y = (v) => 6 + (h - 14) * (1 - v);
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(8, y(0) + 0.5); ctx.lineTo(w - 8, y(0) + 0.5); ctx.stroke();
+  ctx.fillStyle = C.axis; ctx.globalAlpha = 0.55;
+  for (let l = 0; l <= L; l++) { if (!r.top[l]) continue; const bh = spreadAt(r, l) * (h - 14); ctx.fillRect(x(l) - 1.5, y(0) - bh, 3, bh); }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = FC.chosen; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.beginPath(); let started = false;
+  for (let l = 0; l <= L; l++) { const v = r.P[l]; if (Number.isNaN(v)) { started = false; continue; } if (!started) { ctx.moveTo(x(l), y(v)); started = true; } else ctx.lineTo(x(l), y(v)); }
+  ctx.stroke();
+  if (r.emerge >= 0) { ctx.fillStyle = FC.chosen; ctx.beginPath(); ctx.moveTo(x(r.emerge), h - 7); ctx.lineTo(x(r.emerge) - 4, h); ctx.lineTo(x(r.emerge) + 4, h); ctx.fill(); }
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x(F.k) + 0.5, 2); ctx.lineTo(x(F.k) + 0.5, h - 2); ctx.stroke();
+}
+/* The residual basis is fitted per layer, so its axes may flip or swap between adjacent layers. A signed permutation
+   aligning each layer's axes with the previous layer's (from the correlation over the traced positions) keeps the
+   cloud from flipping while scrubbing; it is refitted with each new position until 24 are traced, then frozen. */
+function alignBasis() {
+  if (F.align && F.alignN >= 24) return F.align;
+  const recs = allTraced().filter((t) => t.xyz && t.qpos !== 0), n = recs.length, L = S.nL;
+  if (n < 4 || F.alignN === n) return F.align;
+  const A = [[[0, 1], [1, 1], [2, 1]]];
+  const apply = (v, a) => [a[0][1] * v[a[0][0]], a[1][1] * v[a[1][0]], a[2][1] * v[a[2][0]]];
+  for (let k = 1; k <= L; k++) {
+    const pairs = recs.filter((t) => t.xyz[k - 1] && t.xyz[k]).map((t) => [apply(t.xyz[k - 1], A[k - 1]), t.xyz[k]]);
+    const a = [[0, 1], [1, 1], [2, 1]];
+    if (pairs.length >= 4) {
+      const mu = [[0, 0, 0], [0, 0, 0]], sd = [[0, 0, 0], [0, 0, 0]];
+      for (const [p, q] of pairs) for (let i = 0; i < 3; i++) { mu[0][i] += p[i] / pairs.length; mu[1][i] += q[i] / pairs.length; }
+      for (const [p, q] of pairs) for (let i = 0; i < 3; i++) { sd[0][i] += (p[i] - mu[0][i]) ** 2; sd[1][i] += (q[i] - mu[1][i]) ** 2; }
+      const c = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      for (const [p, q] of pairs) for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) c[i][j] += (p[i] - mu[0][i]) * (q[j] - mu[1][j]) / Math.sqrt(sd[0][i] * sd[1][j] || 1);
+      const usedI = new Set(), usedJ = new Set();
+      for (let pick = 0; pick < 3; pick++) {
+        let bi = -1, bj = -1, bv = -1;
+        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) if (!usedI.has(i) && !usedJ.has(j) && Math.abs(c[i][j]) > bv) { bv = Math.abs(c[i][j]); bi = i; bj = j; }
+        usedI.add(bi); usedJ.add(bj); a[bi] = [bj, c[bi][bj] < 0 ? -1 : 1];
+      }
+    }
+    A.push(a);
+  }
+  F.align = A; F.alignN = n; return A;
+}
+function drawState() {  // every traced word's resid.xyz at this layer: grey dots; the selected one orange
+  const cv = $("fstateCv"), [ctx, w, h] = flCanvas(cv); ctx.clearRect(0, 0, w, h);
+  const r = F.cur, k = F.k; setText($("fstateLayer"), r ? `· layer ${k}` : "");
+  if (!r || !r.xyz) { setText($("fstateNote"), r && !r.xyz ? "No residual basis for this model (tools/trace_basis.py): nothing to draw." : "—"); return; }
+  if (!w) return;
+  const A = alignBasis(), ak = A && A[k];
+  const disp = (v) => (ak ? [ak[0][1] * v[ak[0][0]], ak[1][1] * v[ak[1][0]], ak[2][1] * v[ak[2][0]]] : v);
+  const pts = []; for (const t of allTraced()) if (t.xyz && t.xyz[k] && t.qpos !== 0) pts.push([t, disp(t.xyz[k])]);
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const [, v] of pts) { x0 = Math.min(x0, v[0]); x1 = Math.max(x1, v[0]); y0 = Math.min(y0, v[1]); y1 = Math.max(y1, v[1]); }
+  const sx = (v) => 10 + (w - 20) * (v - x0) / (x1 - x0 || 1), sy = (v) => h - 10 - (h - 20) * (v - y0) / (y1 - y0 || 1);
+  ctx.strokeStyle = C.grid; ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  for (const [t, v] of pts) { if (t === r) continue; ctx.fillStyle = C.axis; ctx.globalAlpha = t.kind === "reply" ? 0.9 : 0.5; ctx.beginPath(); ctx.arc(sx(v[0]), sy(v[1]), 2.5 + 1.5 * Math.min(1, Math.abs(v[2]) / 8), 0, 6.283); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  const v = r.xyz[k] && disp(r.xyz[k]);
+  if (v) { ctx.fillStyle = C.surface; ctx.beginPath(); ctx.arc(sx(v[0]), sy(v[1]), 7, 0, 6.283); ctx.fill(); ctx.fillStyle = FC.chosen; ctx.beginPath(); ctx.arc(sx(v[0]), sy(v[1]), 5, 0, 6.283); ctx.fill(); }
+  const sp = r.spike && r.spike[k];
+  setText($("fstateNote"), `The model's inner state after layer ${k} on its 3 main directions for this layer (dot size: the third); grey: the other traced words. The directions change from layer to layer${A ? " (aligned in sign and order with the layer before)" : ""}, so compare within a layer only.`
+    + (sp != null && sp > 50 ? ` Spike ${sp.toFixed(0)}x: this position carries a massive activation (sink-like).` : ""));
+}
+
+/* ---- the field's colours (the page's tokens; dark: light on black, light: ink on paper) ---- */
+const FC = { dark: false, bg: [1, 1, 1], cand: [0, 0, 0], chosen: [0, 0, 0], field: [0.4, 0.4, 0.4], candCss: "", chosenCss: "", read: "", surface: "" };
+function flColors() {
+  const cs = getComputedStyle(document.documentElement), v = (n) => cs.getPropertyValue(n).trim();
+  FC.dark = C.mode === "dark"; FC.bg = hexRgb(C.surface); FC.cand = hexRgb(v("--cand")); FC.chosen = hexRgb(v("--chosen"));
+  FC.field = FC.dark ? [0.62, 0.61, 0.58] : [0.42, 0.42, 0.40];
+  FC.candCss = v("--cand"); FC.chosenCss = v("--chosen"); FC.read = v("--read"); FC.surface = C.surface;
+}
+
+/* ---- the story sprites: for layer l, the lens top-3 at their map positions (or their rank slots on the ladder) ---- */
+function spritesAt(r, l) {
+  const out = [], top = r.top[l]; if (!top) return out;
+  const hn = spreadAt(r, l);
+  top.forEach(([text, p, id], j) => {
+    let x, y;
+    if (MAP.n) { const xy = tokXY(id); if (!xy) return; [x, y] = xy; } else { x = slotX(j); y = layerY(l); }
+    out.push({ x, y, p, id, text, chosen: id === r.tracked, hn, layer: l, slot: j });
+  });
+  return out;
+}
+// size (css px) grows with the lens entropy (a settled readout is a point, an undecided one a cloud); light with the probability
+function spriteSize(sp) { const S0 = Math.min(VIEW.w, VIEW.h); return S0 * (0.028 + 0.20 * Math.sqrt(sp.hn)); }
+function spriteInt(sp) {
+  const early = sp.layer < 0.2 * S.nL ? 0.4 : 1;  // early-layer readouts are reflexes: de-emphasised to match the narration
+  return (0.10 + 0.9 * Math.sqrt(sp.p)) * (sp.chosen ? 1.7 : 1.0) * 1.2 / (0.35 + Math.sqrt(sp.hn)) * early;
+}
+function trailList(now) {  // every sprite to draw with its weight: the afterimage of the layers below the current one, then the constellation
+  const r = F.cur, out = []; const L = S.nL;
+  if (r) {
+    const kf = F.kf, kc = F.k, lim = Math.min(L, Math.ceil(kf));
+    if (F.live && F.entered) {  // follow-live: each layer's light decays with the time since it was entered; the current layer stays full
+      for (let l = 0; l <= lim; l++) { const t = F.entered[l]; if (Number.isNaN(t)) continue; const w = l === kc ? 1 : Math.exp(-(now - t) / TAU); if (w <= 0.02) continue; for (const sp of spritesAt(r, l)) { sp.w = w; out.push(sp); } }
+      if (F.prev) {  // the previous word's story, still fading
+        let any = false;
+        for (let l = 0; l <= L; l++) { const t = F.prev.entered[l]; if (Number.isNaN(t)) continue; const w = Math.exp(-(now - Math.max(t, F.prev.t1)) / TAU); if (w <= 0.02) continue; any = true; for (const sp of spritesAt(F.prev.rec, l)) { sp.w = w; sp.prev = true; out.push(sp); } }
+        if (!any) F.prev = null;
+      }
+    } else {  // scrubbing: a function of the layer, not of time, so a frame never depends on the previous one
+      for (let l = 0; l <= lim; l++) { const age = kf - l; const w = age <= 0 ? 1 - (l - kf) : Math.pow(DECAY, age); if (w <= 0.02) continue; for (const sp of spritesAt(r, l)) { sp.w = w; out.push(sp); } }
+    }
+    // the cap: no map position accumulates more light than the current layer's brightest sprite, so the top-1 always leads
+    let cap = 0; for (const sp of out) if (sp.layer === kc && !sp.prev) cap = Math.max(cap, spriteInt(sp));
+    if (cap > 0) {
+      const acc = new Map();
+      out.sort((a, b) => (b.layer === kc && !b.prev) - (a.layer === kc && !a.prev));
+      for (const sp of out) { const have = acc.get(sp.id) || 0, v = Math.min(spriteInt(sp) * sp.w, Math.max(0, cap - have)); sp.v = v; acc.set(sp.id, have + v); }
+    } else for (const sp of out) sp.v = spriteInt(sp) * sp.w;
+  }
+  FS.trail = out.length;
+  if (MAP.n) for (const t of S.toks) { const xy = tokXY(t.id); if (xy) out.push({ x: xy[0], y: xy[1], v: FC.dark ? 0.55 : 0.5, dot: true, k: t.k, text: t.raw }); }  // the constellation: every reply word so far
+  return out;
+}
+/* The pigment: every reply word deposits its output-row glow (the chosen word, and the runner-up at half the light) at
+   its own map spot; each deposit keeps PIG_DECAY of its light per later word. It is rebuilt from the reply itself
+   (S.toks) whenever a word arrives, so live, replay and screenshots agree and a word whose story was skipped still
+   deposits. The spread is the output layer's entropy, as for a sprite at the output. */
+function pigmentList(limit) {
+  const out = []; if (!MAP.n) return out;
+  const N = S.toks.length, S0 = Math.min(VIEW.w, VIEW.h), j0 = Math.max(0, N - Math.ceil(Math.log(0.02) / Math.log(PIG_DECAY)));  // older deposits are below 2%
+  for (let j = N - 1; j >= j0 && out.length < limit; j--) {
+    const t = S.toks[j], w = Math.pow(PIG_DECAY, N - 1 - j), d = S0 * (0.05 + 0.15 * Math.sqrt(spreadAt(t, S.nL)));
+    const xy = tokXY(t.id); if (xy) out.push({ x: xy[0], y: xy[1], size: d, v: 0.12 * w * (0.4 + 0.6 * Math.sqrt(t.prob || 0)), chosen: true });
+    const r = t.rival && t.rival[2] !== t.id ? tokXY(t.rival[2]) : null; if (r) out.push({ x: r[0], y: r[1], size: d, v: 0.06 * w * (0.4 + 0.6 * Math.sqrt(t.rival[1] || 0)), chosen: false });
+  }
+  return out;
+}
+function spriteColor(sp) {
+  if (sp.dot) return FC.field;
+  const c = sp.chosen ? FC.chosen : FC.cand;
+  if (sp.layer < 0.2 * S.nL) return [(c[0] + FC.field[0]) / 2, (c[1] + FC.field[1]) / 2, (c[2] + FC.field[2]) / 2];
+  return c;
+}
+
+/* ---- WebGL2: the field as points, the story as instanced gaussian quads, both additive into float targets, a quarter-size bloom ---- */
+function makeGL(cv) {
+  const gl = cv.getContext("webgl2", { alpha: false, antialias: false, premultipliedAlpha: false, preserveDrawingBuffer: false });
+  if (!gl) return null;
+  const hasF = !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
+  const fmt = hasF ? gl.RGBA16F : gl.RGBA8, type = hasF ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;  // without float targets the light clamps at 1 (gain 1)
+  function sh(t, src) { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+  function prog(vs, fs) {
+    const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name; u[nm] = gl.getUniformLocation(p, nm); }
+    return { p, u };
+  }
+  const V = "#version 300 es\nprecision highp float;\n", Fr = "#version 300 es\nprecision mediump float;\nout vec4 o;\n";
+  const field = prog(V + `in vec2 aPos; uniform vec2 uScale, uOffset; uniform float uTime, uSize, uDrift; out float vH;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    void main(){ float h = hash(aPos); vec2 p = aPos + uDrift * vec2(sin(uTime * 0.35 + h * 6.2832), cos(uTime * 0.27 + h * 12.566));
+      gl_Position = vec4(p * uScale + uOffset, 0.0, 1.0); gl_PointSize = uSize; vH = h; }`,
+    Fr + `uniform vec3 uColor; uniform float uAlpha; in float vH;
+    void main(){ vec2 d = gl_PointCoord - 0.5; float r2 = dot(d, d) * 4.0; float a = max(0.0, 1.0 - r2); o = vec4(uColor * uAlpha * a * (0.6 + 0.8 * vH), 1.0); }`);
+  const sprite = prog(V + `in vec2 aQuad; in vec2 aPos; in float aSize; in vec3 aCol; in float aInt; uniform vec2 uScale, uOffset, uPx; out vec2 vQ; out vec3 vCol; out float vInt;
+    void main(){ vec2 c = aPos * uScale + uOffset; gl_Position = vec4(c + aQuad * aSize * uPx, 0.0, 1.0); vQ = aQuad; vCol = aCol; vInt = aInt; }`,
+    Fr + `in vec2 vQ; in vec3 vCol; in float vInt;
+    void main(){ float r2 = dot(vQ, vQ); float g = exp(-r2 * 5.0) * max(0.0, 1.0 - r2); o = vec4(vCol * vInt * g, 1.0); }`);
+  const quadV = V + `in vec2 aQuad; out vec2 vUv; void main(){ vUv = aQuad * 0.5 + 0.5; gl_Position = vec4(aQuad, 0.0, 1.0); }`;
+  const blur = prog(quadV, Fr + `in vec2 vUv; uniform sampler2D uTex; uniform vec2 uDir;
+    void main(){ float w[5] = float[](0.227, 0.195, 0.122, 0.054, 0.016); vec3 c = texture(uTex, vUv).rgb * w[0];
+      for (int i = 1; i < 5; i++) { c += texture(uTex, vUv + uDir * float(i)).rgb * w[i]; c += texture(uTex, vUv - uDir * float(i)).rgb * w[i]; } o = vec4(c, 1.0); }`);
+  // the composite: the accumulated light as "glow on black" (dark) or "ink on paper" (light); the pigment is clamped by its
+  // brightest channel (the hue is kept) and the light theme's story light goes through a soft knee so a guess held for many
+  // layers at one place piles up into a deep wash, not a block (the field is not kneed: its dense regions are meant to be dark)
+  const comp = prog(quadV, Fr + `in vec2 vUv; uniform sampler2D uField, uTrail, uBloom, uPig; uniform vec3 uBg; uniform float uDark, uFieldK, uTrailK, uBloomK, uPigK, uPigCap;
+    void main(){ vec3 P = texture(uPig, vUv).rgb; float m = max(P.r, max(P.g, P.b)); P *= min(1.0, uPigCap / max(m, 1e-4));
+      vec3 S = texture(uTrail, vUv).rgb * uTrailK + texture(uBloom, vUv).rgb * uBloomK + P * uPigK;
+      if (uDark < 0.5) S = 1.6 * (1.0 - exp(-0.65 * S / 1.6));
+      vec3 L = texture(uField, vUv).rgb * uFieldK + S;
+      vec3 c = uDark > 0.5 ? 1.0 - (1.0 - uBg) * exp(-L) : uBg * exp(-L); o = vec4(c, 1.0); }`);
+  const quad = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quad); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const fieldVao = gl.createVertexArray();
+  if (MAP.n) { const posBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, MAP.xy, gl.STATIC_DRAW); gl.bindVertexArray(fieldVao); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0); }
+  const MAXI = 4096, instBuf = gl.createBuffer(), instData = new Float32Array(MAXI * 7);
+  const spriteVao = gl.createVertexArray(); gl.bindVertexArray(spriteVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf); gl.bufferData(gl.ARRAY_BUFFER, instData.byteLength, gl.DYNAMIC_DRAW);
+  [[1, 2, 0], [2, 1, 8], [3, 3, 12], [4, 1, 24]].forEach(([loc, n, off]) => { gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 28, off); gl.vertexAttribDivisor(loc, 1); });
+  const quadVao = gl.createVertexArray(); gl.bindVertexArray(quadVao); gl.bindBuffer(gl.ARRAY_BUFFER, quad); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  function fbo(w, h) {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, gl.RGBA, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE; gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!ok) throw new Error("incomplete framebuffer"); return { f, t, w, h };
+  }
+  const T = { W: 0, H: 0, fieldF: null, trailF: null, pigF: null, bloomA: null, bloomB: null, trailDirty: true, fieldDirty: true, pigDirty: true, bloomOn: false };
+  function resize() {
+    const W = Math.max(1, Math.round(VIEW.w * VIEW.dpr)), H = Math.max(1, Math.round(VIEW.h * VIEW.dpr)); if (W === T.W && H === T.H) return;
+    cv.width = W; cv.height = H; T.W = W; T.H = H;
+    for (const k of ["fieldF", "trailF", "pigF", "bloomA", "bloomB"]) if (T[k]) { gl.deleteFramebuffer(T[k].f); gl.deleteTexture(T[k].t); }
+    T.fieldF = fbo(W, H); T.trailF = fbo(W, H); T.pigF = fbo(W >> 1 || 1, H >> 1 || 1);  // the pigment is soft: half size is enough
+    T.bloomA = fbo(Math.max(1, W >> 2), Math.max(1, H >> 2)); T.bloomB = fbo(Math.max(1, W >> 2), Math.max(1, H >> 2));
+    T.trailDirty = T.fieldDirty = T.pigDirty = true;
+  }
+  const clip = () => (MAP.n ? [2 * VIEW.s / VIEW.w, 2 * VIEW.s / VIEW.h, 2 * VIEW.ox / VIEW.w - 1, 1 - 2 * VIEW.oy / VIEW.h] : [2 / VIEW.w, -2 / VIEW.h, -1, 1]);
+  function drawField(t, drift) {
+    const [sx, sy, ox, oy] = clip(); gl.bindFramebuffer(gl.FRAMEBUFFER, T.fieldF.f); gl.viewport(0, 0, T.W, T.H); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!MAP.n) return;
+    gl.useProgram(field.p); gl.bindVertexArray(fieldVao); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.uniform2f(field.u.uScale, sx, sy); gl.uniform2f(field.u.uOffset, ox, oy); gl.uniform1f(field.u.uTime, t);
+    const dense = MAP.n > 80000; gl.uniform1f(field.u.uSize, (dense ? 1.6 : 2.4) * VIEW.dpr); gl.uniform1f(field.u.uDrift, drift ? 0.0035 : 0);
+    gl.uniform3fv(field.u.uColor, FC.dark ? FC.field : [1 - FC.field[0], 1 - FC.field[1], 1 - FC.field[2]]); gl.uniform1f(field.u.uAlpha, dense ? 0.13 : 0.17);
+    gl.drawArrays(gl.POINTS, 0, MAP.n);
+  }
+  function drawTrail(now, bloom) {
+    const [sx, sy, ox, oy] = clip(); gl.bindFramebuffer(gl.FRAMEBUFFER, T.trailF.f); gl.viewport(0, 0, T.W, T.H); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    const tl = performance.now(), list = trailList(now), lim = F.low ? LOW_RECORDS : MAXI; let n = 0;
+    FS.listMs = performance.now() - tl;
+    for (const sp of list) {
+      if (n >= lim || !(sp.v > 0.001)) continue;
+      const c = spriteColor(sp), col = FC.dark ? c : [1 - c[0], 1 - c[1], 1 - c[2]], o = n * 7;
+      instData[o] = sp.x; instData[o + 1] = sp.y; instData[o + 2] = (sp.dot ? 6 : spriteSize(sp)) * VIEW.dpr;
+      instData[o + 3] = col[0]; instData[o + 4] = col[1]; instData[o + 5] = col[2]; instData[o + 6] = sp.v; n++;
+    }
+    FS.particles = n;
+    T.bloomOn = false;
+    if (!n) return;
+    gl.useProgram(sprite.p); gl.bindVertexArray(spriteVao); gl.bindBuffer(gl.ARRAY_BUFFER, instBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, instData, 0, n * 7);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.uniform2f(sprite.u.uScale, sx, sy); gl.uniform2f(sprite.u.uOffset, ox, oy); gl.uniform2f(sprite.u.uPx, 1 / T.W, 1 / T.H);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+    if (!bloom) return;
+    // bloom: the trail at a quarter size, blurred twice (separable, radii 1.5 and 2.5 texels)
+    gl.disable(gl.BLEND); gl.useProgram(blur.p); gl.bindVertexArray(quadVao); gl.activeTexture(gl.TEXTURE0); gl.uniform1i(blur.u.uTex, 0);
+    const pass = (dst, src, dx, dy) => { gl.bindFramebuffer(gl.FRAMEBUFFER, dst.f); gl.viewport(0, 0, dst.w, dst.h); gl.bindTexture(gl.TEXTURE_2D, src.t); gl.uniform2f(blur.u.uDir, dx, dy); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); };
+    pass(T.bloomA, T.trailF, 1.5 / T.bloomA.w, 0); pass(T.bloomB, T.bloomA, 0, 1.5 / T.bloomA.h);
+    pass(T.bloomA, T.bloomB, 2.5 / T.bloomA.w, 0); pass(T.bloomB, T.bloomA, 0, 2.5 / T.bloomA.h);
+    T.bloomOn = true;
+  }
+  function drawPigment() {  // one instanced pass into the pigment target, only when a deposit is pending (a word arrived, a resize, the theme)
+    const [sx, sy, ox, oy] = clip(); gl.bindFramebuffer(gl.FRAMEBUFFER, T.pigF.f); gl.viewport(0, 0, T.pigF.w, T.pigF.h); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    const list = pigmentList(F.low ? LOW_RECORDS : MAXI); let n = 0;
+    for (const sp of list) {
+      const c = sp.chosen ? FC.chosen : FC.cand, col = FC.dark ? c : [1 - c[0], 1 - c[1], 1 - c[2]], o = n * 7;
+      instData[o] = sp.x; instData[o + 1] = sp.y; instData[o + 2] = sp.size * VIEW.dpr; instData[o + 3] = col[0]; instData[o + 4] = col[1]; instData[o + 5] = col[2]; instData[o + 6] = sp.v; n++;
+    }
+    FS.pigment = n;
+    if (!n) return;
+    gl.useProgram(sprite.p); gl.bindVertexArray(spriteVao); gl.bindBuffer(gl.ARRAY_BUFFER, instBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, instData, 0, n * 7);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.uniform2f(sprite.u.uScale, sx, sy); gl.uniform2f(sprite.u.uOffset, ox, oy); gl.uniform2f(sprite.u.uPx, 1 / T.W, 1 / T.H);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+  }
+  function frame(now, animating, opt) {
+    resize();
+    if (animating || T.fieldDirty) { drawField(now / 1000, opt.drift); T.fieldDirty = false; }
+    if (T.pigDirty) { drawPigment(); T.pigDirty = false; }
+    if (T.trailDirty || T.bloomOn !== opt.bloom) { drawTrail(now, opt.bloom); T.trailDirty = false; }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, T.W, T.H); gl.disable(gl.BLEND);
+    gl.useProgram(comp.p); gl.bindVertexArray(quadVao);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, T.fieldF.t); gl.uniform1i(comp.u.uField, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, T.trailF.t); gl.uniform1i(comp.u.uTrail, 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, T.bloomB.t); gl.uniform1i(comp.u.uBloom, 2);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.pigF.t); gl.uniform1i(comp.u.uPig, 3);
+    gl.uniform3fv(comp.u.uBg, FC.bg); gl.uniform1f(comp.u.uDark, FC.dark ? 1 : 0);
+    gl.uniform1f(comp.u.uFieldK, F.cur ? 0.55 : 1.0); gl.uniform1f(comp.u.uTrailK, 1.0); gl.uniform1f(comp.u.uBloomK, T.bloomOn ? 1.6 : 0);
+    gl.uniform1f(comp.u.uPigK, 1.0); gl.uniform1f(comp.u.uPigCap, PIG_CAP);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  const invalidate = (what) => { if (what === "trail" || what === "all") T.trailDirty = true; if (what === "field" || what === "all") T.fieldDirty = true; if (what === "pigment" || what === "all") T.pigDirty = true; };
+  return { name: hasF ? "webgl2" : "webgl2-rgba8", frame, invalidate, animates: MAP.n > 0, minInterval: 30 };
+}
+
+/* ---- Canvas2D fallback: the field rasterized once, the sprites as pre-rendered radial gradients; a filter blur stands in for the bloom where it exists ---- */
+function make2D(cv) {
+  const ctx = cv.getContext("2d"); if (!ctx) return null;
+  const T = { W: 0, H: 0, field: null, trail: null, bloom: null, sprites: null, trailDirty: true, fieldDirty: true };
+  const canBlur = typeof ctx.filter === "string";  // not in WebKit
+  const D = () => Math.min(1.5, VIEW.dpr);  // soft blobs need no retina resolution; the raster cost is per pixel
+  function spriteImage(col) {
+    const c = document.createElement("canvas"); c.width = c.height = 96; const g = c.getContext("2d"), rg = g.createRadialGradient(48, 48, 0, 48, 48, 48);
+    const rgb = col.map((v) => Math.round(v * 255));
+    rg.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},1)`); rg.addColorStop(0.35, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.45)`); rg.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+    g.fillStyle = rg; g.fillRect(0, 0, 96, 96); return c;
+  }
+  function resize() {
+    const W = Math.max(1, Math.round(VIEW.w * D())), H = Math.max(1, Math.round(VIEW.h * D()));
+    if (W === T.W && H === T.H && T.field && !T.fieldDirty) return;
+    cv.width = W; cv.height = H; T.W = W; T.H = H;
+    const f = document.createElement("canvas"); f.width = W; f.height = H; const g = f.getContext("2d"); g.setTransform(D(), 0, 0, D(), 0, 0);
+    const c = FC.dark ? FC.field : [0.25, 0.25, 0.24];
+    g.fillStyle = `rgba(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)},${FC.dark ? 0.28 : 0.22})`;
+    for (let i = 0; i < MAP.n; i++) { const [x, y] = toPx(MAP.xy[2 * i], MAP.xy[2 * i + 1]); g.fillRect(x - 0.75, y - 0.75, 1.5, 1.5); }
+    T.field = f; const tcv = document.createElement("canvas"); tcv.width = W; tcv.height = H; T.trail = tcv; T.trailDirty = true; T.fieldDirty = false;
+    const pg = document.createElement("canvas"); pg.width = W; pg.height = H; T.pig = pg; T.pigDirty = true;
+    const bl = document.createElement("canvas"); bl.width = Math.max(1, W >> 2); bl.height = Math.max(1, H >> 2); T.bloom = bl;
+    const mix = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+    T.sprites = { cand: spriteImage(FC.cand), chosen: spriteImage(FC.chosen), candE: spriteImage(mix(FC.cand, FC.field)), chosenE: spriteImage(mix(FC.chosen, FC.field)), dot: spriteImage(FC.dark ? FC.field : [0.3, 0.3, 0.28]) };
+  }
+  function drawDots(list) {  // the constellation on its own layer: it changes once per token, the trail many times a second
+    const dots = list.filter((sp) => sp.dot);
+    if (T.dots && T.dotsN === dots.length) return dots.length;
+    if (!T.dots) { T.dots = document.createElement("canvas"); T.dots.width = T.W; T.dots.height = T.H; }
+    const g = T.dots.getContext("2d"); g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, T.W, T.H); g.setTransform(D(), 0, 0, D(), 0, 0);
+    g.globalCompositeOperation = FC.dark ? "lighter" : "multiply";
+    for (const sp of dots) { const [x, y] = toPx(sp.x, sp.y); g.globalAlpha = Math.min(1, sp.v); g.drawImage(T.sprites.dot, x - 3.5, y - 3.5, 7, 7); }
+    T.dotsN = dots.length; return dots.length;
+  }
+  function drawTrail(now, bloom) {
+    const g = T.trail.getContext("2d"); g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, T.W, T.H); g.setTransform(D(), 0, 0, D(), 0, 0);
+    g.globalCompositeOperation = FC.dark ? "lighter" : "multiply";
+    const list = trailList(now); let n = drawDots(list);
+    for (const sp of list) {
+      if (sp.dot || !(sp.v > 0.001)) continue;
+      const a = Math.min(1, sp.v / (1.2 / (0.35 + Math.sqrt(sp.hn))) * 0.85 / (0.5 + Math.sqrt(sp.hn)));
+      if (a < 0.03) continue;  // invisible, and the software raster pays per pixel
+      const [x, y] = toPx(sp.x, sp.y), d = spriteSize(sp) * 1.6;
+      g.globalAlpha = a; g.drawImage(T.sprites[(sp.chosen ? "chosen" : "cand") + (sp.layer < 0.2 * S.nL ? "E" : "")], x - d / 2, y - d / 2, d, d); n++;
+    }
+    FS.particles = n;
+    g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+    T.bloomOn = false;
+    if (canBlur && bloom && n) {  // the bloom: the trail at a quarter size, blurred once; drawn scaled up
+      const b = T.bloom.getContext("2d"); b.setTransform(1, 0, 0, 1, 0, 0); b.clearRect(0, 0, T.bloom.width, T.bloom.height);
+      b.filter = "blur(2px)"; b.drawImage(T.trail, 0, 0, T.bloom.width, T.bloom.height); b.filter = "none"; T.bloomOn = true;
+    }
+  }
+  function drawPigment() {  // the pigment on its own layer, redrawn only when a deposit is pending; source-over stacks converge to the hue, which is the clamp
+    const g = T.pig.getContext("2d"); g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, T.W, T.H); g.setTransform(D(), 0, 0, D(), 0, 0);
+    g.globalCompositeOperation = "source-over"; let n = 0;
+    for (const sp of pigmentList(F.low ? LOW_RECORDS : 4096)) {
+      const a = Math.min(1, sp.v * 2.2); if (a < 0.02) continue;
+      const [x, y] = toPx(sp.x, sp.y), d = sp.size * 1.6;
+      g.globalAlpha = a; g.drawImage(T.sprites[sp.chosen ? "chosen" : "cand"], x - d / 2, y - d / 2, d, d); n++;
+    }
+    FS.pigment = n; g.globalAlpha = 1;
+  }
+  function frame(now, animating, opt) {
+    resize(); if (T.pigDirty) { drawPigment(); T.pigDirty = false; }
+    if (T.trailDirty || T.bloomOn !== (opt.bloom && canBlur && FS.particles > 0)) { drawTrail(now, opt.bloom); T.trailDirty = false; }
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1;
+    ctx.fillStyle = FC.surface; ctx.fillRect(0, 0, T.W, T.H);
+    ctx.globalAlpha = F.cur ? 0.55 : 1; ctx.drawImage(T.field, 0, 0);
+    if (FS.pigment) { ctx.globalAlpha = 0.55; ctx.drawImage(T.pig, 0, 0); }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = FC.dark ? "lighter" : "multiply";
+    if (T.dots) ctx.drawImage(T.dots, 0, 0);
+    if (T.bloomOn) { ctx.globalAlpha = 0.7; ctx.drawImage(T.bloom, 0, 0, T.W, T.H); ctx.globalAlpha = 1; }
+    ctx.drawImage(T.trail, 0, 0); ctx.globalCompositeOperation = "source-over";
+  }
+  const invalidate = (what) => { if (what !== "field") T.trailDirty = true; if (what === "pigment" || what === "all") T.pigDirty = true; if (what !== "trail" && what !== "pigment") { T.fieldDirty = true; T.dots = null; } };
+  return { name: "canvas2d", frame, invalidate, animates: false, minInterval: 60 };
+}
+
+/* ---- the stage: layout, region labels, marks (ring and labels over the field), hover ---- */
+const fstage = $("fstage"), flowCv = $("flowCv");
+function layoutView() {
+  const w = fstage.clientWidth, h = fstage.clientHeight; if (!w || !h) return;
+  VIEW.w = w; VIEW.h = h; VIEW.dpr = Math.min(2, window.devicePixelRatio || 1);
+  const b = MAP.box;
+  if (b) {
+    const pad = 0.06, s = Math.min(w * (1 - 2 * pad) / (b.x1 - b.x0), h * (1 - 2 * pad) / (b.y1 - b.y0));
+    VIEW.s = s; VIEW.ox = w / 2 - s * (b.x0 + b.x1) / 2; VIEW.oy = h / 2 + s * (b.y0 + b.y1) / 2;
+  } else { VIEW.s = 1; VIEW.ox = 0; VIEW.oy = 0; }
+  placeLabels();
+}
+function placeLabels() {  // region labels: the largest clusters inside the frame (nine; five on a small stage, as on a phone); on the ladder, the axes
+  const box = $("flabels"); box.replaceChildren();
+  if (MAP.n) {
+    const small = VIEW.w < 420, labs = [];  // a phone's stage is at most about 400 px wide; a desktop's is 474 px at 1440x900
+    for (const c of MAP.clusters.slice().sort((a, b) => b.n - a.n).slice(0, small ? 5 : 9)) {
+      const [x, y] = toPx(c.x, c.y), yc = clamp(y, 34, VIEW.h - 40), d = el("div", "rl", c.name); d.style.left = `${x}px`; d.style.top = `${yc}px`;
+      d.title = `a region of ${fmtInt(c.n)} word pieces` + (c.landmark && PIECE_KINDS.has(c.name) ? `, mostly ${c.name}: it has no whole words to name it by`
+        : `; ${c.landmark ? "its commonest whole words" : "its three commonest pieces"}: ${c.name}`);
+      box.append(d); labs.push([d, x, yc]);
+    }
+    for (const [d, x, yc] of labs) {  // kept inside the stage by its measured width: one layout read per resize; the box is for settleLabels
+      const half = d.offsetWidth / 2 + 6, cx = clamp(x, half, VIEW.w - half); d.style.left = `${cx}px`; d.box = [cx - half, yc - 8, cx + half, yc + 8];
+    }
+    return;
+  }
+  const L = S.nL || 1;
+  ["1st guess", "2nd", "3rd"].forEach((s, j) => { const d = el("div", "rl", s); d.style.left = `${slotX(j)}px`; d.style.top = "30px"; box.append(d); });
+  for (const l of layerTicks(L)) { const d = el("div", "rl lt", l === 0 ? "0" : String(l)); d.style.left = "16px"; d.style.top = `${layerY(l)}px`; box.append(d); const h = el("div", "rung"); h.style.top = `${layerY(l)}px`; box.append(h); }
+}
+function placeMarks() {  // the chosen word's ring and label, the current top-1's label, the runner-up's hollow ring: selective labels, text in ink
+  const box = $("fmarks"), r = F.cur, ax = $("faxes"); box.replaceChildren();
+  if (!r) {
+    ax.replaceChildren(el("b", "", MAP.n ? "Word space." : "Layer ladder."), MAP.n ? " Each dot is one of the model's word pieces; pieces it treats alike sit in the same region. The map is a flattened sketch: trust regions, not exact neighbours."
+      : " This model has no word map: the model's guesses are laid out by rank across and by layer upwards.");
+    settleLabels([]);
+    return;
+  }
+  const name = r.kind === "reply" ? r.raw : r.name;
+  ax.replaceChildren(el("b", "", MAP.n ? "Word space." : "Layer ladder."), ` The glow is where the model's guess sits at layer ${F.k}; fainter glows are the layers before. The ring marks `, ftok(name), ".");
+  const labs = [];  // [label, x, y, flipped]: settled once all are in the DOM, with one layout read
+  const label = (cls, x, y, ...parts) => {  // a label beside a mark, flipped to the left near the right edge
+    const left = x > VIEW.w - 130, lab = el("div", "lab " + cls + (left ? " left" : "")); lab.append(...parts); lab.style.left = `${x}px`; lab.style.top = `${y}px`; box.append(lab); labs.push([lab, x, y, left, cls]); return lab;
+  };
+  const top = r.top[F.k];
+  let tr = MAP.n ? tokXY(r.tracked) : null;
+  if (!MAP.n && top) { const j = top.findIndex((t) => t[2] === r.tracked); if (j >= 0) tr = [slotX(j), layerY(F.k)]; }
+  if (tr) {
+    const [x, y] = toPx(tr[0], tr[1]), ring = el("div", "ring" + (F.pulse ? " pulse" : "")); ring.style.left = `${x}px`; ring.style.top = `${y}px`; box.append(ring);
+    label("o", x, y, visFrag(name));
+  }
+  F.pulse = false;
+  if (top && top[0] && top[0][2] !== r.tracked) {
+    const xy = MAP.n ? tokXY(top[0][2]) : [slotX(0), layerY(F.k)];
+    if (xy) { const [x, y] = toPx(xy[0], xy[1]); label("c", x, y, visFrag(top[0][0])).title = `top guess at layer ${F.k}`; }
+  }
+  if (r.rival && MAP.n && r.rival[2] !== r.tracked) {
+    const xy = tokXY(r.rival[2]);
+    if (xy) {
+      const [x, y] = toPx(xy[0], xy[1]), ring = el("div", "ring r"); ring.style.left = `${x}px`; ring.style.top = `${y}px`; ring.title = `runner-up at the output: ${vis(r.rival[0])} ${pct(r.rival[1])}`; box.append(ring);
+      if (r.rival[1] >= 0.03) label("r", x, y + 14, "runner-up ", visFrag(r.rival[0]));
+    }
+  }
+  settleLabels(labs);
+}
+const LAB = {}, LABW = new Map();  // per kind of mark label (o, c, r), measured once: its height, its font and the width of one character; label widths by kind and text
+function labWidth(cls, lab) {
+  if (!LAB[cls]) { const cs = getComputedStyle(lab); measureCtx.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`; LAB[cls] = { h: lab.offsetHeight, font: measureCtx.font, ch: measureCtx.measureText("0").width }; }
+  const m = LAB[cls], key = cls + "\n" + lab.textContent; let w = LABW.get(key);
+  if (w == null) { if (LABW.size > 2000) LABW.clear(); measureCtx.font = m.font; w = Math.min(measureCtx.measureText(lab.textContent).width + 14, 24 * m.ch); LABW.set(key, w); }
+  return [w, m.h];
+}
+function settleLabels(labs) {  // mark labels stay between the header line and the caption; a region label one would cover is hidden. No layout read per step: a label's
+  // size comes from the canvas text measure (max-width 24ch, padding and border 14 px), the header's and the caption's extents from a ResizeObserver
+  F.labs = labs; const boxes = [], y0 = F.hudBottom + 2, y1 = F.capTop - 2;
+  for (const [lab, x, y, left, cls] of labs) {
+    const [w, h] = labWidth(cls, lab), yc = clamp(y, y0 + h / 2, y1 - h / 2), x0 = left ? x - 10 - w : x + 10;
+    lab.style.top = `${yc}px`; boxes.push([x0, yc - h / 2, x0 + w, yc + h / 2]);
+  }
+  for (const d of $("flabels").children) {
+    if (!d.box) continue;
+    const hide = boxes.some((b) => b[0] < d.box[2] && b[2] > d.box[0] && b[1] < d.box[3] && b[3] > d.box[1]);
+    if (hide !== (d.style.visibility === "hidden")) d.style.visibility = hide ? "hidden" : "";
+  }
+}
+function hudText() {
+  const m = MAP.meta || {};
+  setText($("fhudMap"), MAP.n ? `${fmtInt(MAP.n)} word pieces on the map (${(MAP.off * 100).toFixed(1)}% off-frame)${m.knn15_preserved != null ? ` · ${Math.round(+m.knn15_preserved * 100)}% of each piece's nearest neighbours kept` : ""}` : "no word map for this model");
+  setText($("fhudRend"), REND ? REND.name : "");
+}
+function doHover(p) {
+  const r = F.cur; let best = null, bd = 24;
+  if (r) for (const sp of spritesAt(r, F.k)) { const [x, y] = toPx(sp.x, sp.y), d = Math.hypot(x - p.x, y - p.y); if (d < bd) { bd = d; best = sp; } }
+  if (best) {
+    showTip(p.cx, p.cy, (t) => { t.append(el("div", "h", "")); t.firstChild.append(visFrag(best.text)); tipRow(t, `at layer ${F.k}`, pct(best.p)); t.append(el("div", "s", best.chosen ? "the word it chose" : `candidate ${best.slot + 1}`)); });
+    return best;
+  }
+  if (MAP.n) {
+    let bk = -1; bd = 12;  // a dot of the constellation: a reply word
+    for (const t of S.toks) { const xy = tokXY(t.id); if (!xy) continue; const [x, y] = toPx(xy[0], xy[1]), d = Math.hypot(x - p.x, y - p.y); if (d < bd) { bd = d; bk = t.k; } }
+    if (bk >= 0) { const t = S.toks[bk]; showTip(p.cx, p.cy, (b) => { const h = el("div", "h", ""); h.append(visFrag(t.raw)); b.append(h, el("div", "s", `word ${t.i + 1} of reply ${t.turn.idx + 1}: click for its story`)); }); return { dotK: bk }; }
+    const b = MAP.box, G = MAP.G, mx = (p.x - VIEW.ox) / VIEW.s, my = (VIEW.oy - p.y) / VIEW.s;
+    const gx = Math.floor((mx - b.x0) / (b.x1 - b.x0) * G), gy = Math.floor((my - b.y0) / (b.y1 - b.y0) * G); let bi = -1; bd = 10;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const cx = gx + dx, cy = gy + dy; if (cx < 0 || cy < 0 || cx >= G || cy >= G) continue;
+      for (const i of MAP.grid[cy * G + cx] || []) { const [x, y] = toPx(MAP.xy[2 * i], MAP.xy[2 * i + 1]), d = Math.hypot(x - p.x, y - p.y); if (d < bd) { bd = d; bi = i; } }
+    }
+    if (bi >= 0) { showTip(p.cx, p.cy, (t) => { const h = el("div", "h", ""); h.append(VOCAB.has(bi) ? visFrag(VOCAB.get(bi)) : `word piece ${bi}`); t.append(h, el("div", "s", "a dot of the map")); }); return null; }
+  }
+  hideTip(); return null;
+}
+const stagePoint = (e) => { const b = fstage.getBoundingClientRect(); return { x: e.clientX - b.left, y: e.clientY - b.top, cx: e.clientX, cy: e.clientY }; };
+fstage.addEventListener("pointermove", (e) => { F.tipPending = stagePoint(e); flowRequestFrame(); });
+fstage.addEventListener("pointerleave", () => { F.tipPending = null; hideTip(); });
+fstage.addEventListener("click", (e) => { const hit = doHover(stagePoint(e)); if (hit && hit.dotK != null) selectToken(hit.dotK, { pin: true, revealText: true }); });
+
+/* ---- a word's story: the sweep, the layer, follow-live's queue, the guided walk ---- */
+function flowStartStory(rec, opt = {}) {  // opt: live (from the follow-live queue), user (a tap), jump (no sweep), layer, dur
+  const L = S.nL, now = performance.now();
+  if (F.live && F.cur && opt.live && F.cur !== rec) F.prev = { rec: F.cur, entered: F.entered, t1: now };
+  else if (!opt.live) F.prev = null;
+  F.cur = rec; F.live = !!opt.live; F.walk = null; hideCaption();
+  if (F.stripTurn !== rec.turn) stripBuild(rec.turn);
+  stripMark(rec);
+  $("fscrub").disabled = false; $("fscrub").max = L;
+  F.entered = new Float64Array(L + 1).fill(NaN);
+  if (opt.layer != null) flowSetLayer(opt.layer, { quiet: true });
+  else if (reduced() || opt.jump || !L) { F.live = false; F.prev = null; flowSetLayer(L, { quiet: true }); }  // no sweep: the afterimage is the layer-indexed one, as when scrubbing
+  else {
+    F.sweep = { from: 0, to: L, t0: now, dur: (opt.dur || (opt.live ? 900 : 1400)) / speedF() };
+    F.k = 0; F.kf = 0; F.entered[0] = now; $("fscrub").value = 0;
+    refreshLight();
+  }
+  scheduleHeavy();
+  if (REND) REND.invalidate("trail");
+  hideTip(); flowRequestFrame();
+}
+function flowSetLayer(k, opt = {}) {
+  k = clamp(Math.round(k), 0, S.nL);
+  F.k = F.kf = k; F.sweep = null; $("fscrub").value = k;
+  if (opt.user) { F.live = false; F.prev = null; F.walk = null; hideCaption(); }  // scrubbing: the afterimage is a function of the layer again
+  refreshLight(); scheduleHeavy(opt.user ? 120 : 300);
+  if (REND) REND.invalidate("trail");
+  if (!opt.fromDetails) syncDetailsLayer();
+  flowRequestFrame();
+}
+function syncDetailsLayer() {  // the details panels show the same layer; their "all layers" is the flow's rest at the output (and its layer 0)
+  const l = F.k === S.nL || F.k === 0 ? 0 : F.k;
+  if (S.layer !== l) setLayer(l);
+}
+function markEntered(k, now) { for (let l = 0; l <= k; l++) if (Number.isNaN(F.entered[l])) F.entered[l] = now; }
+function landed(sw, now) {
+  F.k = F.kf = sw.to; $("fscrub").value = F.k;
+  if (sw.to === S.nL && !reduced()) { F.landedAt = now; F.pulse = true; }  // the landing cue: a pulse into the chosen word's ring
+  refreshLight(); scheduleHeavy(100); syncDetailsLayer();
+  if (REND) REND.invalidate("trail");
+  if (sw.onEnd) sw.onEnd(now);
+}
+function refreshLight() {  // per layer step: everything that names the layer (label, sparkline, marks, wash, the three per-layer cards, the table's row); the narration waits for an idle moment
+  const r = F.cur, prof = S.profile;  // window.__superborg.profile = {} collects the parts' times as "flow.<part>" (ms)
+  const run = prof ? (n, fn) => { const t = performance.now(); fn(); prof["flow." + n] = (prof["flow." + n] || 0) + performance.now() - t; } : (n, fn) => fn();
+  let rd = null; run("decode", () => { rd = r ? readsAt(r, F.k) : null; });
+  setText($("flayerLabel"), r ? `${F.k} of ${S.nL}` : "–"); setText($("flayerWord"), r ? `· ${layerWord(F.k)}` : "");
+  run("spark", drawSpark); run("marks", placeMarks); run("wash", () => applyWash(rd));
+  run("reads", () => drawReads(rd)); run("cands", drawCands); run("state", drawState); run("table", tableMark);
+}
+function refreshHeavy() { narrate(); drawFinal(); drawTable(); if (stripCur) revealSpan(stripCur); }
+function scheduleHeavy(within = 300) {  // the narration and the cards are rebuilt in idle time, by `within` ms at the latest
+  if (F.heavy) { if (within >= F.heavyBy) return; cancelIdle(F.heavy); }
+  F.heavyBy = within; F.heavy = idleCall(() => { F.heavy = 0; refreshHeavy(); }, within);
+}
+/* Follow-live pacing, for words that arrive faster than their stories can play (25 words/s natively): with up to two
+   waiting a story sweeps in 900 ms; past two, the sweep takes max(4, 28 / (waiting - 1)) ms per layer; past six, the
+   queue is dropped and the newest word plays. A skipped word still deposits its pigment (pigmentList reads the reply
+   itself) and stays tappable in the strip. The next story starts in the frame after the previous one lands (flowFrame). */
+function flowPump() {
+  if (F.sweep || F.walk || !S.follow || !F.active || !F.queue.length) return;
+  const waiting = F.queue.length; let rec;
+  if (waiting > 6) { rec = F.queue[waiting - 1]; F.queue.length = 0; } else rec = F.queue.shift();
+  const perLayer = waiting > 2 ? Math.max(4, 28 / (waiting - 1)) : 900 / Math.max(1, S.nL);
+  if (rec.k != null && S.sel !== rec.k) { S.sel = rec.k; invalidate("sel"); }
+  flowStartStory(rec, { live: true, dur: perLayer * Math.max(1, S.nL) });
+}
+function flowClear() {
+  F.cur = null; F.sweep = null; F.walk = null; F.live = false; F.prev = null; F.queue.length = 0; hideCaption();
+  stripMark(null); $("fscrub").disabled = true;
+  refreshLight(); refreshHeavy(); if (REND) REND.invalidate("trail"); flowRequestFrame();
+}
+// the guided walk: a slow sweep (~110 ms per layer) that pauses with a caption at layer 0, the lead layer, the midpoint if the word has not led yet, and the output
+function walkStops(r) {
+  const L = S.nL, name = r.kind === "reply" ? r.raw : r.name, stops = [];
+  const cap = (layer, ...parts) => stops.push({ layer, parts });
+  const t0 = r.top[0] && r.top[0][0];
+  cap(0, "Layer 0 is only the word's embedding, before any layer has worked on it", ...(t0 ? [": the lens reads it back as ", ftok(t0[0]), "."] : ["."]));
+  const mid = Math.round(L / 2), tm = r.top[mid] && r.top[mid][0];
+  if (tm && (r.emerge < 0 || r.emerge > mid)) cap(mid, `Halfway, at layer ${mid}, the top guess is `, ftok(tm[0]), ` at ${pct(tm[1])}; `, ftok(name), ` has not taken the lead yet (ranked ${rankStr(r.R[mid])}).`);
+  if (r.emerge > 0 && r.emerge < L) cap(r.emerge, `Layer ${r.emerge}: `, ftok(name), ` takes the lead at ${pct(r.P[r.emerge])}` + (r.leads.length === 1 && r.leads[0][1] === L ? " and keeps it from here on." : "."));
+  const last = r.kind === "reply" ? [`The output, layer ${L}: `, ftok(name), ` is chosen at ${pct(r.prob)}`, ...(r.rival ? ["; the runner-up was ", ftok(r.rival[0]), ` at ${pct(r.rival[1])}.`] : ["."])]
+    : [`The output, layer ${L}: the model expected `, ftok(r.top[L] ? r.top[L][0][0] : ""), "; what actually came next was ", ftok(name), "."];
+  cap(L, ...last);
+  return stops.sort((a, b) => a.layer - b.layer);
+}
+function startWalk(rec) {
+  if (!rec || !S.nL) return;
+  if (S.follow && S.generating) setFollow(false);
+  if (F.cur !== rec) flowStartStory(rec, { layer: 0 }); else flowSetLayer(0, { quiet: true });
+  F.live = false; F.prev = null;
+  F.walk = { rec, stops: walkStops(rec), i: 0, phase: "hold", until: 0 };
+  walkArrive(performance.now());
+}
+function walkArrive(now) {
+  const w = F.walk; if (!w) return;
+  const st = w.stops[w.i], box = $("fcoach"); box.replaceChildren();
+  box.append(el("div", "step", `walk · ${w.i + 1} of ${w.stops.length} · layer ${st.layer}`), para(...st.parts));
+  const acts = el("div", "acts"), last = w.i === w.stops.length - 1;
+  const skip = el("button", "btn small", last ? "Done" : "Stop"); skip.type = "button"; skip.addEventListener("click", endWalk);
+  const next = el("button", "btn small primary", last ? "Replay" : "Next"); next.type = "button"; next.addEventListener("click", () => { if (last) startWalk(w.rec); else { w.until = 0; flowRequestFrame(); } });
+  acts.append(skip, next); box.append(acts); box.hidden = false; F.caption = "walk";
+  w.phase = "hold"; w.until = now + 2600;
+  flowRequestFrame();
+}
+function walkTick(now) {
+  const w = F.walk; if (!w || F.sweep) return;
+  if (now < w.until) return;
+  if (w.i >= w.stops.length - 1) { endWalk(); return; }
+  w.i++;
+  const from = F.k, to = w.stops[w.i].layer;
+  if (reduced() || to === from) { flowSetLayer(to, { quiet: true }); walkArrive(now); }
+  else { F.sweep = { from, to, t0: now, dur: Math.abs(to - from) * 110 / speedF(), linear: true, onEnd: walkArrive }; w.phase = "sweep"; }
+}
+function endWalk() { F.walk = null; hideCaption(); flowRequestFrame(); }
+function hideCaption() { if (F.caption === "walk") { $("fcoach").hidden = true; F.caption = null; } }  // the walk's captions; the first-run cards stay until dismissed
+
+/* ---- the frame loop: driven by requestAnimationFrame, from the queue of token reports, whatever the decode rate ---- */
+function flowRequestFrame() { if (!F.rafId && F.active) F.rafId = requestAnimationFrame(flowFrame); }
+function trailNow(now, force) {  // the sprites are rebuilt on a layer change, otherwise (the fade-in, the live decay) at most every 30-60 ms
+  if (!force && now - F.trailAt < REND.minInterval) return;
+  F.trailAt = now; REND.invalidate("trail");
+}
+function flowFrame(now) {
+  F.rafId = 0; if (!F.active || !REND) return;
+  const low = (F.onThread && S.generating) || F.decoding;  // the engine shares this thread: 30 fps, no drift, no bloom, at most LOW_RECORDS sprites per pass
+  if (low && now - F.lastFrame < 32) { flowRequestFrame(); return; }
+  F.lastFrame = now; F.low = low;
+  const t0 = performance.now();
+  const phase = (k, t) => { const p = FS.phase[k] || (FS.phase[k] = { n: 0, mean: 0, max: 0 }); const d = performance.now() - t; p.n++; p.mean += (d - p.mean) / p.n; p.max = Math.max(p.max, d); };
+  let animating = false, landedNow = false;
+  if (F.sweep) {
+    const sw = F.sweep, u = Math.min(1, (now - sw.t0) / Math.max(1, sw.dur)), e = sw.linear ? u : u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    const kf = sw.from + (sw.to - sw.from) * e, ki = Math.round(kf);
+    F.kf = kf;
+    if (F.live && ki !== F.k) markEntered(ki, now);
+    if (ki !== F.k && u < 1) { const t = performance.now(); F.k = ki; $("fscrub").value = ki; refreshLight(); phase("step", t); trailNow(now, true); }  // on the landing frame the step is the landing: one refresh, not two
+    else if (u < 1) trailNow(now, false);
+    animating = true;
+    if (u >= 1) { const t = performance.now(); F.sweep = null; landed(sw, now); phase("land", t); trailNow(now, true); landedNow = true; }
+  } else if (F.walk) { walkTick(now); animating = !!F.sweep; }
+  if (!landedNow) { const t = performance.now(); flowPump(); phase("pump", t); }  // the next story starts in the frame after a landing (the frame is requested below), so a landing and a start never share a frame
+  if (!F.sweep && F.live && (F.prev || now - F.landedAt < 2200)) { trailNow(now, false); animating = true; }  // the live afterimage keeps fading
+  if (F.tipPending) { doHover(F.tipPending); F.tipPending = null; }
+  const drift = REND.animates && !reduced() && !low && !document.hidden;
+  { const t = performance.now(); REND.frame(now, animating || drift, { drift, bloom: !low }); phase("draw", t); }
+  const dt = performance.now() - t0;
+  FS.frames++; FS.ms = dt; FS.mean += (dt - FS.mean) / FS.frames; FS.max = Math.max(FS.max, dt);
+  FS.samples.push(dt); if (FS.samples.length > 600) FS.samples.shift();
+  if (FS.frames % 30 === 0) {
+    const s = FS.samples.slice().sort((a, b) => a - b); FS.p95 = s[Math.floor(s.length * 0.95)] || 0;
+    if (F.perf) setText($("fhudRend"), `${REND.name}${low ? " · low power" : ""} · ${FS.ms.toFixed(1)} ms (mean ${FS.mean.toFixed(2)}, p95 ${FS.p95.toFixed(1)}) · ${FS.particles} + ${FS.pigment} sprites`);
+  }
+  FS.animating = animating || drift; FS.lowPower = low; FS.reduced = reduced();
+  if (animating || drift) flowRequestFrame();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) flowRequestFrame(); });
+
+/* ---- controls: the scrubber (keyboard-accessible: a native range input), speed, walk, strip keys ---- */
+$("fscrub").addEventListener("input", (e) => {
+  if (!F.cur) return;
+  if (S.follow && S.generating) setFollow(false);
+  flowSetLayer(+e.target.value, { user: true });
+});
+$("fwalkBtn").addEventListener("click", () => startWalk(F.cur || (S.toks.length ? S.toks[S.toks.length - 1] : null)));
+$("fstepBtn").addEventListener("click", () => {  // one layer up; from the output back to the word itself
+  if (!F.cur) return;
+  if (S.follow && S.generating) setFollow(false);
+  flowSetLayer(F.k >= S.nL ? 0 : F.k + 1, { user: true });
+});
+F.perf = PAGE_Q.has("perf");  // ?perf: the renderer badge shows the frame times live (for a check on a real phone; window.__superborg.flowStats has the numbers)
+$("fhelpBtn").addEventListener("click", () => showCoach(0));
+$("fstrip").addEventListener("keydown", (e) => {
+  if (!F.cur || !F.stripTurn) return;
+  const turn = F.stripTurn, order = [...F.spans.keys()].filter((p) => recordAt(turn, p)).sort((a, b) => a - b), i = order.indexOf(F.cur.cpos);
+  if (e.key === "ArrowRight" && i < order.length - 1) flowSelectPos(turn, order[i + 1], true);
+  else if (e.key === "ArrowLeft" && i > 0) flowSelectPos(turn, order[i - 1], true);
+  else if (e.key === "ArrowUp") flowSetLayer(F.k + 1, { user: true });
+  else if (e.key === "ArrowDown") flowSetLayer(F.k - 1, { user: true });
+  else if (e.key === "Home") flowSetLayer(0, { user: true });
+  else if (e.key === "End") flowSetLayer(S.nL, { user: true });
+  else if (e.key === "Escape") { if (S.follow) setFollow(false); flowClear(); }
+  else return;
+  e.preventDefault();
+});
+
+/* ---- first-run guidance: three cards over the field; dismissed state in localStorage (a per-viewer convenience) ---- */
+const COACH = [
+  ["1 of 3 · the field", "This is the model's word space. Each dot is one of its word pieces; pieces it treats alike sit in the same region. The map is a flattened sketch: trust regions, not exact neighbours."],
+  ["2 of 3 · a word's story", "Tap any word of the reply, or of your question. Blue glows are the words the model considered at that layer, the orange one is the word it finally chose; soft and large means undecided, bright means likely."],
+  ["3 of 3 · layers", "Drag the layer slider. Each layer is one step of the model's computation, from the raw word at 0 to the answer at the end. The orange tick marks where the chosen word first takes the lead; words of your question light up aqua when the model reads from them."]];
+function showCoach(i) {
+  const c = $("fcoach"); F.walk = null;
+  if (i >= COACH.length) { c.hidden = true; F.caption = null; try { localStorage.setItem("superborg.ui.coach", "done"); } catch (e) { /* storage unavailable */ } return; }
+  c.replaceChildren(el("div", "step", COACH[i][0]), para(COACH[i][1]));
+  const acts = el("div", "acts"), skip = el("button", "btn small", "Skip"); skip.type = "button"; skip.addEventListener("click", () => showCoach(COACH.length));
+  const last = i === COACH.length - 1, rec = F.cur || (S.toks.length ? S.toks[S.toks.length - 1] : null);
+  const next = el("button", "btn small primary", last ? (rec ? "Walk me through one token" : "Got it") : "Next"); next.type = "button";
+  next.addEventListener("click", () => { if (!last) { showCoach(i + 1); return; } showCoach(COACH.length); if (rec) startWalk(rec); });
+  acts.append(skip, next); c.append(acts); c.hidden = false; F.caption = "coach";  // stays until dismissed: a story starting does not hide it
+}
+
+/* ---- the view switch, the page's hooks, start ---- */
+function applyView() {
+  const flow = S.prefs.view !== "details";
+  F.active = flow; $("flow").hidden = !flow; $("details").hidden = flow;
+  for (const b of document.querySelectorAll("[data-view]")) b.setAttribute("aria-pressed", String((b.dataset.view === "details") !== flow));
+  if (flow) {
+    CSZ = new WeakMap(); layoutView(); if (REND) REND.invalidate("all");
+    const rec = S.sel >= 0 ? S.toks[S.sel] : null;
+    if (rec && rec !== F.cur) flowStartStory(rec, S.layer > 0 ? { layer: S.layer } : { jump: true });  // the layer chosen in Details stays
+    else { refreshLight(); refreshHeavy(); }
+    flowRequestFrame();
+  } else {
+    F.queue.length = 0;
+    if (S.follow && S.toks.length) S.sel = S.toks.length - 1;
+    invalidate("sel", "map", "contrib", "ent", "legend");
+  }
+}
+function flowOnSelection(d) {  // called by frame(): the page's selection and layer lead, the flow follows
+  if (!F.ready) return;
+  const rec = S.sel >= 0 ? S.toks[S.sel] : null;
+  if (d.sel && rec && rec !== F.cur) {  // hidden behind Details: no sweep (its frames would not run) and the layer chosen there
+    F.queue = F.queue.filter((q) => q !== rec);
+    flowStartStory(rec, F.active ? { live: S.follow, user: !S.follow, jump: reduced() } : S.layer > 0 ? { layer: S.layer } : { jump: true });
+  }
+  else if (d.sel && !rec && F.cur && F.cur.kind === "reply" && !S.toks.length) flowClear();
+  if (d.layer && F.cur && (!F.active || (!F.sweep && !F.walk))) {
+    const want = S.layer > 0 ? S.layer : F.k === 0 ? 0 : S.nL;
+    if (want !== F.k) flowSetLayer(want, { fromDetails: true });
+  }
+  if (d.theme) flowOnTheme();
+}
+function flowOnTheme() { flColors(); if (REND) REND.invalidate("all"); refreshLight(); scheduleHeavy(); flowRequestFrame(); }
+function flowReset() { flowClear(); F.stripTurn = null; stripBuild(null); F.align = null; F.alignN = 0; if (REND) { REND.invalidate("trail"); REND.invalidate("pigment"); } }
+function flowChatStarted() { F.onThread = typeof BORG.capabilities === "function" && ((BORG.capabilities() || {}).engine === "main-thread"); }
+new ResizeObserver(() => { CSZ = new WeakMap(); layoutView(); if (REND) REND.invalidate("all"); if (F.active) { refreshLight(); scheduleHeavy(); flowRequestFrame(); } }).observe(fstage);
+{  // the header line's and the caption's extents for settleLabels, read here where layout is clean (their text wraps differently per stage width and caption)
+  const hud = $("fhud"), ax = $("faxes"), ro = new ResizeObserver(() => { F.hudBottom = hud.offsetTop + hud.offsetHeight; F.capTop = ax.offsetTop; if (F.labs.length) settleLabels(F.labs); });
+  ro.observe(hud); ro.observe(ax);
+}
+async function flowInit() {  // after the engine's info: the map (if any), the renderer, the first-run guidance
+  F.nV = (S.info && S.info.vocab) || 0;
+  flColors();
+  let m = null;
+  try { m = await loadVocabMap(S.info); } catch (e) { m = null; }
+  if (m && m.bin) try { buildMap(m); } catch (e) { console.warn("vocab map unreadable:", e.message); }
+  layoutView();
+  if (PAGE_Q.get("renderer") !== "2d") { try { REND = makeGL(flowCv); } catch (e) { console.warn("webgl2 unavailable for the flow view:", e.message); REND = null; } }
+  if (!REND) REND = make2D(flowCv);
+  FS.renderer = REND.name; hudText();
+  F.ready = true;
+  stripBuild(F.stripTurn);
+  applyView();
+  let seen = false; try { seen = localStorage.getItem("superborg.ui.coach") === "done"; } catch (e) { /* storage unavailable */ }
+  if (!seen && F.active) showCoach(0);
+}
+
 /* ---------------------------------------------------------------- start */
 async function start() {
   if (window.matchMedia("(max-width: 900px)").matches) input.placeholder = "Message the model";
@@ -1908,8 +3351,10 @@ async function start() {
   syncSettingsUI();
   invalidate("sel", "map", "status", "legend");
   input.focus();
+  await flowInit();
+  if (BORG.replay) { input.value = await BORG.replay.question(); submit(); }  // ?replay=: play the recorded chat
 }
-start();
+start().catch((e) => { console.error(e); S.statusErr = "the page could not start: " + (e && e.message || e); renderStatus(); });
 })();
 </script>
 </body>

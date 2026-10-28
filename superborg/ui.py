@@ -11,12 +11,20 @@ Endpoints (standard library only):
   GET  /            the app
   GET  /api/info    model facts (TraceSession.info()), the defaults (lens_stride, lens_layers,
                     max_tokens_default) and whether a generation is running (busy)
+  GET  /api/basis   the residual-stream basis next to the model (<model stem>.basis.json, from
+                    tools/trace_basis.py), which the "xyz" trace field is projected onto; 404 without one
+  GET  /api/vocab_map.bin, /api/vocab_map.json
+                    the vocabulary map next to the model (<model stem>.vocab_map.bin and .json, from
+                    tools/vocab_map.py), the field of the page's flow view (docs/VIEWER.md); 404 without one
   POST /api/chat    {"messages": [...], "max_tokens", "temperature", "top_p", "top_k", "seed",
-                    "lens_stride", "enable_thinking", "request_id"} -> Server-Sent Events, one JSON
-                    event per `data:` line: "prefill" progress for a long prompt, "prompt", then one
-                    "token" per generated token, then "done" (or an in-band "error"); see
-                    superborg.interp for the fields. max_tokens above n_ctx and lens_stride above
-                    n_layers are clamped.
+                    "lens_stride", "enable_thinking", "chat_template_kwargs" (further variables for
+                    the chat template, as superborg/server.py takes them), "trace_prompt",
+                    "request_id"} -> Server-Sent Events, one JSON event per `data:` line: "prefill"
+                    progress for a long prompt, "prompt_token" traces of the prompt positions with
+                    trace_prompt (the last 256 uncached ones, each evaluated alone: about as slow as
+                    a generated token), "prompt", then one "token" per generated token, then "done"
+                    (or an in-band "error"); see docs/TRACE.md for the fields. max_tokens above
+                    n_ctx and lens_stride above n_layers are clamped.
   POST /api/stop    cancel the running generation (it ends with a "done" event whose stop_reason
                     is "cancelled"). With {"request_id": id} only the chat sent with that id is
                     cancelled, and if it has not started yet it is cancelled as soon as it arrives
@@ -32,6 +40,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
 import select
 import socket
@@ -43,7 +52,7 @@ from collections import deque
 from http.server import ThreadingHTTPServer
 from importlib import resources
 
-from .server import APIError, Handler as _BaseHandler, _flag, _number, parse_messages
+from .server import APIError, Handler as _BaseHandler, _flag, _number, _template_kwargs, parse_messages
 
 __all__ = ["UIService", "make_ui_server", "serve_ui"]
 
@@ -82,13 +91,29 @@ def _request_id(body: dict) -> str | None:
 class UIService:
     """The model, its trace session and the one-generation-at-a-time policy (HTTP-independent)."""
 
-    def __init__(self, llm, lens_stride: int = 1, max_tokens_default: int = 512):
+    def __init__(self, llm, lens_stride: int = 1, max_tokens_default: int = 512, basis_path: str | None = None):
         from .interp import TraceOptions, TraceSession
 
         self.llm = llm
         # a stride past the last layer traces the same layers as one equal to it
         self.default_stride = max(1, min(int(lens_stride), llm.model.config["n_layers"]))
-        self.session = TraceSession(llm, TraceOptions(lens_stride=self.default_stride))
+        # the residual-stream basis (tools/trace_basis.py): <model stem>.basis.json next to the model
+        self.basis_path = basis_path if basis_path is not None else os.path.splitext(llm.model.path)[0] + ".basis.json"
+        self.basis = None
+        if os.path.isfile(self.basis_path):
+            with open(self.basis_path, "rb") as f:
+                self.basis = f.read()
+        self.session = TraceSession(llm, TraceOptions(lens_stride=self.default_stride),
+                                    basis=json.loads(self.basis) if self.basis else None)
+        # the vocabulary map (tools/vocab_map.py): <model stem>.vocab_map.bin and .json next to the model, both or neither
+        self.vocab_map_stem = os.path.splitext(llm.model.path)[0] + ".vocab_map"
+        self.vocab_map = {}
+        for ext in ("bin", "json"):
+            if os.path.isfile(f"{self.vocab_map_stem}.{ext}"):
+                with open(f"{self.vocab_map_stem}.{ext}", "rb") as f:
+                    self.vocab_map[ext] = f.read()
+        if len(self.vocab_map) != 2:
+            self.vocab_map = {}
         self.max_tokens_default = min(max_tokens_default, llm.n_ctx)
         self.lock = threading.Lock()        # held for the whole generation
         self.cancel = threading.Event()     # set by /api/stop, cleared when a generation starts
@@ -104,7 +129,7 @@ class UIService:
         if layers[-1] != n_layers:
             layers.append(n_layers)
         return dict(self.session.info(), lens_layers=layers, lens_stride=self.default_stride,
-                    busy=self.lock.locked(), max_tokens_default=self.max_tokens_default)
+                    busy=self.lock.locked(), max_tokens_default=self.max_tokens_default, vocab_map=bool(self.vocab_map))
 
     def parse_chat(self, body: dict) -> dict:
         """Validated stream_chat arguments for a /api/chat body (raises APIError 400), plus its
@@ -112,6 +137,7 @@ class UIService:
         is limited by the room left in the context anyway, and the last layer is always traced."""
         n_layers = self.session.cfg["n_layers"]
         seed = _number(body, "seed", 0, int, 0, (1 << 64) - 1)
+        thinking, template_kwargs = _template_kwargs(body)  # the enable_thinking field wins, as in the server
         return {
             "messages": parse_messages(body),
             "max_tokens": min(_number(body, "max_tokens", self.max_tokens_default, int, 1), self.llm.n_ctx),
@@ -119,7 +145,9 @@ class UIService:
             "top_p": _number(body, "top_p", 1.0, float, 0.0, 1.0),
             "top_k": _number(body, "top_k", 0, int, 0, 1 << 30),
             "seed": seed,
-            "enable_thinking": _flag(body, "enable_thinking"),
+            "enable_thinking": thinking,
+            "chat_template_kwargs": template_kwargs or None,
+            "trace_prompt": _flag(body, "trace_prompt"),
             "lens_stride": min(_number(body, "lens_stride", self.default_stride, int, 1), n_layers),
             "request_id": _request_id(body),
         }
@@ -272,6 +300,26 @@ class UIHandler(_BaseHandler):
                 return
             if path == "/api/info":
                 return self._send_json(200, self.ui.info())
+            if path == "/api/basis":
+                if self.ui.basis is None:
+                    raise APIError(404, f"no residual basis for this model ({self.ui.basis_path}; tools/trace_basis.py)")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(self.ui.basis)))
+                self.end_headers()
+                self.wfile.write(self.ui.basis)
+                return
+            if path in ("/api/vocab_map.bin", "/api/vocab_map.json"):
+                if not self.ui.vocab_map:
+                    raise APIError(404, f"no vocabulary map for this model ({self.ui.vocab_map_stem}.bin/.json; tools/vocab_map.py)")
+                ext = path.rsplit(".", 1)[1]
+                data = self.ui.vocab_map[ext]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json" if ext == "json" else "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path == "/favicon.ico":
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
@@ -319,7 +367,11 @@ class UIHandler(_BaseHandler):
         ui.session.opt.lens_stride = kw.pop("lens_stride")
         self.close_connection = True  # the stream has no length; closing the connection ends it
         try:  # rendering is cheap; doing it here first turns a template refusal into a plain 400
-            ui.llm.render(kw["messages"], enable_thinking=kw["enable_thinking"])
+            if kw["chat_template_kwargs"]:
+                ui.llm.formatter.render(kw["messages"], enable_thinking=kw["enable_thinking"],
+                                        **kw["chat_template_kwargs"])
+            else:
+                ui.llm.render(kw["messages"], enable_thinking=kw["enable_thinking"])
         except Exception as e:  # noqa: BLE001 - templates reject some message orders (raise_exception)
             return self._send_error(APIError(400, f"the model's chat template rejected the messages: {e}",
                                              param="messages"))

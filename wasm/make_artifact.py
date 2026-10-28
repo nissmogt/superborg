@@ -10,7 +10,14 @@ Writes to out_dir:
                   in one file, plus the JavaScript build (build/borg-asm.js from wasm/build-js.sh)
                   when it exists
   borg.wasm       the engine (built with wasm/build.sh if missing)
-  model.json      manifest: engine file, model parts and sizes, context length
+  model.json      manifest: engine file, model parts and sizes, context length, the basis file
+  basis.json      the residual-stream basis (<model stem>.basis.json next to the model, from
+                  tools/trace_basis.py, or --basis), when there is one: the worker projects the
+                  "xyz" trace field onto it
+  vocab_map.bin, vocab_map.json
+                  the vocabulary map (<model stem>.vocab_map.bin and .json next to the model, from
+                  tools/vocab_map.py), when there is one: the field of the page's flow view
+                  (docs/VIEWER.md); listed in model.json as "vocab_map"
   model/part-NN.wasm the .borg file split into parts of at most --part-size bytes, each stored as
                   the custom section "borg-part" of an otherwise empty WebAssembly module, so
                   hosts that serve only web file types (.wasm, not .bin) serve the parts
@@ -107,6 +114,8 @@ def main(argv=None) -> int:
     ap.add_argument("--n-ctx", type=int, default=2048)
     ap.add_argument("--lens-stride", type=int, default=3)
     ap.add_argument("--name", help="model name shown in the UI (default: the header's source)")
+    ap.add_argument("--basis", type=Path, help="residual-stream basis to ship as basis.json (default: "
+                                               "<model stem>.basis.json next to the model, if it exists)")
     ap.add_argument("--fragment", action="store_true", help="omit the document skeleton from index.html")
     ap.add_argument("--inline-worker", action="store_true",
                     help="embed worker.js in index.html (implied by --fragment): hosts that do not serve "
@@ -142,6 +151,24 @@ def main(argv=None) -> int:
         "model": {"name": a.name or header.get("source") or a.model.stem, "id": digest.hexdigest()[:16],
                   "size": size, "quant": header.get("quant"), "wrap": "wasm-custom-section", "parts": parts},
     }
+    basis = a.basis if a.basis is not None else a.model.with_name(a.model.stem + ".basis.json")
+    if basis.is_file():
+        json.loads(basis.read_text())  # refuse to ship a file the worker could not parse
+        shutil.copyfile(basis, out / "basis.json")
+        manifest["basis"] = "basis.json"
+    elif a.basis is not None:
+        raise SystemExit(f"{basis}: not a file")
+    else:
+        (out / "basis.json").unlink(missing_ok=True)  # from an earlier build of this directory
+    vocab_map = {ext: a.model.with_name(f"{a.model.stem}.vocab_map.{ext}") for ext in ("bin", "json")}
+    if all(p.is_file() for p in vocab_map.values()):
+        json.loads(vocab_map["json"].read_text())  # refuse to ship a file the page could not parse
+        for ext, p in vocab_map.items():
+            shutil.copyfile(p, out / f"vocab_map.{ext}")
+        manifest["vocab_map"] = {"bin": "vocab_map.bin", "json": "vocab_map.json"}
+    else:
+        for ext in ("bin", "json"):
+            (out / f"vocab_map.{ext}").unlink(missing_ok=True)
     (out / "model.json").write_text(json.dumps(manifest, indent=1) + "\n")
     shutil.copyfile(a.wasm, out / "borg.wasm")
     asm = None if a.no_asm or not a.asm.exists() else a.asm
