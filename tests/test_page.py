@@ -69,7 +69,7 @@ TRANSPORT = r"""
       const f16 = (v) => { const s = v < 0 ? 0x8000 : 0; v = Math.abs(v); if (v < 1e-6) return s; const e = Math.floor(Math.log2(v)); return s | ((e + 15) << 10) | Math.min(1023, Math.round((v / 2 ** e - 1) * 1024)); };
       for (let i = 0; i < n; i++) { const a = i * 0.7, r = 0.1 + 0.85 * i / n; u[2 * i] = f16(r * Math.cos(a)); u[2 * i + 1] = f16(r * Math.sin(a)); }
       const cluster = { label: "b c zz", x: 0.2, y: 0.1, n, tokens: [["b", 2], ["c", 3], ["zz", 99]] };
-      if (window.__LANDMARK) cluster.landmark = "paris · city · france";  // a readable region name (tools/vocab_map.py --label-text)
+      if (window.__LANDMARK) cluster.landmark = "paris · city · france";  // a readable region name (the landmark rule of tools/vocab_map.py)
       const clusters = [cluster];  // __CLUSTERS = k: k - 1 smaller regions spread over the map (the label-count case)
       for (let i = 1; i < (window.__CLUSTERS || 1); i++) clusters.push({ label: "r" + i, x: 0.8 * Math.cos(i * 2.4), y: 0.8 * Math.sin(i * 2.4), n: n - i, tokens: [["r" + i, i]] });
       return { meta: { n, stability_knn15: 0.5, clusters }, bin: u.buffer };

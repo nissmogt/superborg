@@ -2202,9 +2202,12 @@ function buildMap(m) {
   for (const c of MAP.clusters) for (const [t, id] of c.tokens || []) VOCAB.set(id, t);
   FS.points = n; FS.mapLoaded = true;
 }
-/* A region's name: the map json's readable landmark when it carries one (`landmark`: the region's commonest whole words in a
-   reference text, the rule of tools/vocab_map.py --label-text), else its three commonest pieces joined with middle dots so the
-   reader sees that the regions are made of word pieces ("stud · bec · includ", not "stud bec includ"). */
+/* A region's name: the map json's readable landmark when it carries one (`landmark`, the landmark rule of tools/vocab_map.py: up
+   to three of the region's whole words, the lowest ids, a frequency proxy, among those in its inner half around its density peak,
+   or, for a region without whole words, the kind of piece it is mostly made of: fragments, punctuation, numbers or code), else its
+   three commonest pieces joined with middle dots so the reader sees that the regions are made of word pieces ("stud · bec · includ",
+   not "stud bec includ"). */
+const PIECE_KINDS = new Set(["fragments", "punctuation", "numbers", "code"]);  // the landmarks that name a kind, not words
 function regionName(c) {
   if (c.landmark) return String(c.landmark).trim();
   const pieces = (c.tokens || []).map((t) => String(t[0]).trim()).filter(Boolean);
@@ -2961,7 +2964,9 @@ function placeLabels() {  // region labels: the largest clusters inside the fram
     const small = VIEW.w < 420, labs = [];  // a phone's stage is at most about 400 px wide; a desktop's is 474 px at 1440x900
     for (const c of MAP.clusters.slice().sort((a, b) => b.n - a.n).slice(0, small ? 5 : 9)) {
       const [x, y] = toPx(c.x, c.y), yc = clamp(y, 34, VIEW.h - 40), d = el("div", "rl", c.name); d.style.left = `${x}px`; d.style.top = `${yc}px`;
-      d.title = `a region of ${fmtInt(c.n)} word pieces; ${c.landmark ? "its commonest whole words" : "its three commonest pieces"}: ${c.name}`; box.append(d); labs.push([d, x, yc]);
+      d.title = `a region of ${fmtInt(c.n)} word pieces` + (c.landmark && PIECE_KINDS.has(c.name) ? `, mostly ${c.name}: it has no whole words to name it by`
+        : `; ${c.landmark ? "its commonest whole words" : "its three commonest pieces"}: ${c.name}`);
+      box.append(d); labs.push([d, x, yc]);
     }
     for (const [d, x, yc] of labs) {  // kept inside the stage by its measured width: one layout read per resize; the box is for settleLabels
       const half = d.offsetWidth / 2 + 6, cx = clamp(x, half, VIEW.w - half); d.style.left = `${cx}px`; d.box = [cx - half, yc - 8, cx + half, yc + 8];
@@ -3029,7 +3034,7 @@ function settleLabels(labs) {  // mark labels stay between the header line and t
 }
 function hudText() {
   const m = MAP.meta || {};
-  setText($("fhudMap"), MAP.n ? `${fmtInt(MAP.n)} word pieces on the map (${(MAP.off * 100).toFixed(1)}% off-frame)${m.stability_knn15 != null ? ` · map stability ${(+m.stability_knn15).toFixed(2)}` : ""}` : "no word map for this model");
+  setText($("fhudMap"), MAP.n ? `${fmtInt(MAP.n)} word pieces on the map (${(MAP.off * 100).toFixed(1)}% off-frame)${m.knn15_preserved != null ? ` · ${Math.round(+m.knn15_preserved * 100)}% of each piece's nearest neighbours kept` : ""}` : "no word map for this model");
   setText($("fhudRend"), REND ? REND.name : "");
 }
 function doHover(p) {
