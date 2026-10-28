@@ -832,7 +832,7 @@ without would yes yet you your yours yourself yourselves
 EXCLUDED_WORDS = frozenset("""
 anal ass bitch boobs cock cum dick erotic erotica escort fuck fucking horny incontri masturbation milf naked
 nude penis porn porno pornos pussy rape rencontre sex sexe sesso sexo sexual sexuelle sexy shit slut tits
-vagina whore xxx assault
+vagina whore xxx assault viagra cialis prostitutas prostitute prostitution casino poker
 """.split())
 WORD_SHARE_MIN = 0.1      # a piece standing alone for less than a tenth of its weight is a fragment of longer pieces
 WORD_FRACTION_MIN = 0.05  # a region is named by its words only when at least one member in twenty is a word
