@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task recorder</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#6a737d; --line:#e1e4e8; --accent:#0b6bcb;
+          --rec:#d1242f; --soft:#eef3fb; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#171a21; --ink:#e6e8eb; --muted:#9aa4b2; --line:#2a2f3a; --accent:#5aa2f0;
+            --rec:#ff6b6b; --soft:#1d2533; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  .status { display:flex; align-items:center; gap:8px; font-weight:600; }
+  .dot { width:12px; height:12px; border-radius:50%; background:var(--muted); }
+  .dot.on { background:var(--rec); box-shadow:0 0 0 4px rgba(209,36,47,.18); animation:pulse 1.4s infinite; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 7px rgba(209,36,47,.06);} }
+  .root { margin-left:auto; color:var(--muted); font-size:13px; font-family:var(--mono); }
+  main { display:grid; grid-template-columns: minmax(0,1fr) 360px; gap:20px; padding:20px; max-width:1300px; margin:0 auto; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  .card h2 { font-size:16px; margin:0 0 10px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input[type=text], textarea, select { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:7px; background:var(--bg); color:var(--ink); font:inherit; }
+  textarea { min-height:64px; resize:vertical; }
+  button { font:inherit; padding:9px 14px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.danger { color:var(--rec); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  .notice { background:var(--soft); border-radius:8px; padding:10px 12px; font-size:14px; color:var(--ink); }
+  .notice ul { margin:6px 0 0 18px; padding:0; }
+  .timeline { list-style:none; margin:12px 0 0; padding:0; max-height:52vh; overflow:auto; border-top:1px solid var(--line); }
+  .timeline li { display:grid; grid-template-columns:62px 84px minmax(0,1fr) 34px; gap:8px; align-items:start; padding:8px 4px; border-bottom:1px solid var(--line); }
+  .timeline li.focus { color:var(--muted); font-size:13px; padding:4px; }
+  .timeline li.redacted .text { color:var(--muted); font-style:italic; }
+  .t { font-family:var(--mono); font-size:12px; color:var(--muted); padding-top:3px; }
+  .kind { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; padding-top:3px; }
+  .kind.step { color:var(--accent); } .kind.decision { color:#b35c00; } .kind.note { color:var(--muted); }
+  .kind.capture, .kind.file { color:#2a7f3f; }
+  .text { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .text img { display:block; max-width:260px; max-height:160px; border:1px solid var(--line); border-radius:6px; margin-top:6px; }
+  .x { border:none; background:none; color:var(--muted); font-size:16px; padding:0 6px; }
+  .x:hover { color:var(--rec); }
+  .entry { display:flex; gap:8px; align-items:flex-end; }
+  .entry textarea { min-height:44px; flex:1; }
+  .list { list-style:none; margin:0; padding:0; }
+  .list li { padding:8px 4px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .list li:hover { background:var(--soft); }
+  .list .meta { color:var(--muted); font-size:12px; }
+  pre.md { white-space:pre-wrap; overflow-wrap:anywhere; font-family:var(--mono); font-size:12.5px; background:var(--bg); padding:12px; border-radius:8px; max-height:60vh; overflow:auto; }
+  .err { color:var(--rec); font-size:14px; margin-top:8px; min-height:1.2em; }
+  .hint { color:var(--muted); font-size:13px; }
+  .hidden { display:none !important; }
+  .scale { display:flex; gap:6px; }
+  .scale button { width:40px; }
+  .scale button.sel { background:var(--accent); color:#fff; border-color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Task recorder</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">Not recording</span></div>
+  <div class="root" id="root" title="Everything is written here, on this computer"></div>
+</header>
+<main>
+  <section>
+    <div class="card" id="startCard">
+      <h2>Start a task</h2>
+      <div class="notice">
+        Nothing is recorded until you press <b>Start</b>, and a red light shows while it records. It writes:
+        <ul>
+          <li>the steps, notes and decisions you type here</li>
+          <li id="focusLine">which program and window is in front, and when that changes (window titles only)</li>
+          <li>a screenshot only when you click <b>Capture screen</b></li>
+        </ul>
+        No keystrokes and no continuous screen recording. Everything stays in the folder shown top right, which belongs to this practice.
+        Any entry can be redacted with its × button.
+      </div>
+      <label for="name">What task are you about to do?</label>
+      <input type="text" id="name" placeholder="e.g. Review last week's Google Ads search terms">
+      <label for="goal">What does done look like?</label>
+      <input type="text" id="goal" placeholder="e.g. Wasted terms added as negatives, winners noted for budget">
+      <div class="row" style="margin-top:0">
+        <div style="flex:1"><label for="owner">Your name</label><input type="text" id="owner"></div>
+        <div style="flex:1"><label for="tags">Tags (comma separated)</label><input type="text" id="tags" placeholder="google-ads, weekly"></div>
+      </div>
+      <div class="row" id="focusRow"><label style="margin:0;display:flex;align-items:center;gap:8px;color:var(--ink)"><input type="checkbox" id="trackFocus" checked> Record which window is in front</label></div>
+      <div class="row"><button class="primary" id="startBtn">Start recording</button></div>
+      <div class="err" id="startErr"></div>
+    </div>
+
+    <div class="card hidden" id="recCard">
+      <h2 id="recName"></h2>
+      <div class="hint" id="recGoal"></div>
+      <div class="entry" style="margin-top:12px">
+        <textarea id="entry" placeholder="What did you just do? Press Enter to add it as a step."></textarea>
+        <button class="primary" id="addStep" title="Enter">Step</button>
+        <button id="addNote">Note</button>
+        <button id="addDecision" title="A choice you made, and why">Decision</button>
+      </div>
+      <div class="row">
+        <button id="captureBtn">Capture screen</button>
+        <button id="attachBtn">Attach file</button>
+        <input type="file" id="fileInput" class="hidden" multiple>
+        <button id="pauseBtn">Pause</button>
+        <span class="hint" id="count"></span>
+      </div>
+      <div class="err" id="recErr"></div>
+      <ul class="timeline" id="timeline"></ul>
+    </div>
+
+    <div class="card hidden" id="endCard">
+      <h2>Finish</h2>
+      <label for="outcome">What was the result?</label>
+      <textarea id="outcome" placeholder="e.g. 14 search terms added as negatives; 3 keywords flagged for more budget"></textarea>
+      <label>How tedious was this, 1 (fine) to 5 (please make it stop)?</label>
+      <div class="scale" id="pain"><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button><button data-v="5">5</button></div>
+      <label for="wish">If a tool did part of this for you, which part?</label>
+      <textarea id="wish"></textarea>
+      <div class="row">
+        <button class="primary" id="endBtn">End task and write the procedure</button>
+        <button class="danger" id="discardBtn">Discard this recording</button>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>Recordings</h2>
+      <ul class="list" id="tasks"></ul>
+      <div class="row"><a href="/api/encyclopedia" target="_blank" class="hint">Open every procedure as one document</a></div>
+    </div>
+    <div class="card hidden" id="procCard">
+      <h2 id="procTitle"></h2>
+      <pre class="md" id="proc"></pre>
+      <div class="row"><a id="procLink" class="hint" target="_blank">Open as a file</a></div>
+    </div>
+  </aside>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let state = null, paused = false, painValue = null, lastEventCount = -1;
+
+  async function api(path, body) {
+    const r = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const ct = r.headers.get('Content-Type') || '';
+    const data = ct.includes('json') ? await r.json() : await r.text();
+    if (!r.ok) throw new Error(data && data.error ? data.error : ('request failed: ' + r.status));
+    return data;
+  }
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function offset(t0, t) {
+    const s = Math.max(0, Math.round((new Date(t) - new Date(t0)) / 1000));
+    const m = Math.floor(s / 60), h = Math.floor(m / 60);
+    return h ? `${h}h${String(m % 60).padStart(2, '0')}` : `${m}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  function render() {
+    const a = state.active;
+    const pr = a ? (a.events || []).filter(e => e.kind === 'pause' || e.kind === 'resume') : [];
+    paused = pr.length ? pr[pr.length - 1].kind === 'pause' : false;
+    $('root').textContent = state.root;
+    $('dot').classList.toggle('on', !!a && !paused);
+    $('statusText').textContent = a ? (paused ? 'Paused: ' + a.name : 'Recording: ' + a.name) : 'Not recording';
+    document.title = (a && !paused ? '● ' : '') + 'Task recorder';
+    $('startCard').classList.toggle('hidden', !!a);
+    $('recCard').classList.toggle('hidden', !a);
+    $('endCard').classList.toggle('hidden', !a);
+    $('focusRow').classList.toggle('hidden', !state.focus);
+    $('focusLine').classList.toggle('hidden', !state.focus);
+    if (a) {
+      $('recName').textContent = a.name;
+      $('recGoal').textContent = a.goal ? 'Done looks like: ' + a.goal : '';
+      const ev = a.events || [];
+      $('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+      const n = ev.filter(e => ['step', 'note', 'decision'].includes(e.kind)).length;
+      $('count').textContent = n ? `${n} entr${n === 1 ? 'y' : 'ies'}` : '';
+      if (ev.length !== lastEventCount) {
+        const tl = $('timeline');
+        tl.innerHTML = ev.map(e => {
+          const t = `<span class="t">${offset(a.started, e.t)}</span>`;
+          const x = e.redacted ? '<span></span>' : `<button class="x" data-id="${e.id}" title="Redact this entry">×</button>`;
+          if (e.kind === 'focus') return `<li class="focus ${e.redacted ? 'redacted' : ''}">${t}<span class="kind">window</span><span class="text">${esc(e.app)}${e.title ? ' · ' + esc(e.title) : ''}</span>${x}</li>`;
+          let body = esc(e.text);
+          if (e.kind === 'capture' && e.file) body += `<img src="/files/${encodeURIComponent(a.slug)}/${e.file}" alt="capture">`;
+          if (e.kind === 'file' && e.file) body += ` <a class="hint" href="/files/${encodeURIComponent(a.slug)}/${e.file}" target="_blank">open</a>`;
+          return `<li class="${e.redacted ? 'redacted' : ''}">${t}<span class="kind ${e.kind}">${e.kind}</span><span class="text">${body}</span>${x}</li>`;
+        }).join('');
+        tl.scrollTop = tl.scrollHeight;
+        lastEventCount = ev.length;
+      }
+    } else { lastEventCount = -1; }
+    $('tasks').innerHTML = state.tasks.length ? state.tasks.map(t =>
+      `<li data-slug="${esc(t.slug)}"><div>${esc(t.name)}</div><div class="meta">${t.started.slice(0, 10)} · ${esc(t.owner || '')} · ${t.entries} entries${t.ended ? '' : ' · recording'}</div></li>`).join('')
+      : '<li class="hint" style="cursor:default">Nothing recorded yet.</li>';
+  }
+
+  async function refresh() { try { state = await api('/api/state'); render(); } catch (e) { $('statusText').textContent = 'Server not reachable'; } }
+
+  function err(id, e) { $(id).textContent = e ? (e.message || String(e)) : ''; }
+
+  $('startBtn').onclick = async () => {
+    err('startErr');
+    try {
+      localStorage.setItem('owner', $('owner').value);
+      await api('/api/start', { name: $('name').value, goal: $('goal').value, owner: $('owner').value, tags: $('tags').value, track_focus: $('trackFocus').checked });
+      $('name').value = $('goal').value = $('tags').value = '';
+      painValue = null; [...$('pain').children].forEach(b => b.classList.remove('sel'));
+      $('outcome').value = $('wish').value = '';
+      await refresh(); $('entry').focus();
+    } catch (e) { err('startErr', e); }
+  };
+  async function add(kind) {
+    const text = $('entry').value.trim(); if (!text) return;
+    err('recErr'); $('entry').value = '';
+    try { await api('/api/event', { kind, text }); await refresh(); }
+    catch (e) { err('recErr', e); if (!$('entry').value) $('entry').value = text; }
+  }
+  $('addStep').onclick = () => add('step');
+  $('addNote').onclick = () => add('note');
+  $('addDecision').onclick = () => add('decision');
+  $('entry').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); add('step'); } });
+  $('captureBtn').onclick = async () => {
+    err('recErr'); $('captureBtn').disabled = true;
+    try { await api('/api/capture', { text: $('entry').value.trim() || 'screen captured' }); $('entry').value = ''; await refresh(); }
+    catch (e) { err('recErr', e); } finally { $('captureBtn').disabled = false; }
+  };
+  $('attachBtn').onclick = () => $('fileInput').click();
+  $('fileInput').onchange = async () => {
+    err('recErr');
+    for (const f of $('fileInput').files) {
+      try {
+        const data = await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result.split(',')[1]); r.onerror = bad; r.readAsDataURL(f); });
+        await api('/api/file', { name: f.name, data, text: `attached ${f.name}` });
+      } catch (e) { err('recErr', e); }
+    }
+    $('fileInput').value = ''; await refresh();
+  };
+  $('pauseBtn').onclick = async () => { err('recErr'); try { await api('/api/event', { kind: paused ? 'resume' : 'pause', text: paused ? 'resumed' : 'paused' }); await refresh(); } catch (e) { err('recErr', e); } };
+  $('timeline').addEventListener('click', async e => {
+    const b = e.target.closest('button.x'); if (!b) return;
+    if (!confirm('Redact this entry? Its text (and screenshot, if any) is removed for good.')) return;
+    try { await api('/api/redact', { id: Number(b.dataset.id) }); lastEventCount = -1; await refresh(); } catch (e) { err('recErr', e); }
+  });
+  $('pain').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; painValue = Number(b.dataset.v); [...$('pain').children].forEach(x => x.classList.toggle('sel', x === b)); });
+  $('endBtn').onclick = async () => {
+    err('recErr');
+    try {
+      const slug = state.active.slug;
+      await api('/api/end', { outcome: $('outcome').value, pain: painValue, wish: $('wish').value });
+      await refresh(); showProc(slug);
+    } catch (e) { err('recErr', e); }
+  };
+  $('discardBtn').onclick = async () => {
+    if (!confirm('Delete this recording entirely? This cannot be undone.')) return;
+    try { await api('/api/discard', {}); await refresh(); } catch (e) { err('recErr', e); }
+  };
+  async function showProc(slug) {
+    try {
+      const md = await api('/api/procedure/' + encodeURIComponent(slug));
+      $('procCard').classList.remove('hidden');
+      $('procTitle').textContent = (state.tasks.find(t => t.slug === slug) || {}).name || slug;
+      $('proc').textContent = md;
+      $('procLink').href = '/api/procedure/' + encodeURIComponent(slug);
+    } catch (e) { err('recErr', e); }
+  }
+  $('tasks').addEventListener('click', e => { const li = e.target.closest('li[data-slug]'); if (li) showProc(li.dataset.slug); });
+
+  $('owner').value = localStorage.getItem('owner') || '';
+  refresh(); setInterval(refresh, 3000);
+})();
+</script>
+</body>
+</html>

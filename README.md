@@ -15,6 +15,12 @@ It has three parts:
   sandboxed Python runner, answer verification, retrieval over local files and a
   tool-using agent.
 
+## Task recorder
+
+`taskrecorder/` is a separate, dependency-free program that records how a person does one task on
+their own computer, on that computer, and writes a draft procedure for it. It shares no code with
+the engine; see [taskrecorder/README.md](taskrecorder/README.md).
+
 ## Reimplementing instead of distilling
 
 Distillation trains a smaller student model to imitate a larger one: the student is
