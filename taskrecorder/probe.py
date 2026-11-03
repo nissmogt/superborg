@@ -53,7 +53,7 @@ $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-$bmp.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Save($env:TASKRECORDER_SHOT, [System.Drawing.Imaging.ImageFormat]::Png)
 """
 
 
@@ -105,7 +105,8 @@ def screenshot(path: str) -> bool:
     if sys.platform == "darwin":
         return _run(["screencapture", "-x", path]) is not None and os.path.isfile(path)
     if sys.platform.startswith("win"):
-        _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _WIN_SHOT, path])
+        env = dict(os.environ, TASKRECORDER_SHOT=path)   # -Command does not fill $args; pass the path this way
+        _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _WIN_SHOT], env=env)
         return os.path.isfile(path)
     for cmd in (["gnome-screenshot", "-f", path], ["grim", path], ["scrot", path],
                 ["import", "-window", "root", path], ["spectacle", "-b", "-n", "-o", path]):

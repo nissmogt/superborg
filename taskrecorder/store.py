@@ -29,6 +29,7 @@ TEXT_LIMIT = 4000
 FILE_LIMIT = 50 * 1024 * 1024
 REDACTED = "[redacted]"
 _SLUG = re.compile(r"[^a-z0-9]+")
+_SLUG_OK = re.compile(r"[a-z0-9][a-z0-9-]{0,79}")
 
 
 class StoreError(Exception):
@@ -74,10 +75,13 @@ class Store:
         self._lock = threading.RLock()
         self._active: Optional[str] = None
         self._last_focus: Optional[tuple] = None
+        self._paused = False
         for slug in self._slugs():
             t = self._read_task(slug)
             if t and not t.get("ended"):
                 self._active = slug
+                pr = [e for e in self._read_events(slug) if e["kind"] in ("pause", "resume")]
+                self._paused = bool(pr) and pr[-1]["kind"] == "pause"
                 break
 
     # -- paths -----------------------------------------------------------------------------
@@ -147,8 +151,17 @@ class Store:
         out.sort(key=lambda t: t["started"], reverse=True)
         return out
 
+    @staticmethod
+    def _check_slug(slug: str) -> str:
+        if not _SLUG_OK.fullmatch(slug or ""):
+            raise StoreError(f"no recording named {slug!r}")
+        return slug
+
+    def paused(self) -> bool:
+        return self._paused
+
     def get(self, slug: str) -> dict:
-        slug = os.path.basename(slug)
+        slug = self._check_slug(slug)
         t = self._read_task(slug)
         if t is None:
             raise StoreError(f"no recording named {slug!r}")
@@ -176,6 +189,7 @@ class Store:
             self._write_events(slug, [])
             self._active = slug
             self._last_focus = None
+            self._paused = False
             task["events"] = []
             return task
 
@@ -199,12 +213,15 @@ class Store:
                 raise StoreError("the entry is empty")
             with open(self.path(slug, "events.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            if kind in ("pause", "resume"):
+                self._paused = kind == "pause"
+                self._last_focus = None   # after a resume, the window in front is recorded afresh
             return ev
 
     def note_focus(self, app: str, title: str) -> Optional[dict]:
-        """Record the window in front if it changed since the last focus event."""
+        """Record the window in front if it changed since the last focus event. Nothing while paused."""
         with self._lock:
-            if not self._active:
+            if not self._active or self._paused:
                 return None
             task = self._read_task(self._active) or {}
             if not task.get("track_focus", True):
@@ -222,14 +239,16 @@ class Store:
             for e in events:
                 if e["id"] == event_id:
                     e["text"] = REDACTED
-                    if "title" in e:
-                        e["title"] = REDACTED
-                    if e["kind"] == "capture" and e.get("file"):
+                    for k in ("title", "app"):
+                        if k in e:
+                            e[k] = REDACTED
+                    if e["kind"] in ("capture", "file") and e.get("file"):
                         try:
                             os.remove(self.path(slug, e["file"]))
                         except OSError:
                             pass
                         e["file"] = None
+                        e.pop("size", None)
                     e["redacted"] = True
                     self._write_events(slug, events)
                     return e
@@ -281,6 +300,7 @@ class Store:
                 f.write(render_procedure(task))
             self._active = None
             self._last_focus = None
+            self._paused = False
             return task
 
     def discard_active(self) -> None:
@@ -290,9 +310,10 @@ class Store:
             shutil.rmtree(self.path(slug), ignore_errors=True)
             self._active = None
             self._last_focus = None
+            self._paused = False
 
     def procedure(self, slug: str) -> str:
-        slug = os.path.basename(slug)
+        slug = self._check_slug(slug)
         p = self.path(slug, "procedure.md")
         if os.path.isfile(p):
             with open(p, encoding="utf-8") as f:

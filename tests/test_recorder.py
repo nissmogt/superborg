@@ -21,6 +21,15 @@ from taskrecorder.store import Store, StoreError, render_procedure, slugify  # n
 
 
 # -- store -------------------------------------------------------------------------------------
+def test_slug_check(tmp_path):
+    s = Store(str(tmp_path))
+    for bad in ("..", "", "../x", "a/b", "A", "x" * 81, ".hidden"):
+        with pytest.raises(StoreError):
+            s.get(bad)
+        with pytest.raises(StoreError):
+            s.procedure(bad)
+
+
 def test_slugify():
     assert slugify("Review last week's Google Ads search terms!") == "review-last-week-s-google-ads-search-terms"
     assert slugify("   ") == "task"
@@ -86,7 +95,13 @@ def test_redaction_and_restart(tmp_path):
         s.redact(99)
     evs = s.active()["events"]
     assert evs[0]["text"] == store.REDACTED and evs[0]["redacted"]
-    assert evs[1]["title"] == store.REDACTED
+    assert evs[1]["title"] == store.REDACTED and evs[1]["app"] == store.REDACTED
+    # paused: nothing about the screen is written down until resume
+    s.add_event("pause", "paused")
+    assert s.paused() and s.note_focus("Chrome", "personal mail") is None
+    assert Store(str(tmp_path)).paused()          # a restart remembers it
+    s.add_event("resume", "resumed")
+    assert not s.paused() and s.note_focus("Dentrix", "John Smith - ledger")["app"] == "Dentrix"
     assert evs[2]["file"] is None and os.listdir(s.path(s.active()["slug"], "captures")) == []
     # a restart picks the unfinished task back up
     s2 = Store(str(tmp_path))
@@ -162,13 +177,27 @@ def raw(port, method, path, body=None, headers=None, cookie=None):
 
 def test_http_flow(server):
     port, rec, desk = server
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    c.request("GET", "/", headers={"Host": f"127.0.0.1:{port}"})
-    r = c.getresponse()
-    page = r.read().decode()
-    assert r.status == 200 and "<title>Task recorder</title>" in page and "text/html" in r.getheader("Content-Type")
-    assert f"{app.COOKIE}={rec.secret}; HttpOnly; SameSite=Strict" in r.getheader("Set-Cookie")
-    c.close()
+    def get_page(path, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        h = {"Host": f"127.0.0.1:{port}"}
+        if cookie:
+            h["Cookie"] = f"{app.COOKIE}={cookie}"
+        c.request("GET", path, headers=h)
+        r = c.getresponse()
+        body = r.read().decode()
+        c.close()
+        return r.status, body, r.getheader("Set-Cookie")
+    # a bare visit gets a locked page and no cookie: another local user cannot pick up the session
+    st, body, sc = get_page("/")
+    assert st == 403 and sc is None and "link printed" in body
+    st, body, sc = get_page("/?t=wrong")
+    assert st == 403 and sc is None
+    # the launch link sets the cookie; a later visit with the cookie works without the link
+    st, page, sc = get_page(f"/?t={rec.token}")
+    assert st == 200 and "<title>Task recorder</title>" in page
+    assert f"{app.COOKIE}={rec.secret}; HttpOnly; SameSite=Strict" in sc
+    st, page, sc = get_page("/", cookie=rec.secret)
+    assert st == 200 and "<title>Task recorder</title>" in page and sc is None
     def call(port, method, path, body=None, headers=None):  # the same calls, with the session cookie
         return raw(port, method, path, body, headers, cookie=rec.secret)
 
@@ -202,6 +231,16 @@ def test_http_flow(server):
     assert st == 200 and fev["file"] == "files/report.csv"
     st, body, ct = call(port, "GET", f"/files/{slug}/files/report.csv")
     assert st == 200 and body == "a,b\n" and ct == "application/octet-stream"
+    st, uev, _ = call(port, "POST", "/api/file", {"name": "mes données été.csv", "data": data})
+    assert st == 200 and uev["file"] == "files/mes données été.csv"
+    from urllib.parse import quote
+    c3 = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c3.request("GET", f"/files/{slug}/" + "/".join(quote(x) for x in uev["file"].split("/")),
+               headers={"Host": f"127.0.0.1:{port}", "Cookie": f"{app.COOKIE}={rec.secret}"})
+    r3 = c3.getresponse(); assert r3.status == 200 and r3.read() == b"a,b\n"
+    assert "filename*=UTF-8''mes%20donn%C3%A9es%20%C3%A9t%C3%A9.csv" in r3.getheader("Content-Disposition")
+    c3.close()
+    assert call(port, "GET", f"/files/{slug}/files/%2e%2e/%2e%2e/setup.py")[0] == 404
     assert call(port, "POST", "/api/file", {"name": "x", "data": "!!!"})[0] == 400
 
     assert call(port, "GET", "/files/../tests/test_recorder.py")[0] == 404
@@ -210,10 +249,15 @@ def test_http_flow(server):
 
     st, red, _ = call(port, "POST", "/api/redact", {"id": 1})
     assert st == 200 and red["redacted"]
+    st, red, _ = call(port, "POST", "/api/redact", {"id": fev["id"]})
+    assert st == 200 and red["file"] is None and "size" not in red
+    assert not os.path.isfile(rec.store.path(slug, "files", "report.csv"))
 
     st, t, _ = call(port, "GET", f"/api/task/{slug}")
-    assert st == 200 and [e["kind"] for e in t["events"]] == ["step", "focus", "focus", "capture", "file"]
+    assert st == 200 and [e["kind"] for e in t["events"]] == ["step", "focus", "focus", "capture", "file", "file"]
     assert call(port, "GET", "/api/task/nope")[0] == 404
+    assert call(port, "GET", "/api/task/..")[0] == 404
+    assert call(port, "GET", "/api/procedure/%2e%2e")[0] == 404
 
     st, done, _ = call(port, "POST", "/api/end", {"outcome": "ok", "pain": 2, "wish": "fetch the report"})
     assert st == 200 and done["pain"] == 2
@@ -234,7 +278,8 @@ def test_discard_and_guards(server):
     assert raw(port, "GET", "/api/state")[0] == 403
     assert raw(port, "POST", "/api/start", {"name": "x"})[0] == 403
     assert raw(port, "GET", "/api/state", cookie="wrong" * 10)[0] == 403
-    assert raw(port, "GET", "/")[0] == 200
+    assert raw(port, "GET", "/")[0] == 403                      # the page itself needs the launch link
+    assert raw(port, "GET", f"/?t={rec.token}")[0] == 200
     # a browser marks requests from other sites, and those are refused even with the cookie
     assert call(port, "GET", "/api/state", headers={"Sec-Fetch-Site": "cross-site"})[0] == 403
     assert call(port, "GET", "/api/state", headers={"Sec-Fetch-Site": "same-origin"})[0] == 200
@@ -247,7 +292,12 @@ def test_discard_and_guards(server):
     # requests not addressed to this computer, or sent by another page, are refused
     assert call(port, "GET", "/api/state", headers={"Host": "evil.example"})[0] == 403
     assert call(port, "POST", "/api/start", {"name": "x"}, headers={"Origin": "http://evil.example"})[0] == 403
-    assert call(port, "POST", "/api/start", {"name": "x"}, headers={"Origin": f"http://localhost:{port}"})[0] == 200
+    assert call(port, "POST", "/api/start", {"name": "x"}, headers={"Origin": "null"})[0] == 403
+    # a page on another loopback port is not this server, whatever the browser says about Sec-Fetch-Site
+    assert call(port, "POST", "/api/start", {"name": "x"}, headers={"Origin": f"http://127.0.0.1:{port + 1}"})[0] == 403
+    assert call(port, "POST", "/api/start", {"name": "x"}, headers={"Origin": f"http://127.0.0.1:{port}"})[0] == 200
+    assert call(port, "POST", "/api/discard", {})[0] == 200
+    assert call(port, "POST", "/api/start", {"name": "x"}, headers={"Origin": f"http://localhost:{port}", "Host": f"localhost:{port}"})[0] == 200
     assert call(port, "GET", "/api/state", headers={"Host": "localhost"})[0] == 200
     assert call(port, "GET", "/api/state", headers={"Host": "[::1]:80"})[0] == 200
     assert call(port, "GET", "/nothing")[0] == 404

@@ -14,10 +14,12 @@ recording can redact any entry, and the maker of the recorder never receives a c
 * Which program and window is in front, and when that changes. Window titles only, sampled every
   two seconds while a task records, and only when the box "Record which window is in front" is
   ticked at start. It can be switched off for good with `--no-focus`.
-* A screenshot, only when the user clicks **Capture screen**.
+* A screenshot, only when the user clicks **Capture**.
 * Files the user attaches.
 
-It does not record keystrokes, the clipboard, audio, or the screen continuously.
+It does not record keystrokes, the clipboard, audio, or the screen continuously. While paused,
+it records nothing at all, including window titles. Removing an entry with its × deletes its
+text, and its screenshot or file, from disk.
 
 When the task ends, the recorder writes `procedure.md`: a numbered draft procedure with the
 decisions and notes in place, a table of the programs used and the time spent in each, the
@@ -34,8 +36,10 @@ outcome, how tedious the task was on a 1 to 5 scale, and what the user wished a 
 
        python -m taskrecorder
 
-   The browser opens `http://127.0.0.1:8766/`. Recordings go to `~/Task Recordings` unless
-   `--dir` says otherwise. The page only answers that computer's own browser.
+   The browser opens on a link that carries a key for this run (`http://127.0.0.1:8766/?t=...`,
+   also printed in the terminal). The page does not open without it, so another person or
+   program on the same computer cannot read the recordings through the recorder. Recordings go
+   to `~/Task Recordings` unless `--dir` says otherwise.
 
 On macOS, recording the window in front and taking screenshots asks for Accessibility and
 Screen Recording permission the first time; the system shows the prompt. On Windows both work

@@ -19,8 +19,11 @@ Endpoints (standard library only; all state lives in taskrecorder.store.Store):
   GET  /api/encyclopedia         every finished procedure in one document (text/markdown)
   GET  /files/<slug>/<path>      a capture or attached file of a recording
 
-The server binds to 127.0.0.1 only and answers requests whose Host is a loopback name and whose
-Origin, when a browser sends one, is this server, so other web pages cannot drive it.
+The server binds to 127.0.0.1 only. The page is opened through a launch link that carries a
+token printed in the terminal (http://127.0.0.1:8766/?t=...); that visit sets a session cookie,
+and every other request must carry the cookie. Requests whose Host is not a loopback name, whose
+Sec-Fetch-Site says they come from another site, or whose Origin is not exactly this server are
+refused, so other web pages, and other users of the same computer, cannot drive it.
 
 While a task records, a background thread asks the operating system every FOCUS_PERIOD_S which
 window is in front and writes a focus event when that changes (taskrecorder.probe). Nothing is
@@ -39,6 +42,7 @@ import threading
 import time
 import traceback
 import webbrowser
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
@@ -65,6 +69,10 @@ _HEADERS = {
 INLINE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")  # shown in the page; all else downloads
 COOKIE = "taskrecorder"
 PAGE_MARK = "Task recorder"  # focus events for our own page are not worth recording
+LOCKED_PAGE = ("<!doctype html><meta charset=utf-8><title>Task recorder</title>"
+               "<body style='font:16px system-ui;padding:40px;max-width:40em'><h1>Task recorder</h1>"
+               "<p>This page opens only through the link printed in the terminal when the recorder started "
+               "(it ends in <code>?t=…</code>). Start the recorder again if you no longer have it.</p>")
 
 
 class Recorder:
@@ -79,7 +87,8 @@ class Recorder:
         self.shoot = shoot
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self.secret = secrets.token_urlsafe(32)   # the page gets it as a cookie; every other request must carry it
+        self.secret = secrets.token_urlsafe(32)   # the session cookie; every request but the page itself needs it
+        self.token = secrets.token_urlsafe(24)    # in the launch link; the page sets the cookie only when it is given
 
     def start_sampling(self) -> None:
         if not self.focus_enabled or self._thread:
@@ -125,11 +134,11 @@ def _host_ok(host: str) -> bool:
     return host in _LOOPBACK
 
 
-def _origin_ok(origin: Optional[str]) -> bool:
-    if not origin or origin == "null":
+def _origin_ok(origin: Optional[str], host: str) -> bool:
+    """No Origin (a non-browser client) passes; a browser's Origin must be exactly this server."""
+    if origin is None:
         return True
-    o = origin.lower()
-    return any(o == f"http://{h}" or o.startswith(f"http://{h}:") for h in _LOOPBACK)
+    return origin.lower() == f"http://{host.strip().lower()}"
 
 
 def make_handler(rec: Recorder, page: str):
@@ -162,20 +171,31 @@ def make_handler(rec: Recorder, page: str):
             self._json({"error": msg}, status)
 
         def _guard(self) -> bool:
+            ok = self._checks()
+            if not ok:
+                self.close_connection = True   # a refused POST's body is unread; do not reuse the connection
+            return ok
+
+        def _checks(self) -> bool:
             if not _host_ok(self.headers.get("Host", "")):
                 self._error(HTTPStatus.FORBIDDEN, "this server only answers its own computer")
                 return False
             if self.headers.get("Sec-Fetch-Site", "").lower() in ("cross-site", "same-site"):
                 self._error(HTTPStatus.FORBIDDEN, "requests from other sites are refused")
                 return False
-            if self.command == "POST" and not _origin_ok(self.headers.get("Origin")):
+            if self.command == "POST" and not _origin_ok(self.headers.get("Origin"), self.headers.get("Host", "")):
                 self._error(HTTPStatus.FORBIDDEN, "cross-origin requests are refused")
                 return False
             path = self.path.split("?", 1)[0]
             if path not in ("/", "/index.html") and not self._session_ok():
-                self._error(HTTPStatus.FORBIDDEN, "open the page first (missing session)")
+                self._error(HTTPStatus.FORBIDDEN, "no session: open the link printed when the recorder started")
                 return False
             return True
+
+        def _launch_token_ok(self) -> bool:
+            q = parse_qs(urlsplit(self.path).query)
+            t = (q.get("t") or [""])[0]
+            return bool(t) and secrets.compare_digest(t, rec.token)
 
         def _session_ok(self) -> bool:
             jar = _cookies.SimpleCookie()
@@ -211,16 +231,21 @@ def make_handler(rec: Recorder, page: str):
             path = self.path.split("?", 1)[0]
             try:
                 if path in ("/", "/index.html"):
-                    self._send(200, page.encode("utf-8"), "text/html; charset=utf-8",
-                               {"Set-Cookie": f"{COOKIE}={rec.secret}; HttpOnly; SameSite=Strict; Path=/"})
+                    if self._launch_token_ok():
+                        self._send(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                                   {"Set-Cookie": f"{COOKIE}={rec.secret}; HttpOnly; SameSite=Strict; Path=/"})
+                    elif self._session_ok():
+                        self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+                    else:
+                        self._send(HTTPStatus.FORBIDDEN, LOCKED_PAGE.encode("utf-8"), "text/html; charset=utf-8")
                 elif path == "/api/state":
                     self._json(rec.state())
                 elif path == "/api/encyclopedia":
                     self._send(200, rec.store.encyclopedia().encode("utf-8"), "text/markdown; charset=utf-8")
                 elif path.startswith("/api/task/"):
-                    self._json(rec.store.get(path[len("/api/task/"):]))
+                    self._json(rec.store.get(unquote(path[len("/api/task/"):])))
                 elif path.startswith("/api/procedure/"):
-                    self._send(200, rec.store.procedure(path[len("/api/procedure/"):]).encode("utf-8"),
+                    self._send(200, rec.store.procedure(unquote(path[len("/api/procedure/"):])).encode("utf-8"),
                                "text/markdown; charset=utf-8")
                 elif path.startswith("/files/"):
                     self._file(path[len("/files/"):])
@@ -230,7 +255,7 @@ def make_handler(rec: Recorder, page: str):
                 self._error(HTTPStatus.NOT_FOUND, str(e))
 
         def _file(self, rel: str) -> None:
-            parts = [p for p in rel.split("/") if p]
+            parts = [p for p in unquote(rel).split("/") if p]
             if len(parts) < 2 or any(p in ("..", "") or p.startswith(".") for p in parts):
                 return self._error(HTTPStatus.NOT_FOUND, "not found")
             full = os.path.realpath(os.path.join(rec.store.root, *parts))
@@ -240,7 +265,10 @@ def make_handler(rec: Recorder, page: str):
             extra = {"Content-Security-Policy": "sandbox; default-src 'none'"}
             if ctype not in INLINE_TYPES:
                 ctype = "application/octet-stream"
-                extra["Content-Disposition"] = f'attachment; filename="{os.path.basename(full)}"'
+                name = os.path.basename(full)
+                ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+                extra["Content-Disposition"] = (f'attachment; filename="{ascii_name}"; '
+                                                f"filename*=UTF-8''{quote(name)}")
             with open(full, "rb") as f:
                 self._send(200, f.read(), ctype, extra)
 
@@ -307,10 +335,11 @@ def serve(root: str, port: int = DEFAULT_PORT, open_browser: bool = True, focus:
     except OSError as e:
         print(f"could not listen on 127.0.0.1:{port}: {e}", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    url = f"http://127.0.0.1:{srv.server_address[1]}/?t={rec.token}"
     print(f"Task recorder {__version__}")
     print(f"  recordings: {rec.store.root}")
     print(f"  open:       {url}")
+    print("  (the link carries a key for this run; the page does not open without it)")
     print("  window tracking:", "on while a task records" if rec.focus_enabled else "off")
     print("Press Ctrl+C to stop.")
     rec.start_sampling()
