@@ -67,6 +67,10 @@ class Store:
     def __init__(self, root: str):
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
+        try:
+            os.chmod(self.root, 0o700)   # owner only; a no-op on Windows
+        except OSError:
+            pass
         self._lock = threading.RLock()
         self._active: Optional[str] = None
         self._last_focus: Optional[tuple] = None

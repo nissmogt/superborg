@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import secrets
 import json
 import mimetypes
 import os
@@ -41,6 +42,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
+from http import cookies as _cookies
 
 from . import __version__, probe
 from .store import KINDS, Store, StoreError
@@ -56,8 +58,12 @@ _HEADERS = {
                                 "frame-ancestors 'none'"),
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
+INLINE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")  # shown in the page; all else downloads
+COOKIE = "taskrecorder"
 PAGE_MARK = "Task recorder"  # focus events for our own page are not worth recording
 
 
@@ -73,6 +79,7 @@ class Recorder:
         self.shoot = shoot
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.secret = secrets.token_urlsafe(32)   # the page gets it as a cookie; every other request must carry it
 
     def start_sampling(self) -> None:
         if not self.focus_enabled or self._thread:
@@ -129,17 +136,20 @@ def make_handler(rec: Recorder, page: str):
     class Handler(BaseHTTPRequestHandler):
         server_version = f"taskrecorder/{__version__}"
         protocol_version = "HTTP/1.1"
+        timeout = 60
 
         def log_message(self, fmt, *args):  # quiet by default
             if os.environ.get("TASKRECORDER_LOG"):
                 super().log_message(fmt, *args)
 
         # -- replies -----------------------------------------------------------------------
-        def _send(self, status: int, body: bytes, ctype: str) -> None:
+        def _send(self, status: int, body: bytes, ctype: str, extra: Optional[dict] = None) -> None:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             for k, v in _HEADERS.items():
+                self.send_header(k, v)
+            for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
             if self.command != "HEAD":
@@ -155,10 +165,26 @@ def make_handler(rec: Recorder, page: str):
             if not _host_ok(self.headers.get("Host", "")):
                 self._error(HTTPStatus.FORBIDDEN, "this server only answers its own computer")
                 return False
+            if self.headers.get("Sec-Fetch-Site", "").lower() in ("cross-site", "same-site"):
+                self._error(HTTPStatus.FORBIDDEN, "requests from other sites are refused")
+                return False
             if self.command == "POST" and not _origin_ok(self.headers.get("Origin")):
                 self._error(HTTPStatus.FORBIDDEN, "cross-origin requests are refused")
                 return False
+            path = self.path.split("?", 1)[0]
+            if path not in ("/", "/index.html") and not self._session_ok():
+                self._error(HTTPStatus.FORBIDDEN, "open the page first (missing session)")
+                return False
             return True
+
+        def _session_ok(self) -> bool:
+            jar = _cookies.SimpleCookie()
+            try:
+                jar.load(self.headers.get("Cookie", ""))
+            except _cookies.CookieError:
+                return False
+            m = jar.get(COOKIE)
+            return bool(m) and secrets.compare_digest(m.value, rec.secret)
 
         def _body(self) -> dict:
             n = int(self.headers.get("Content-Length") or 0)
@@ -185,7 +211,8 @@ def make_handler(rec: Recorder, page: str):
             path = self.path.split("?", 1)[0]
             try:
                 if path in ("/", "/index.html"):
-                    self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+                    self._send(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                               {"Set-Cookie": f"{COOKIE}={rec.secret}; HttpOnly; SameSite=Strict; Path=/"})
                 elif path == "/api/state":
                     self._json(rec.state())
                 elif path == "/api/encyclopedia":
@@ -210,10 +237,12 @@ def make_handler(rec: Recorder, page: str):
             if not full.startswith(os.path.realpath(rec.store.root) + os.sep) or not os.path.isfile(full):
                 return self._error(HTTPStatus.NOT_FOUND, "not found")
             ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
-            if ctype.startswith("text/") or ctype in ("application/javascript", "text/html"):
-                ctype = "text/plain; charset=utf-8"
+            extra = {"Content-Security-Policy": "sandbox; default-src 'none'"}
+            if ctype not in INLINE_TYPES:
+                ctype = "application/octet-stream"
+                extra["Content-Disposition"] = f'attachment; filename="{os.path.basename(full)}"'
             with open(full, "rb") as f:
-                self._send(200, f.read(), ctype)
+                self._send(200, f.read(), ctype, extra)
 
         def do_POST(self):  # noqa: N802
             if not self._guard():

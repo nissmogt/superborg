@@ -30,6 +30,8 @@ def test_slugify():
 def test_record_a_task(tmp_path):
     s = Store(str(tmp_path))
     assert s.active() is None and s.list_tasks() == []
+    if os.name != "nt":
+        assert os.stat(s.root).st_mode & 0o777 == 0o700
     t = s.start("Review search terms", goal="negatives added", owner="Salar", tags=["google-ads", " weekly "])
     assert t["tags"] == ["google-ads", "weekly"]
     assert os.path.isdir(s.path(t["slug"], "captures"))
@@ -140,9 +142,11 @@ def server(tmp_path):
     srv.server_close()
 
 
-def call(port, method, path, body=None, headers=None):
+def raw(port, method, path, body=None, headers=None, cookie=None):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     h = {"Host": f"127.0.0.1:{port}"}
+    if cookie:
+        h["Cookie"] = f"{app.COOKIE}={cookie}"
     h.update(headers or {})
     data = None
     if body is not None:
@@ -158,8 +162,15 @@ def call(port, method, path, body=None, headers=None):
 
 def test_http_flow(server):
     port, rec, desk = server
-    st, page, ct = call(port, "GET", "/")
-    assert st == 200 and "<title>Task recorder</title>" in page and "text/html" in ct
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("GET", "/", headers={"Host": f"127.0.0.1:{port}"})
+    r = c.getresponse()
+    page = r.read().decode()
+    assert r.status == 200 and "<title>Task recorder</title>" in page and "text/html" in r.getheader("Content-Type")
+    assert f"{app.COOKIE}={rec.secret}; HttpOnly; SameSite=Strict" in r.getheader("Set-Cookie")
+    c.close()
+    def call(port, method, path, body=None, headers=None):  # the same calls, with the session cookie
+        return raw(port, method, path, body, headers, cookie=rec.secret)
 
     st, state, _ = call(port, "GET", "/api/state")
     assert st == 200 and state["active"] is None and state["focus"] is True
@@ -190,7 +201,7 @@ def test_http_flow(server):
     st, fev, _ = call(port, "POST", "/api/file", {"name": "report.csv", "data": data})
     assert st == 200 and fev["file"] == "files/report.csv"
     st, body, ct = call(port, "GET", f"/files/{slug}/files/report.csv")
-    assert st == 200 and body == "a,b\n" and ct.startswith("text/plain")
+    assert st == 200 and body == "a,b\n" and ct == "application/octet-stream"
     assert call(port, "POST", "/api/file", {"name": "x", "data": "!!!"})[0] == 400
 
     assert call(port, "GET", "/files/../tests/test_recorder.py")[0] == 404
@@ -217,6 +228,17 @@ def test_http_flow(server):
 
 def test_discard_and_guards(server):
     port, rec, desk = server
+    def call(port, method, path, body=None, headers=None):
+        return raw(port, method, path, body, headers, cookie=rec.secret)
+    # without the session cookie nothing but the page answers
+    assert raw(port, "GET", "/api/state")[0] == 403
+    assert raw(port, "POST", "/api/start", {"name": "x"})[0] == 403
+    assert raw(port, "GET", "/api/state", cookie="wrong" * 10)[0] == 403
+    assert raw(port, "GET", "/")[0] == 200
+    # a browser marks requests from other sites, and those are refused even with the cookie
+    assert call(port, "GET", "/api/state", headers={"Sec-Fetch-Site": "cross-site"})[0] == 403
+    assert call(port, "GET", "/api/state", headers={"Sec-Fetch-Site": "same-origin"})[0] == 200
+    assert call(port, "GET", "/api/state", headers={"Sec-Fetch-Site": "none"})[0] == 200
     assert call(port, "POST", "/api/start", {"name": "oops"})[0] == 200
     assert call(port, "POST", "/api/discard", {})[0] == 200
     assert call(port, "GET", "/api/state")[1]["tasks"] == []
