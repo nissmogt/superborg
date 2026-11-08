@@ -47,6 +47,10 @@ class Params:
     alpha: float
     beta: float
 
+    def __post_init__(self):
+        if self.r_c <= 0 or self.r_p <= 0:
+            raise ValueError("growth rates must be positive")
+
     def replace(self, **kw) -> "Params":
         d = self.__dict__.copy()
         d.update(kw)
@@ -69,7 +73,10 @@ def simulate(schedule: Schedule, y0: tuple[float, float], years: float = YEARS,
     """Integrate with classical RK4 and return ``samples_per_year`` samples a year.
 
     Parameters are held constant within each step and read at the step's
-    midpoint, so a switch at a whole year never falls inside a step.
+    midpoint, so a switch at a whole year never falls inside a step. The
+    parameter columns hold ``schedule(t)``: the values in force from sample
+    time t onward. If ``years`` is not a whole number of sample intervals,
+    the final state is appended as an extra sample.
     """
     steps_per_year = round(1.0 / dt)
     if not math.isclose(steps_per_year * dt, 1.0):
@@ -91,7 +98,12 @@ def simulate(schedule: Schedule, y0: tuple[float, float], years: float = YEARS,
             t = (n + 1) * dt
             out_t.append(round(t, 9))
             out_y.append(y.copy())
-            out_p.append(p)
+            out_p.append(schedule(t))
+    if n_steps % every:
+        t = n_steps * dt
+        out_t.append(round(t, 9))
+        out_y.append(y.copy())
+        out_p.append(schedule(t))
     ys = np.array(out_y)
     return {
         "year": np.array(out_t),
@@ -116,7 +128,13 @@ def jacobian(C: float, P: float, p: Params) -> np.ndarray:
 
 
 def equilibria(p: Params) -> list[dict]:
-    """All equilibria in the closed unit square, with eigenvalues and type."""
+    """Equilibria in the closed unit square, with eigenvalues and type.
+
+    In the degenerate case alpha = r_c and beta = r_p every point on
+    C + P = 1 is an equilibrium; only the three corner points are returned.
+    An equilibrium with a zero eigenvalue is labelled "marginal": its
+    stability is decided by nonlinear terms, not by the eigenvalues.
+    """
     a, b = p.alpha / p.r_c, p.beta / p.r_p
     pts = [("extinct", 0.0, 0.0), ("creative only", 1.0, 0.0), ("possessive only", 0.0, 1.0)]
     if not math.isclose(a * b, 1.0):
@@ -128,7 +146,9 @@ def equilibria(p: Params) -> list[dict]:
     for name, C, P in pts:
         ev = np.linalg.eigvals(jacobian(C, P, p))
         re = ev.real
-        if np.all(re < 0):
+        if np.any(np.abs(re) < 1e-12):
+            kind = "marginal"
+        elif np.all(re < 0):
             kind = "stable"
         elif np.all(re > 0):
             kind = "unstable"
@@ -143,7 +163,11 @@ def regime(p: Params) -> str:
 
     C can grow into a P-only society iff alpha < r_c.
     P can grow into a C-only society iff beta < r_p.
+    The rule needs strict inequalities; equality cases are reported as
+    borderline because nonlinear terms decide them.
     """
+    if math.isclose(p.alpha, p.r_c) or math.isclose(p.beta, p.r_p):
+        return "borderline: alpha == r_c or beta == r_p"
     c_invades = p.alpha < p.r_c
     p_invades = p.beta < p.r_p
     if c_invades and p_invades:
@@ -187,6 +211,7 @@ def scenarios(t_crisis_short: float, t_crisis_long: float) -> list[dict]:
             "title": "1. Crisis that passes",
             "desc": f"r_p rises 0.5 -> {CRISIS_RP} for years {CRISIS_START}-{end}, then returns",
             "schedule": window(BASE, CRISIS_START, end, r_p=CRISIS_RP),
+            "crisis": (CRISIS_START, end),
             "y0": balanced_start(),
         },
         {
@@ -194,6 +219,7 @@ def scenarios(t_crisis_short: float, t_crisis_long: float) -> list[dict]:
             "title": "2. Crisis budget made permanent",
             "desc": f"r_p rises 0.5 -> {CRISIS_RP} at year {CRISIS_START} and stays",
             "schedule": window(BASE, CRISIS_START, math.inf, r_p=CRISIS_RP),
+            "crisis": (CRISIS_START, math.inf),
             "y0": balanced_start(),
         },
         {
@@ -201,6 +227,7 @@ def scenarios(t_crisis_short: float, t_crisis_long: float) -> list[dict]:
             "title": "3. Displacement institutionalized",
             "desc": f"as 2, and alpha rises 0.25 -> 0.75 (> r_c) at year {CRISIS_START}",
             "schedule": window(BASE, CRISIS_START, math.inf, r_p=CRISIS_RP, alpha=0.75),
+            "crisis": (CRISIS_START, math.inf),
             "y0": balanced_start(),
         },
         {
@@ -208,6 +235,7 @@ def scenarios(t_crisis_short: float, t_crisis_long: float) -> list[dict]:
             "title": f"4a. Polarized society, {t_crisis_short:g}-year crisis",
             "desc": f"alpha = beta = 0.6; r_p = {CRISIS_RP} for {t_crisis_short:g} years from year {CRISIS_START}",
             "schedule": window(POLARIZED, CRISIS_START, CRISIS_START + t_crisis_short, r_p=CRISIS_RP),
+            "crisis": (CRISIS_START, CRISIS_START + t_crisis_short),
             "y0": (1.0, RESIDUAL_P),
         },
         {
@@ -215,6 +243,7 @@ def scenarios(t_crisis_short: float, t_crisis_long: float) -> list[dict]:
             "title": f"4b. Polarized society, {t_crisis_long:g}-year crisis",
             "desc": f"alpha = beta = 0.6; r_p = {CRISIS_RP} for {t_crisis_long:g} years from year {CRISIS_START}",
             "schedule": window(POLARIZED, CRISIS_START, CRISIS_START + t_crisis_long, r_p=CRISIS_RP),
+            "crisis": (CRISIS_START, CRISIS_START + t_crisis_long),
             "y0": (1.0, RESIDUAL_P),
         },
     ]
@@ -284,11 +313,8 @@ def plot(runs: list[tuple[dict, dict]], t_crit: float, path: Path) -> None:
                              facecolor=surface)
     for ax, (sc, r) in zip(axes, runs):
         ax.set_facecolor(surface)
-        crisis = r["r_p"] > r["r_p"][0] + 1e-12
-        if crisis.any():
-            step = r["year"][1] - r["year"][0]
-            yrs = r["year"][crisis]
-            ax.axvspan(yrs[0] - step, yrs[-1], color=band, lw=0, zorder=0)
+        start, end = sc["crisis"]
+        ax.axvspan(start, min(end, r["year"][-1]), color=band, lw=0, zorder=0)
         ax.plot(r["year"], r["C"], color=c_col, lw=2, label="Creative (C)")
         ax.plot(r["year"], r["P"], color=p_col, lw=2, label="Possessive (P)")
         c_end, p_end = r["C"][-1], r["P"][-1]

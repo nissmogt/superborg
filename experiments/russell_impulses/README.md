@@ -31,7 +31,7 @@ python -m pytest experiments/russell_impulses
 ```
 
 `model.py` needs NumPy (matplotlib for the figure). It writes one CSV per scenario
-(yearly C, P and the parameters in force), `summary.txt` and `trajectories.png` to
+(yearly C, P and the parameters in force from that year on), `summary.txt` and `trajectories.png` to
 `results/`. Integration is fourth-order Runge-Kutta with a 0.01-year step; halving the
 step changes no yearly value by more than 1e-8.
 
@@ -50,14 +50,22 @@ invasion conditions:
 | yes | no | creative excludes possessive |
 | no | no | bistable: whichever impulse dominates now stays dominant |
 
-Two consequences follow directly:
+The table assumes strict inequalities. When α = r_c or β = r_p the linear terms
+cancel and nonlinear terms decide the outcome; for example, at α = r_c and β = r_p
+every point on C + P = 1 is an equilibrium.
 
-1. **Raising r_p alone never eliminates C.** r_p appears only in the second condition.
-   With α < r_c, as r_p grows without bound b → 0 and C\* falls toward 1 − α/r_c, not to
-   zero. With the baseline values below that floor is 0.5.
-2. **Eliminating C requires α > r_c**: possessive spending must displace creative
-   spending faster than creative activity regenerates. Near C = 0 the creative impulse
-   then shrinks at rate α − r_c per year.
+Three consequences follow:
+
+1. **If α < r_c, raising r_p alone never eliminates C.** r_p appears only in the
+   second condition. As r_p grows without bound, b → 0 and C\* falls toward
+   1 − α/r_c, not to zero. With the baseline values below that floor is 0.5.
+2. **Eliminating C requires α ≥ r_c**: possessive spending must displace creative
+   spending at least as fast as creative activity regenerates. Near C = 0 the creative
+   impulse shrinks at rate α − r_c per year; at α = r_c exactly, the decline is
+   algebraic, close to 1/(r_c·(1 − b)·t), instead of exponential.
+3. **In a bistable society (α > r_c and β > r_p), raising r_p is enough.** Once r_p
+   exceeds β, P can invade; if r_p stays high long enough, the state crosses into P's
+   basin and C is eliminated even after r_p falls back (scenario 4).
 
 β is the model's place for Russell's own remedy (education and culture as a check on
 militarism): raising β above r_p makes the purely creative society resistant to
@@ -85,11 +93,13 @@ creative-dominant with a 0.02 residue of possessive spending.
   P = 10/11 ≈ 0.909. Creative spending is lower but stable.
 * **3** With α > r_c, creative spending falls to 0.127 within five years and below 0.01
   by year 24.6; it shrinks at 0.25 per year near zero (half-life about 2.8 years).
-* **4** In the polarized society the outcome depends on crisis length only. A crisis
-  longer than **6.74 years** (`critical_crisis_length()`, accurate to about 0.01 year)
-  pushes the state across the boundary between the two basins, and creative spending
-  keeps declining after the crisis is over: from 0.353 at year 20 to 0.081 at year 50,
-  shrinking at 0.1 per year near zero (half-life about 7 years). A 5-year crisis
+* **4** With this starting state and crisis intensity, the polarized society's outcome
+  depends only on how long the crisis lasts. A crisis longer than **6.74 years**
+  (`critical_crisis_length()`, accurate to about 0.01 year) pushes the state across the
+  boundary between the two basins, and creative spending keeps declining after the
+  crisis is over: from 0.353 at year 20 to 0.081 at year 50, halving about every 14
+  years. The decline approaches its asymptotic rate, α − r_c = 0.1 per year (half-life
+  about 7 years), only after about year 80, once P is close to 1. A 5-year crisis
   leaves the same society recovering.
 
 ## Measuring C and P
@@ -104,8 +114,7 @@ which OECD, Eurostat and the IMF use for government spending by function:
 | C | environmental protection | 05 |
 | C | foreign economic aid | 01.2 |
 | P | defence | 02 |
-| P | police services, law courts, prisons | 03.1, 03.3, 03.4 |
-| P | border security | no separate code; split between 02 and 03 |
+| P | police services (includes port, border and coast guards and immigration services), law courts, prisons | 03.1, 03.3, 03.4 |
 | P | corporate bailouts | no function code; mostly recorded as financial transactions, partly 04 (economic affairs) |
 
 Fitting the model to a country would need a series for each proxy, a normalization

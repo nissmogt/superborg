@@ -78,9 +78,23 @@ def test_scenarios_and_bounds():
 def test_parameter_switch_timing():
     sc = m.scenarios(5, 9)[0]
     r = m.simulate(sc["schedule"], sc["y0"])
-    # sample at year t records the parameters of the step that ended at t
-    assert r["r_p"][10] == 0.5 and r["r_p"][11] == 1.5
-    assert r["r_p"][20] == 1.5 and r["r_p"][21] == 0.5
+    # sample at year t records the parameters in force from t onward
+    assert r["r_p"][9] == 0.5 and r["r_p"][10] == 1.5
+    assert r["r_p"][19] == 1.5 and r["r_p"][20] == 0.5
+
+
+def test_borderline_and_marginal_cases():
+    p = m.BASE.replace(alpha=0.5)  # alpha == r_c
+    assert m.regime(p).startswith("borderline")
+    kinds = {e["name"]: e["kind"] for e in m.equilibria(p)}
+    assert kinds["possessive only"] == "marginal"
+    with pytest.raises(ValueError):
+        m.Params(r_c=0, r_p=0.5, alpha=0.1, beta=0.1)
+
+
+def test_partial_year_horizon_keeps_final_state():
+    r = m.simulate(const(m.BASE), (0.1, 0.1), years=2.5)
+    assert r["year"][-1] == 2.5
 
 
 def test_critical_length_brackets():

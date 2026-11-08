@@ -36,12 +36,12 @@ Polarized crisis (r_p=1.5)
 Critical crisis length for the polarized society: 6.74 years
 
 Trajectories (C / P)
-scenario                                     y0          y10          y15          y20          y30          y40          y50
-1. Crisis that passes              0.667/0.667  0.667/0.667  0.585/0.901  0.557/0.907  0.636/0.696  0.661/0.672  0.666/0.668 
-2. Crisis budget made permanent    0.667/0.667  0.667/0.667  0.585/0.901  0.557/0.907  0.546/0.909  0.546/0.909  0.545/0.909 
-3. Displacement institutionalized  0.667/0.667  0.667/0.667  0.127/0.973  0.032/0.993  0.003/0.999  0.000/1.000  0.000/1.000 
-4a. Polarized society, 5-year crisis 1.000/0.020  0.989/0.007  0.821/0.356  0.700/0.243  0.784/0.159  0.876/0.087  0.942/0.040 
-4b. Polarized society, 9-year crisis 1.000/0.020  0.989/0.007  0.821/0.356  0.353/0.720  0.230/0.699  0.150/0.795  0.081/0.885 
+scenario                                         y0          y10          y15          y20          y30          y40          y50
+1. Crisis that passes                  0.667/0.667  0.667/0.667  0.585/0.901  0.557/0.907  0.636/0.696  0.661/0.672  0.666/0.668 
+2. Crisis budget made permanent        0.667/0.667  0.667/0.667  0.585/0.901  0.557/0.907  0.546/0.909  0.546/0.909  0.545/0.909 
+3. Displacement institutionalized      0.667/0.667  0.667/0.667  0.127/0.973  0.032/0.993  0.003/0.999  0.000/1.000  0.000/1.000 
+4a. Polarized society, 5-year crisis   1.000/0.020  0.989/0.007  0.821/0.356  0.700/0.243  0.784/0.159  0.876/0.087  0.942/0.040 
+4b. Polarized society, 9-year crisis   1.000/0.020  0.989/0.007  0.821/0.356  0.353/0.720  0.230/0.699  0.150/0.795  0.081/0.885 
 
 1. Crisis that passes: r_p rises 0.5 -> 1.5 for years 10-20, then returns
 2. Crisis budget made permanent: r_p rises 0.5 -> 1.5 at year 10 and stays
